@@ -1,0 +1,3 @@
+项目是用DQN训练agent下五子棋，self-play的方式、只更新黑棋，白棋是纯陪练。
+每隔一定的时间步就存储checkpoint，每隔一定的时间步就随机加载最近的一个checkpoint到白棋agent作为陪练。
+用的虚拟环境是conda mygames。

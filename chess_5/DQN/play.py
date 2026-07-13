@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+from typing import Any, List
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from env import GomokuEnv
+
+try:
+    from .agent import DQNAgent
+except ImportError:
+    from agent import DQNAgent
+
+
+DEFAULT_HISTORY_DIR = Path(__file__).resolve().parent / "history"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Play Gomoku as black against a white DQN checkpoint."
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Checkpoint filename or sequence number under --history-dir. "
+            "Defaults to the checkpoint with the largest sequence number."
+        ),
+    )
+    parser.add_argument("--history-dir", type=Path, default=DEFAULT_HISTORY_DIR)
+    parser.add_argument("--board-size", type=int, default=5)
+    parser.add_argument("--device", type=str, default="auto")
+    return parser.parse_args()
+
+
+def checkpoint_sort_key(path: Path) -> Any:
+    match = re.search(r"(\d+)", path.stem)
+    return (int(match.group(1)) if match else -1, path.name)
+
+
+def history_checkpoints(history_dir: Path) -> List[Path]:
+    if not history_dir.is_dir():
+        return []
+    return sorted(history_dir.glob("*.pt"), key=checkpoint_sort_key)
+
+
+def resolve_checkpoint(history_dir: Path, requested: str | None) -> Path:
+    history_dir = history_dir.expanduser().resolve()
+    if requested is None:
+        checkpoints = history_checkpoints(history_dir)
+        if not checkpoints:
+            raise FileNotFoundError(f"No .pt checkpoints found in {history_dir}")
+        return checkpoints[-1]
+
+    value = Path(requested).expanduser()
+    if value.is_absolute():
+        candidate = value
+    elif requested.isdigit():
+        candidate = history_dir / f"{int(requested):06d}.pt"
+    else:
+        candidate = history_dir / value
+    candidate = candidate.resolve()
+    if not candidate.is_file():
+        raise FileNotFoundError(f"Checkpoint does not exist: {candidate}")
+    return candidate
+
+
+def build_agent(board_size: int, device: str, checkpoint: Path) -> DQNAgent:
+    # Playing does not use replay or optimization, so keep their allocations tiny.
+    agent = DQNAgent(
+        board_size,
+        replay_size=1,
+        min_replay_size=1,
+        batch_size=1,
+        device=device,
+    )
+    metadata = agent.load_checkpoint(checkpoint, load_optimizer=False)
+    checkpoint_board_size = int(metadata.get("board_size", board_size))
+    if checkpoint_board_size != board_size:
+        raise ValueError(
+            f"Checkpoint board size is {checkpoint_board_size}x{checkpoint_board_size}, "
+            f"but --board-size is {board_size}x{board_size}."
+        )
+    return agent
+
+
+def wait_after_game() -> bool:
+    """Return True to start another game, or False when the window is closed."""
+    import pygame
+    while True:
+        event = pygame.event.wait()
+        if event.type == pygame.QUIT:
+            return False
+        if event.type in (pygame.KEYDOWN, pygame.MOUSEBUTTONDOWN):
+            return True
+
+
+def result_text(winner: int) -> str:
+    if winner == 1:
+        return "黑棋获胜，你赢了！"
+    if winner == -1:
+        return "白棋获胜，DQN agent 赢了。"
+    return "和棋。"
+
+
+def main() -> None:
+    args = parse_args()
+    checkpoint = resolve_checkpoint(args.history_dir, args.checkpoint)
+    agent = build_agent(args.board_size, args.device, checkpoint)
+    env = GomokuEnv(
+        board_size=args.board_size,
+        render_mode="human",
+        starting_player="black",
+        illegal_action_mode="raise",
+    )
+
+    print(f"Loaded checkpoint: {checkpoint}")
+    print("你执黑棋，点击棋盘上的交叉点落子；DQN agent 执白棋。")
+    try:
+        game_number = 1
+        while True:
+            print(f"\n第 {game_number} 局")
+            obs, _ = env.reset()
+            terminated = truncated = False
+            while not (terminated or truncated):
+                current_player = int(obs["current_player"].item())
+                if current_player == 1:
+                    action = env.wait_for_human_action()
+                else:
+                    action = int(
+                        agent.select_actions(
+                            obs["board"][None, ...],
+                            np.array([-1], dtype=np.int8),
+                            obs["action_mask"][None, ...],
+                            epsilon=0.0,
+                        )[0]
+                    )
+                obs, _, terminated, truncated, info = env.step(action)
+
+            print(result_text(int(info["winner"])))
+            print("点击棋盘或按任意键开始下一局；关闭窗口退出。")
+            if not wait_after_game():
+                break
+            game_number += 1
+    except KeyboardInterrupt:
+        print("\n游戏已退出。")
+    finally:
+        env.close()
+
+
+if __name__ == "__main__":
+    main()
