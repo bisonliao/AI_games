@@ -33,6 +33,7 @@ class ReplayBuffer:
         self.actions = np.zeros(capacity, dtype=np.int64)
         self.rewards = np.zeros(capacity, dtype=np.float32)
         self.dones = np.zeros(capacity, dtype=np.bool_)
+        self.discounts = np.zeros(capacity, dtype=np.float32)
 
         self.pos = 0
         self.size = 0
@@ -45,6 +46,7 @@ class ReplayBuffer:
         next_state: np.ndarray,
         next_mask: np.ndarray,
         done: bool,
+        discount: float,
     ) -> None:
         self.states[self.pos] = state
         self.actions[self.pos] = int(action)
@@ -52,6 +54,7 @@ class ReplayBuffer:
         self.next_states[self.pos] = next_state
         self.next_masks[self.pos] = next_mask.astype(np.bool_)
         self.dones[self.pos] = bool(done)
+        self.discounts[self.pos] = float(discount)
 
         self.pos = (self.pos + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
@@ -63,7 +66,7 @@ class ReplayBuffer:
         self,
         batch_size: int,
         device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, ...]:
         indices = self.rng.integers(0, self.size, size=batch_size)
         return (
             torch.as_tensor(self.states[indices], device=device),
@@ -72,6 +75,7 @@ class ReplayBuffer:
             torch.as_tensor(self.next_states[indices], device=device),
             torch.as_tensor(self.next_masks[indices], device=device),
             torch.as_tensor(self.dones[indices], device=device).float(),
+            torch.as_tensor(self.discounts[indices], device=device),
         )
 
 
@@ -181,17 +185,26 @@ class DQNAgent:
         next_state: np.ndarray,
         next_mask: np.ndarray,
         done: bool,
+        discount: Optional[float] = None,
     ) -> None:
-        self.replay.add(state, action, reward, next_state, next_mask, done)
+        self.replay.add(
+            state, action, reward, next_state, next_mask, done,
+            self.gamma if discount is None else discount,
+        )
 
-    def train_step(self, *, force: bool = False) -> Optional[Dict[str, float]]:
+    def train_step(
+        self,
+        *,
+        force: bool = False,
+        collect_metrics: bool = True,
+    ) -> Optional[Dict[str, float]]:
         self.learn_calls += 1
         if len(self.replay) < self.min_replay_size:
             return None
         if not force and self.learn_calls % self.train_freq != 0:
             return None
 
-        states, actions, rewards, next_states, next_masks, dones = self.replay.sample(
+        states, actions, rewards, next_states, next_masks, dones, discounts = self.replay.sample(
             self.batch_size,
             self.device,
         )
@@ -207,7 +220,7 @@ class DQNAgent:
             else:
                 next_q = self.target_net(next_states).masked_fill(~next_masks, -1e9)
                 next_values = next_q.max(dim=1).values
-            targets = rewards + self.gamma * next_values * (1.0 - dones)
+            targets = rewards + discounts * next_values * (1.0 - dones)
 
         loss = nn.functional.smooth_l1_loss(q_values, targets)
 
@@ -215,12 +228,13 @@ class DQNAgent:
         loss.backward()
         grad_max = 0.0
         grad_norm_sq = 0.0
-        for parameter in self.online_net.parameters():
-            if parameter.grad is None:
-                continue
-            grad = parameter.grad.detach()
-            grad_max = max(grad_max, float(grad.abs().max().item()))
-            grad_norm_sq += float(grad.pow(2).sum().item())
+        if collect_metrics:
+            for parameter in self.online_net.parameters():
+                if parameter.grad is None:
+                    continue
+                grad = parameter.grad.detach()
+                grad_max = max(grad_max, float(grad.abs().max().item()))
+                grad_norm_sq += float(grad.pow(2).sum().item())
         if self.grad_clip > 0:
             nn.utils.clip_grad_norm_(self.online_net.parameters(), self.grad_clip)
         self.optimizer.step()
@@ -229,6 +243,8 @@ class DQNAgent:
         if self.update_steps % self.target_update == 0:
             self.sync_target()
 
+        if not collect_metrics:
+            return None
         return {
             "loss": float(loss.item()),
             "mean_q": float(q_values.detach().mean().item()),

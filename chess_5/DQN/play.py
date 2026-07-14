@@ -16,8 +16,10 @@ from env import GomokuEnv
 
 try:
     from .agent import DQNAgent
+    from .run_paths import checkpoint_filename, named_directory, validate_run_name
 except ImportError:
     from agent import DQNAgent
+    from run_paths import checkpoint_filename, named_directory, validate_run_name
 
 
 DEFAULT_HISTORY_DIR = Path(__file__).resolve().parent / "history"
@@ -26,6 +28,13 @@ DEFAULT_HISTORY_DIR = Path(__file__).resolve().parent / "history"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Play Gomoku as black against a white DQN checkpoint."
+    )
+    parser.add_argument(
+        "--run-name", required=True,
+        help=(
+            "Required training name used to select its checkpoint directory. "
+            "Pass an empty string to use legacy checkpoints directly under --history-dir."
+        ),
     )
     parser.add_argument(
         "--checkpoint",
@@ -53,8 +62,13 @@ def history_checkpoints(history_dir: Path) -> List[Path]:
     return sorted(history_dir.glob("*.pt"), key=checkpoint_sort_key)
 
 
-def resolve_checkpoint(history_dir: Path, requested: str | None) -> Path:
-    history_dir = history_dir.expanduser().resolve()
+def resolve_checkpoint(history_dir: Path, run_name: str, requested: str | None) -> Path:
+    legacy_layout = run_name == ""
+    if legacy_layout:
+        history_dir = history_dir.expanduser().resolve()
+    else:
+        run_name = validate_run_name(run_name)
+        history_dir = named_directory(history_dir, run_name).resolve()
     if requested is None:
         checkpoints = history_checkpoints(history_dir)
         if not checkpoints:
@@ -65,7 +79,12 @@ def resolve_checkpoint(history_dir: Path, requested: str | None) -> Path:
     if value.is_absolute():
         candidate = value
     elif requested.isdigit():
-        candidate = history_dir / f"{int(requested):06d}.pt"
+        filename = (
+            f"{int(requested):06d}.pt"
+            if legacy_layout
+            else checkpoint_filename(run_name, int(requested))
+        )
+        candidate = history_dir / filename
     else:
         candidate = history_dir / value
     candidate = candidate.resolve()
@@ -114,7 +133,7 @@ def result_text(winner: int) -> str:
 
 def main() -> None:
     args = parse_args()
-    checkpoint = resolve_checkpoint(args.history_dir, args.checkpoint)
+    checkpoint = resolve_checkpoint(args.history_dir, args.run_name, args.checkpoint)
     agent = build_agent(args.board_size, args.device, checkpoint)
     env = GomokuEnv(
         board_size=args.board_size,

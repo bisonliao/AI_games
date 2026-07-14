@@ -3,7 +3,6 @@ from __future__ import annotations
 import queue
 import time
 import traceback
-from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
@@ -14,12 +13,15 @@ from env import make_vector_env
 try:
     from .agent import encode_boards, random_legal_actions, slice_obs
     from .network import DuelingGomokuQNet
+    from .returns import NStepAccumulator, Transition, shaped_reward
 except ImportError:
     from agent import encode_boards, random_legal_actions, slice_obs
     from network import DuelingGomokuQNet
+    from returns import NStepAccumulator, Transition, shaped_reward
 
 
 StateDict = Mapping[str, np.ndarray]
+QUEUE_PUT_TIMEOUT_SECONDS = 2.0
 
 
 def cpu_state_dict(module: torch.nn.Module) -> Dict[str, np.ndarray]:
@@ -90,16 +92,6 @@ class RandomPolicy:
         return random_legal_actions(action_masks, self.rng)
 
 
-@dataclass
-class Transition:
-    state: np.ndarray
-    action: int
-    reward: float
-    next_state: np.ndarray
-    next_mask: np.ndarray
-    done: bool
-
-
 def pack_transitions(
     transitions: List[Transition],
     episodes: List[Tuple[int, int, float]],
@@ -118,18 +110,34 @@ def pack_transitions(
         "next_states": np.stack([item.next_state for item in transitions]),
         "next_masks": np.stack([item.next_mask for item in transitions]),
         "dones": np.asarray([item.done for item in transitions], dtype=np.bool_),
+        "discounts": np.asarray([item.discount for item in transitions], dtype=np.float32),
         "episodes": episodes,
         "blocked_seconds": blocked_seconds,
     }
 
 
-def _queue_put(result_queue: Any, message: Dict[str, Any], stop_event: Any) -> float:
+def _queue_put(
+    result_queue: Any,
+    status_queue: Any,
+    message: Dict[str, Any],
+    stop_event: Any,
+    actor_id: int,
+) -> float:
     started = time.monotonic()
+    timeout_reported = False
     while not stop_event.is_set():
         try:
-            result_queue.put(message, timeout=0.5)
+            result_queue.put(message, timeout=QUEUE_PUT_TIMEOUT_SECONDS)
             return time.monotonic() - started
         except queue.Full:
+            if not timeout_reported:
+                status_queue.put_nowait({
+                    "type": "queue_put_timeout",
+                    "actor_id": actor_id,
+                    "timeout_seconds": QUEUE_PUT_TIMEOUT_SECONDS,
+                    "event_time": time.time(),
+                })
+                timeout_reported = True
             continue
     return time.monotonic() - started
 
@@ -172,6 +180,7 @@ def actor_worker(
     model_kwargs: Mapping[str, Any],
     initial_opponent: Optional[Tuple[StateDict, Mapping[str, Any]]],
     result_queue: Any,
+    status_queue: Any,
     control_queue: Any,
     stop_event: Any,
     generated_steps: Any,
@@ -206,6 +215,9 @@ def actor_worker(
         pending_actions: List[Optional[int]] = [None] * num_envs
         episode_steps = np.zeros(num_envs, dtype=np.int64)
         transitions: List[Transition] = []
+        n_step_accumulator = NStepAccumulator(
+            num_envs, int(config["n_step"]), float(config["gamma"])
+        )
         episodes: List[Tuple[int, int, float]] = []
         policy_version = 0
         blocked_seconds = 0.0
@@ -246,11 +258,15 @@ def actor_worker(
                 done = bool(dones[env_index])
                 if acted_player == 1 and done:
                     reward = float(_info_value(infos, "reward_black", env_index, True, 0.0))
-                    transitions.append(Transition(
+                    next_state = np.zeros((3, board_size, board_size), dtype=np.float32)
+                    reward = shaped_reward(
+                        reward, pending_states[env_index], next_state, True,
+                        config["gamma"], config["reward_shaping_scale"],
+                    )
+                    transitions.extend(n_step_accumulator.add(env_index, Transition(
                         pending_states[env_index], int(pending_actions[env_index]), reward,
-                        np.zeros((3, board_size, board_size), dtype=np.float32),
-                        np.zeros(board_size * board_size, dtype=np.bool_), True,
-                    ))
+                        next_state, np.zeros(board_size * board_size, dtype=np.bool_), True,
+                    )))
                     pending_states[env_index] = None
                     pending_actions[env_index] = None
                 elif acted_player == 1:
@@ -265,10 +281,14 @@ def actor_worker(
                             next_obs["board"][env_index], next_obs["current_player"][env_index]
                         )[0]
                         next_mask = next_obs["action_mask"][env_index].astype(np.bool_)
-                    transitions.append(Transition(
+                    reward = shaped_reward(
+                        reward, pending_states[env_index], next_state, done,
+                        config["gamma"], config["reward_shaping_scale"],
+                    )
+                    transitions.extend(n_step_accumulator.add(env_index, Transition(
                         pending_states[env_index], int(pending_actions[env_index]), reward,
                         next_state, next_mask, done,
-                    ))
+                    )))
                     pending_states[env_index] = None
                     pending_actions[env_index] = None
 
@@ -286,7 +306,9 @@ def actor_worker(
                     transitions, episodes, actor_id=actor_id,
                     policy_version=policy_version, blocked_seconds=blocked_seconds,
                 )
-                blocked_seconds = _queue_put(result_queue, message, stop_event)
+                blocked_seconds = _queue_put(
+                    result_queue, status_queue, message, stop_event, actor_id
+                )
                 transitions = []
                 episodes = []
                 opponent, policy_version = _apply_commands(

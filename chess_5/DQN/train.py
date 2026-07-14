@@ -22,17 +22,22 @@ from env import make_vector_env
 
 try:
     from .agent import DQNAgent, RandomAgent, encode_boards, slice_obs
+    from .returns import NStepAccumulator, Transition, shaped_reward
+    from .run_paths import checkpoint_filename, named_directory, validate_run_name
 except ImportError:
     from agent import DQNAgent, RandomAgent, encode_boards, slice_obs
+    from returns import NStepAccumulator, Transition, shaped_reward
+    from run_paths import checkpoint_filename, named_directory, validate_run_name
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a Gomoku black-side DQN agent by self-play.")
 
+    parser.add_argument("--run-name", required=True, help="Required name used to isolate checkpoints and logs.")
     parser.add_argument("--board-size", type=int, default=5)
     parser.add_argument("--num-envs", type=int, default=16)
     parser.add_argument("--async-envs", action="store_true")
-    parser.add_argument("--num-actors", type=int, default=4)
+    parser.add_argument("--num-actors", type=int, default=1)
     parser.add_argument("--envs-per-actor", type=int, default=16)
     parser.add_argument("--actor-batch-size", type=int, default=256)
     parser.add_argument("--actor-queue-size", type=int, default=8)
@@ -62,12 +67,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-freq", type=int, default=1)
     parser.add_argument("--grad-clip", type=float, default=10.0)
     parser.add_argument("--no-double-dqn", action="store_true")
+    parser.add_argument("--n-step", type=int, default=5)
+    parser.add_argument(
+        "--no-n-step", dest="n_step", action="store_const", const=1,
+        help="Disable multi-step returns and use one-step TD targets.",
+    )
+    parser.add_argument("--reward-shaping-scale", type=float, default=0.02)
+    parser.add_argument(
+        "--no-reward-shaping", dest="reward_shaping_scale",
+        action="store_const", const=0.0,
+    )
 
     parser.add_argument("--epsilon-start", type=float, default=1.0)
     parser.add_argument("--epsilon-end", type=float, default=0.05)
     parser.add_argument("--epsilon-decay-steps", type=int, default=1_000_000)
     parser.add_argument("--opponent-epsilon", type=float, default=0.0)
-    parser.add_argument("--log-interval", type=int, default=10_000)
+    parser.add_argument("--log-interval", type=int, default=100_000)
     parser.add_argument("--tb-log-dir", type=Path, default=Path(__file__).resolve().parent / "runs")
     parser.add_argument("--disable-tensorboard", action="store_true")
     parser.add_argument("--save-final", action="store_true")
@@ -126,7 +141,7 @@ def save_history_checkpoint(
     total_black_steps: int,
     args: argparse.Namespace,
 ) -> Path:
-    path = history_dir / f"{index:06d}.pt"
+    path = history_dir / checkpoint_filename(args.run_name, index)
     agent.save_checkpoint(
         path,
         total_black_steps=total_black_steps,
@@ -258,18 +273,6 @@ class TensorBoardLogger:
         self.writer = SummaryWriter(log_dir=str(self.log_dir))
         print(f"TensorBoard log dir: {self.log_dir}")
 
-    def add_episode(
-        self,
-        *,
-        step: int,
-        length: int,
-        episode_return: float,
-    ) -> None:
-        if self.writer is None:
-            return
-        self.writer.add_scalar("Episode/length", length, step)
-        self.writer.add_scalar("Episode/return", episode_return, step)
-
     def add_scalars(
         self,
         *,
@@ -314,8 +317,6 @@ def initial_opponent_payload(opponent: Any) -> Optional[Any]:
 def update_episode_stats(
     episode: Any,
     stats: Dict[str, float],
-    tb_logger: TensorBoardLogger,
-    total_black_steps: int,
 ) -> None:
     winner, length, episode_return = episode
     stats["episodes"] += 1
@@ -327,7 +328,19 @@ def update_episode_stats(
         stats["black_losses"] += 1
     else:
         stats["draws"] += 1
-    tb_logger.add_episode(step=total_black_steps, length=int(length), episode_return=float(episode_return))
+
+
+def add_n_step_transition(
+    agent: DQNAgent,
+    accumulator: NStepAccumulator,
+    env_index: int,
+    transition: Transition,
+) -> None:
+    for item in accumulator.add(env_index, transition):
+        agent.add_transition(
+            item.state, item.action, item.reward, item.next_state,
+            item.next_mask, item.done, item.discount,
+        )
 
 
 def queue_size(value: Any) -> int:
@@ -335,6 +348,35 @@ def queue_size(value: Any) -> int:
         return int(value.qsize())
     except (AttributeError, NotImplementedError):
         return -1
+
+
+def report_actor_status_events(
+    status_queue: Any,
+    tb_logger: TensorBoardLogger,
+    total_black_steps: int,
+    timeout_count: int,
+) -> int:
+    while True:
+        try:
+            event = status_queue.get_nowait()
+        except queue.Empty:
+            break
+        if event.get("type") != "queue_put_timeout":
+            continue
+        timeout_count += 1
+        print(
+            "WARNING: actor transition queue put timed out "
+            f"actor={event['actor_id']} timeout={event['timeout_seconds']:.1f}s "
+            f"step={total_black_steps} total_timeouts={timeout_count}",
+            flush=True,
+        )
+        if tb_logger.writer is not None:
+            tb_logger.writer.add_scalar(
+                "Actors/queue_put_timeouts_total", timeout_count, total_black_steps,
+                walltime=float(event["event_time"]),
+            )
+            tb_logger.writer.flush()
+    return timeout_count
 
 
 def run_async_training(
@@ -358,6 +400,7 @@ def run_async_training(
 
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue(maxsize=args.actor_queue_size)
+    status_queue = ctx.Queue()
     control_queues = [ctx.Queue() for _ in range(args.num_actors)]
     stop_event = ctx.Event()
     generated_steps = ctx.Value("q", 0)
@@ -373,6 +416,9 @@ def run_async_training(
         "epsilon_end": args.epsilon_end,
         "epsilon_decay_steps": args.epsilon_decay_steps,
         "opponent_epsilon": args.opponent_epsilon,
+        "n_step": args.n_step,
+        "gamma": args.gamma,
+        "reward_shaping_scale": args.reward_shaping_scale,
     }
     actors = [
         ctx.Process(
@@ -380,8 +426,8 @@ def run_async_training(
             name=f"gomoku-actor-{actor_id}",
             args=(
                 actor_id, actor_config, initial_policy, dict(train_agent.model_kwargs),
-                opponent_payload, result_queue, control_queues[actor_id], stop_event,
-                generated_steps,
+                opponent_payload, result_queue, status_queue,
+                control_queues[actor_id], stop_event, generated_steps,
             ),
         )
         for actor_id in range(args.num_actors)
@@ -402,6 +448,7 @@ def run_async_training(
     actor_versions = [-1] * args.num_actors
     blocked_seconds = 0.0
     received_batches = 0
+    queue_put_timeouts = 0
     start_time = time.time()
     updates_at_start = train_agent.update_steps
 
@@ -415,6 +462,9 @@ def run_async_training(
 
     try:
         while total_black_steps < args.total_black_steps:
+            queue_put_timeouts = report_actor_status_events(
+                status_queue, tb_logger, total_black_steps, queue_put_timeouts
+            )
             try:
                 message = result_queue.get(timeout=2.0)
             except queue.Empty:
@@ -440,20 +490,28 @@ def run_async_training(
                     message["states"][index], int(message["actions"][index]),
                     float(message["rewards"][index]), message["next_states"][index],
                     message["next_masks"][index], bool(message["dones"][index]),
+                    float(message["discounts"][index]),
                 )
             total_black_steps += accepted
             for episode in message["episodes"]:
-                update_episode_stats(episode, stats, tb_logger, total_black_steps)
+                update_episode_stats(episode, stats)
 
             warmup_boundary = max(old_steps, args.min_replay_size)
             eligible_steps = max(0, total_black_steps - warmup_boundary)
             update_credit += eligible_steps * args.updates_per_step
             requested_updates = int(update_credit)
             update_credit -= requested_updates
-            for _ in range(requested_updates):
-                metrics = train_agent.train_step(force=True)
+            log_due = total_black_steps - last_log_step >= args.log_interval
+            for update_index in range(requested_updates):
+                metrics = train_agent.train_step(
+                    force=True,
+                    collect_metrics=log_due and update_index == requested_updates - 1,
+                )
                 if metrics is not None:
                     last_loss = metrics
+            queue_put_timeouts = report_actor_status_events(
+                status_queue, tb_logger, total_black_steps, queue_put_timeouts
+            )
 
             while args.save_checkpoint > 0 and total_black_steps >= next_save_step:
                 path = save_history_checkpoint(
@@ -530,13 +588,20 @@ def run_async_training(
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=5.0)
+        queue_put_timeouts = report_actor_status_events(
+            status_queue, tb_logger, total_black_steps, queue_put_timeouts
+        )
         result_queue.close()
+        status_queue.close()
         for control in control_queues:
             control.close()
 
 
 def main() -> None:
     args = parse_args()
+    args.run_name = validate_run_name(args.run_name)
+    args.history_dir = named_directory(args.history_dir, args.run_name)
+    args.tb_log_dir = named_directory(args.tb_log_dir, args.run_name)
     args.history_dir.mkdir(parents=True, exist_ok=True)
     tb_logger = TensorBoardLogger(args)
 
@@ -555,6 +620,10 @@ def main() -> None:
 
     if args.num_actors < 0:
         raise ValueError("--num-actors cannot be negative")
+    if args.n_step < 1:
+        raise ValueError("--n-step must be at least 1")
+    if args.reward_shaping_scale < 0:
+        raise ValueError("--reward-shaping-scale cannot be negative")
     if args.num_actors > 0:
         try:
             run_async_training(args, train_agent, opponent, opponent_rng, tb_logger)
@@ -579,6 +648,7 @@ def main() -> None:
     pending_states: List[Optional[np.ndarray]] = [None for _ in range(args.num_envs)]
     pending_actions: List[Optional[int]] = [None for _ in range(args.num_envs)]
     episode_black_steps = np.zeros(args.num_envs, dtype=np.int64)
+    n_step_accumulator = NStepAccumulator(args.num_envs, args.n_step, args.gamma)
 
     total_black_steps = 0
     next_save_step = args.save_checkpoint
@@ -653,13 +723,16 @@ def main() -> None:
                             dtype=np.float32,
                         )
                         zero_mask = np.zeros(args.board_size * args.board_size, dtype=np.bool_)
-                        train_agent.add_transition(
-                            pending_states[env_index],
-                            pending_actions[env_index],
-                            reward_black,
-                            zero_state,
-                            zero_mask,
-                            True,
+                        reward_black = shaped_reward(
+                            reward_black, pending_states[env_index], zero_state, True,
+                            args.gamma, args.reward_shaping_scale,
+                        )
+                        add_n_step_transition(
+                            train_agent, n_step_accumulator, env_index,
+                            Transition(
+                                pending_states[env_index], int(pending_actions[env_index]),
+                                reward_black, zero_state, zero_mask, True,
+                            ),
                         )
                         pending_states[env_index] = None
                         pending_actions[env_index] = None
@@ -683,13 +756,16 @@ def main() -> None:
                         )[0]
                         next_mask = next_obs["action_mask"][env_index].astype(np.bool_)
 
-                    train_agent.add_transition(
-                        pending_states[env_index],
-                        pending_actions[env_index],
-                        reward_black,
-                        next_state,
-                        next_mask,
-                        done,
+                    reward_black = shaped_reward(
+                        reward_black, pending_states[env_index], next_state, done,
+                        args.gamma, args.reward_shaping_scale,
+                    )
+                    add_n_step_transition(
+                        train_agent, n_step_accumulator, env_index,
+                        Transition(
+                            pending_states[env_index], int(pending_actions[env_index]),
+                            reward_black, next_state, next_mask, done,
+                        ),
                     )
                     pending_states[env_index] = None
                     pending_actions[env_index] = None
@@ -707,15 +783,13 @@ def main() -> None:
                         stats["black_losses"] += 1
                     else:
                         stats["draws"] += 1
-                    tb_logger.add_episode(
-                        step=total_black_steps,
-                        length=episode_length,
-                        episode_return=episode_return,
-                    )
                     episode_black_steps[env_index] = 0
 
-            for _ in range(len(black_indices)):
-                metrics = train_agent.train_step()
+            log_due = total_black_steps - last_log_step >= args.log_interval
+            for update_index in range(len(black_indices)):
+                metrics = train_agent.train_step(
+                    collect_metrics=log_due and update_index == len(black_indices) - 1
+                )
                 if metrics is not None:
                     last_loss = metrics
 
