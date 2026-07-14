@@ -36,7 +36,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", required=True, help="Required name used to isolate checkpoints and logs.")
     parser.add_argument("--board-size", type=int, default=5)
     parser.add_argument("--num-envs", type=int, default=16)
-    parser.add_argument("--async-envs", action="store_true")
+    parser.add_argument(
+        "--async-envs",
+        action="store_true",
+        help=(
+            "Deprecated: only when --num-actors=0, use Gymnasium "
+            "AsyncVectorEnv (one worker process per env). This is unrelated "
+            "to the asynchronous actor-learner pipeline."
+        ),
+    )
     parser.add_argument("--num-actors", type=int, default=1)
     parser.add_argument("--envs-per-actor", type=int, default=16)
     parser.add_argument("--actor-batch-size", type=int, default=256)
@@ -67,12 +75,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-freq", type=int, default=1)
     parser.add_argument("--grad-clip", type=float, default=10.0)
     parser.add_argument("--no-double-dqn", action="store_true")
-    parser.add_argument("--n-step", type=int, default=5)
+    parser.add_argument(
+        "--n-step", type=int, default=1,
+        help="N-step return horizon; 1 (the default) uses one-step TD.",
+    )
     parser.add_argument(
         "--no-n-step", dest="n_step", action="store_const", const=1,
         help="Disable multi-step returns and use one-step TD targets.",
     )
-    parser.add_argument("--reward-shaping-scale", type=float, default=0.02)
+    parser.add_argument(
+        "--reward-shaping-scale", type=float, default=0.0,
+        help="Potential-based shaping strength; 0 (the default) disables shaping.",
+    )
     parser.add_argument(
         "--no-reward-shaping", dest="reward_shaping_scale",
         action="store_const", const=0.0,
@@ -386,6 +400,18 @@ def run_async_training(
     opponent_rng: random.Random,
     tb_logger: TensorBoardLogger,
 ) -> None:
+    """Run the asynchronous actor-learner training pipeline.
+
+    Here ``async`` describes the relationship between actors and the learner:
+    actor processes generate transition batches while the main-process learner
+    independently consumes queued batches and updates the network.  Each actor
+    deliberately uses a synchronous vector environment internally because a
+    Gomoku ``env.step()`` is much cheaper than cross-process Gymnasium IPC.
+
+    This is distinct from ``args.async_envs``.  That deprecated flag selects
+    Gymnasium ``AsyncVectorEnv`` only in the legacy ``--num-actors=0`` path and
+    is ignored by this function.
+    """
     from DQN.async_train import actor_worker, cpu_state_dict
 
     for name in ("num_actors", "envs_per_actor", "actor_batch_size", "actor_queue_size"):
@@ -398,15 +424,56 @@ def run_async_training(
     if args.async_envs:
         print("Warning: --async-envs is ignored when --num-actors > 0", flush=True)
 
+    # Always use the "spawn" start method. Each actor starts a fresh Python
+    # interpreter instead of inheriting the learner with fork(). This has more
+    # startup overhead, but it is the safe choice when the learner owns CUDA
+    # state: forking an initialized CUDA process can deadlock or corrupt state.
     ctx = mp.get_context("spawn")
+
+    # actor -> learner data channel. Actors put complete NumPy transition
+    # batches here and the learner consumes them with result_queue.get(). The
+    # finite maxsize provides backpressure: when the learner is slower, actors
+    # block rather than allowing queued transitions to consume unlimited RAM.
     result_queue = ctx.Queue(maxsize=args.actor_queue_size)
+
+    # actor -> learner event channel for exceptional status such as a timed-out
+    # result_queue.put(). It is separate and unbounded so an actor can report
+    # that the transition queue is full without sending the report through that
+    # same full queue.
     status_queue = ctx.Queue()
+
+    # learner -> actor control channels. Each actor gets its own queue because
+    # multiprocessing.Queue delivers each item to only one reader; a single
+    # shared queue would not broadcast policy updates to every actor.
     control_queues = [ctx.Queue() for _ in range(args.num_actors)]
+
+    # Shared one-way shutdown flag. Any process can set it; all actors poll it
+    # in their collection and queue-put loops. Unlike a Queue, an Event stores
+    # state, so every actor observes the same stop request.
     stop_event = ctx.Event()
+
+    # A signed 64-bit integer stored in shared memory ("q" = C long long).
+    # Actors increment it under its built-in lock so their epsilon schedules
+    # use one global generated-step count instead of separate local counts.
     generated_steps = ctx.Value("q", 0)
+
+    # Process arguments must be pickled under spawn. Convert model tensors to
+    # copied CPU NumPy arrays so IPC does not depend on CUDA tensors or PyTorch's
+    # file-descriptor-based tensor sharing mechanism.
     initial_policy = cpu_state_dict(train_agent.online_net)
+
+    # Prepare the white-player policy that every actor receives at startup.
+    # - RandomAgent -> None: the child constructs its own seeded RandomPolicy.
+    # - DQNAgent    -> (CPU NumPy state_dict, model_kwargs): the child rebuilds
+    #   a lightweight inference-only white network from this snapshot.
+    # This payload is created before process.start() because spawn must pickle
+    # all initial arguments and cannot directly share the learner's agent/GPU.
     opponent_payload = initial_opponent_payload(opponent)
     actor_config = {
+        # This is a root seed, not the final seed reused by every actor.
+        # actor_worker derives an actor-specific seed from (root seed,
+        # actor_id), then derives each vector environment's seed from
+        # (actor seed, env index). See actor_worker for the exact mapping.
         "seed": args.seed,
         "board_size": args.board_size,
         "envs_per_actor": args.envs_per_actor,
@@ -420,6 +487,9 @@ def run_async_training(
         "gamma": args.gamma,
         "reward_shaping_scale": args.reward_shaping_scale,
     }
+    # Construct Process descriptors only; no child process starts until the
+    # later process.start() call. Every actor receives shared queue/event/value
+    # handles plus ordinary pickled configuration and initial model snapshots.
     actors = [
         ctx.Process(
             target=actor_worker,
@@ -457,23 +527,37 @@ def run_async_training(
         f"batch={args.actor_batch_size} UTD={args.updates_per_step:g}",
         flush=True,
     )
+    # start() launches the fresh interpreters and invokes actor_worker(...) in
+    # each child. The parent immediately continues as the learner; it does not
+    # wait for actor_worker to return here.
     for process in actors:
         process.start()
 
     try:
         while total_black_steps < args.total_black_steps:
+            # Non-blockingly drain the dedicated actor status channel. This is
+            # done before consuming transitions so timeout warnings are handled
+            # even while the main result queue remains full.
             queue_put_timeouts = report_actor_status_events(
                 status_queue, tb_logger, total_black_steps, queue_put_timeouts
             )
             try:
+                # Wait at most two seconds for the next actor batch. Queue.get
+                # deserializes the message into this learner process; batches
+                # are never shared by reference after they cross the queue.
                 message = result_queue.get(timeout=2.0)
             except queue.Empty:
+                # An empty queue can be normal if actors are still collecting.
+                # Use the opportunity to distinguish that from a crashed actor.
                 failed = [process for process in actors if not process.is_alive()]
                 if failed:
                     codes = ", ".join(f"{p.name}={p.exitcode}" for p in failed)
                     raise RuntimeError(f"Actor process exited unexpectedly: {codes}")
                 continue
 
+            # actor_worker catches child exceptions and sends the traceback as
+            # a normal queue message because child exceptions cannot otherwise
+            # be raised directly in the parent process.
             if message.get("type") == "error":
                 raise RuntimeError(
                     f"Actor {message['actor_id']} failed:\n{message['traceback']}"
@@ -482,9 +566,12 @@ def run_async_training(
             actor_id = int(message["actor_id"])
             actor_versions[actor_id] = int(message["policy_version"])
             blocked_seconds += float(message.get("blocked_seconds", 0.0))
-            available = len(message["actions"])
+            available = len(message["actions"]) # transition numbers in this batch
             accepted = min(available, args.total_black_steps - total_black_steps)
             old_steps = total_black_steps
+            # Copy the received actor batch into the learner-owned replay. Only
+            # the learner mutates replay, networks, and optimizer; no locks are
+            # needed around these training objects.
             for index in range(accepted):
                 train_agent.add_transition(
                     message["states"][index], int(message["actions"][index]),
@@ -496,12 +583,12 @@ def run_async_training(
             for episode in message["episodes"]:
                 update_episode_stats(episode, stats)
 
-            warmup_boundary = max(old_steps, args.min_replay_size)
-            eligible_steps = max(0, total_black_steps - warmup_boundary)
-            update_credit += eligible_steps * args.updates_per_step
-            requested_updates = int(update_credit)
-            update_credit -= requested_updates
-            log_due = total_black_steps - last_log_step >= args.log_interval
+            warmup_boundary = max(old_steps, args.min_replay_size)  # Earliest step eligible for learning.
+            eligible_steps = max(0, total_black_steps - warmup_boundary)  # New post-warmup samples.
+            update_credit += eligible_steps * args.updates_per_step  # Accumulate fractional update quota.
+            requested_updates = int(update_credit)  # Whole optimizer updates to run now.
+            update_credit -= requested_updates  # Preserve the fractional quota for later batches.
+            log_due = total_black_steps - last_log_step >= args.log_interval  # Whether metrics are due.
             for update_index in range(requested_updates):
                 metrics = train_agent.train_step(
                     force=True,
@@ -509,6 +596,9 @@ def run_async_training(
                 )
                 if metrics is not None:
                     last_loss = metrics
+            # Gradient updates may take long enough for producers to fill and
+            # time out on result_queue. Drain their status events again before
+            # checkpointing or logging.
             queue_put_timeouts = report_actor_status_events(
                 status_queue, tb_logger, total_black_steps, queue_put_timeouts
             )
@@ -529,6 +619,9 @@ def run_async_training(
                     opponent = reloaded
                     state = cpu_state_dict(opponent.online_net)
                     kwargs = dict(opponent.model_kwargs)
+                    # Queue items are point-to-point, so explicitly put one
+                    # opponent command into every actor's private control queue
+                    # to implement a broadcast.
                     for control in control_queues:
                         control.put(("opponent", state, kwargs))
                 next_load_step += args.load_opponent
@@ -536,6 +629,9 @@ def run_async_training(
             while total_black_steps >= next_policy_sync:
                 version = next_policy_sync
                 state = cpu_state_dict(train_agent.online_net)
+                # Send the same learner policy snapshot and monotonically
+                # increasing version to every actor. Actors apply pending
+                # commands between transition batches, not during a game step.
                 for control in control_queues:
                     control.put(("policy", version, state))
                 next_policy_sync += args.policy_sync_steps
@@ -548,6 +644,8 @@ def run_async_training(
                 collector_text = (
                     f" sample={total_black_steps / elapsed:.1f}/s"
                     f" update={updates / elapsed:.1f}/s"
+                    # qsize() is diagnostic only and may be approximate (or
+                    # unsupported) on some multiprocessing platforms.
                     f" queue={queue_size(result_queue)}/{args.actor_queue_size}"
                     f" actor_wait={blocked_seconds / max(1, args.num_actors * elapsed):.3f}"
                     f" policy_lag={max_lag}"
@@ -576,23 +674,41 @@ def run_async_training(
             )
             print(f"Saved final checkpoint: {path}")
     finally:
+        # This block runs after normal completion, Ctrl+C, or an exception.
+        # Set the shared event first so actors stop collecting and any actor
+        # blocked in its retry loop can leave without successfully queueing.
         stop_event.set()
+
+        # Also enqueue a point-to-point stop command for each actor. It is
+        # redundant with stop_event during normal shutdown, but lets actors
+        # notice shutdown while draining their own control queue.
         for control in control_queues:
             try:
                 control.put_nowait(("stop",))
             except queue.Full:
                 pass
+        # join() waits for graceful child exit but does not stop a process. The
+        # timeout prevents a broken actor from hanging the learner forever.
         for process in actors:
             process.join(timeout=10.0)
+
+        # terminate() is the last-resort hard stop for children that ignored the
+        # cooperative Event/command shutdown. A second join reaps the process.
         for process in actors:
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=5.0)
+        # Children may have reported a final queue timeout while shutdown was
+        # beginning. Consume those events before closing IPC resources.
         queue_put_timeouts = report_actor_status_events(
             status_queue, tb_logger, total_black_steps, queue_put_timeouts
         )
+        # close() releases this parent's queue pipe and feeder-thread resources;
+        # it does not delete replay data already copied into the learner.
         result_queue.close()
         status_queue.close()
+        # Close every learner -> actor control pipe after all children have
+        # exited; closing them earlier could make a live actor receive EOF.
         for control in control_queues:
             control.close()
 
@@ -625,12 +741,17 @@ def main() -> None:
     if args.reward_shaping_scale < 0:
         raise ValueError("--reward-shaping-scale cannot be negative")
     if args.num_actors > 0:
+        # Preferred path: independent actor processes asynchronously feed the
+        # single learner. args.async_envs does not control this architecture.
         try:
             run_async_training(args, train_agent, opponent, opponent_rng, tb_logger)
         finally:
             tb_logger.close()
         return
 
+    # Legacy path: there are no actor processes. In this path only,
+    # --async-envs changes the Gymnasium vector implementation from
+    # SyncVectorEnv to AsyncVectorEnv (one environment worker per process).
     if args.async_envs:
         print(
             "Warning: --async-envs is deprecated; the lightweight Gomoku env "

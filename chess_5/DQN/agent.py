@@ -326,13 +326,13 @@ def ensure_batch_board(boards: np.ndarray) -> np.ndarray:
     return boards.astype(np.int8, copy=False)
 
 
-def encode_boards(boards: np.ndarray, current_players: np.ndarray) -> np.ndarray:
-    boards = ensure_batch_board(boards)
-    players = np.asarray(current_players).reshape(-1, 1, 1).astype(np.int8)
-    own = boards == players
-    opponent = boards == -players
-    empty = boards == 0
-    return np.stack([own, opponent, empty], axis=1).astype(np.float32)
+def encode_boards(boards: np.ndarray, current_players: np.ndarray) -> np.ndarray:  # 将棋盘编码成当前行棋方视角的三通道网络输入。
+    boards = ensure_batch_board(boards)  # 确保棋盘带有批次维度，形状统一为 [B, H, W]。
+    players = np.asarray(current_players).reshape(-1, 1, 1).astype(np.int8)  # 转为 [B, 1, 1]，便于和棋盘广播比较。
+    own = boards == players  # 标记当前行棋方的棋子位置，形状为 [B, H, W]。
+    opponent = boards == -players  # 标记对手棋子的位置，形状为 [B, H, W]。
+    empty = boards == 0  # 标记尚未落子的空位置，形状为 [B, H, W]。
+    return np.stack([own, opponent, empty], axis=1).astype(np.float32)  # 堆叠为 [B, 3, H, W] 浮点张量。
 
 
 def random_legal_actions(action_masks: np.ndarray, rng: np.random.Generator) -> np.ndarray:
