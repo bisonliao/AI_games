@@ -16,9 +16,11 @@ from env import GomokuEnv
 
 try:
     from .agent import DQNAgent
+    from .heuristic_agent import HeuristicAgent
     from .run_paths import checkpoint_filename, named_directory, validate_run_name
 except ImportError:
     from agent import DQNAgent
+    from heuristic_agent import HeuristicAgent
     from run_paths import checkpoint_filename, named_directory, validate_run_name
 
 
@@ -27,12 +29,13 @@ DEFAULT_HISTORY_DIR = Path(__file__).resolve().parent / "history"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Play Gomoku as black against a white DQN checkpoint."
+        description="Play Gomoku as black against a white DQN or heuristic agent."
     )
+    parser.add_argument("--opponent", choices=("dqn", "heuristic"), default="dqn")
     parser.add_argument(
-        "--run-name", required=True,
+        "--run-name", default=None,
         help=(
-            "Required training name used to select its checkpoint directory. "
+            "Training name required for a DQN opponent. "
             "Pass an empty string to use legacy checkpoints directly under --history-dir."
         ),
     )
@@ -48,7 +51,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--history-dir", type=Path, default=DEFAULT_HISTORY_DIR)
     parser.add_argument("--board-size", type=int, default=5)
     parser.add_argument("--device", type=str, default="auto")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.opponent == "dqn" and args.run_name is None:
+        parser.error("--run-name is required when --opponent=dqn")
+    return args
 
 
 def checkpoint_sort_key(path: Path) -> Any:
@@ -123,18 +129,24 @@ def wait_after_game() -> bool:
             return True
 
 
-def result_text(winner: int) -> str:
+def result_text(winner: int, opponent_name: str = "DQN agent") -> str:
     if winner == 1:
         return "黑棋获胜，你赢了！"
     if winner == -1:
-        return "白棋获胜，DQN agent 赢了。"
+        return f"白棋获胜，{opponent_name} 赢了。"
     return "和棋。"
 
 
 def main() -> None:
     args = parse_args()
-    checkpoint = resolve_checkpoint(args.history_dir, args.run_name, args.checkpoint)
-    agent = build_agent(args.board_size, args.device, checkpoint)
+    if args.opponent == "heuristic":
+        checkpoint = None
+        agent: Any = HeuristicAgent(seed=0)
+        opponent_name = "启发式机器人"
+    else:
+        checkpoint = resolve_checkpoint(args.history_dir, args.run_name, args.checkpoint)
+        agent = build_agent(args.board_size, args.device, checkpoint)
+        opponent_name = "DQN agent"
     env = GomokuEnv(
         board_size=args.board_size,
         render_mode="human",
@@ -142,8 +154,9 @@ def main() -> None:
         illegal_action_mode="raise",
     )
 
-    print(f"Loaded checkpoint: {checkpoint}")
-    print("你执黑棋，点击棋盘上的交叉点落子；DQN agent 执白棋。")
+    if checkpoint is not None:
+        print(f"Loaded checkpoint: {checkpoint}")
+    print(f"你执黑棋，点击棋盘上的交叉点落子；{opponent_name}执白棋。")
     try:
         game_number = 1
         while True:
@@ -165,7 +178,7 @@ def main() -> None:
                     )
                 obs, _, terminated, truncated, info = env.step(action)
 
-            print(result_text(int(info["winner"])))
+            print(result_text(int(info["winner"]), opponent_name))
             print("点击棋盘或按任意键开始下一局；关闭窗口退出。")
             if not wait_after_game():
                 break

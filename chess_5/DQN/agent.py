@@ -197,6 +197,8 @@ class DQNAgent:
         *,
         force: bool = False,
         collect_metrics: bool = True,
+        replay_b: Optional[ReplayBuffer] = None,
+        replay_b_fraction: float = 0.0,
     ) -> Optional[Dict[str, float]]:
         self.learn_calls += 1
         if len(self.replay) < self.min_replay_size:
@@ -204,10 +206,10 @@ class DQNAgent:
         if not force and self.learn_calls % self.train_freq != 0:
             return None
 
-        states, actions, rewards, next_states, next_masks, dones, discounts = self.replay.sample(
-            self.batch_size,
-            self.device,
+        batch, actual_replay_b_fraction = self._sample_training_batch(
+            replay_b, replay_b_fraction,
         )
+        states, actions, rewards, next_states, next_masks, dones, discounts = batch
 
         q_values = self.online_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
 
@@ -252,7 +254,39 @@ class DQNAgent:
             "td_error_abs": float((targets.detach() - q_values.detach()).abs().mean().item()),
             "grad_max": grad_max,
             "grad_norm": float(grad_norm_sq ** 0.5),
+            "replay_b_fraction": actual_replay_b_fraction,
         }
+
+    def _sample_training_batch(
+        self,
+        replay_b: Optional[ReplayBuffer],
+        replay_b_fraction: float,
+    ) -> Tuple[Tuple[torch.Tensor, ...], float]:
+        """Sample one learner batch without changing the rollout-A replay path.
+
+        With no ready secondary replay this calls the original replay buffer
+        exactly once for the full batch.  When replay B is supplied, each
+        component is sampled independently and concatenated on the learner
+        device; update frequency and total batch size remain unchanged.
+        """
+        fraction = float(replay_b_fraction)
+        if not 0.0 <= fraction <= 1.0:
+            raise ValueError("replay_b_fraction must be between 0 and 1")
+        if replay_b is None or len(replay_b) == 0 or fraction == 0.0:
+            return self.replay.sample(self.batch_size, self.device), 0.0
+
+        replay_b_count = min(self.batch_size, max(1, round(self.batch_size * fraction)))
+        replay_a_count = self.batch_size - replay_b_count
+        if replay_a_count == 0:
+            return replay_b.sample(replay_b_count, self.device), 1.0
+
+        batch_a = self.replay.sample(replay_a_count, self.device)
+        batch_b = replay_b.sample(replay_b_count, self.device)
+        combined = tuple(
+            torch.cat((value_a, value_b), dim=0)
+            for value_a, value_b in zip(batch_a, batch_b)
+        )
+        return combined, replay_b_count / self.batch_size
 
     def sync_target(self) -> None:
         self.target_net.load_state_dict(self.online_net.state_dict())

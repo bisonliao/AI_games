@@ -21,11 +21,13 @@ if str(ROOT) not in sys.path:
 from env import make_vector_env
 
 try:
-    from .agent import DQNAgent, RandomAgent, encode_boards, slice_obs
+    from .agent import DQNAgent, RandomAgent, ReplayBuffer, encode_boards, slice_obs
+    from .evaluator import HeuristicEvaluator
     from .returns import NStepAccumulator, Transition, shaped_reward
     from .run_paths import checkpoint_filename, named_directory, validate_run_name
 except ImportError:
-    from agent import DQNAgent, RandomAgent, encode_boards, slice_obs
+    from agent import DQNAgent, RandomAgent, ReplayBuffer, encode_boards, slice_obs
+    from evaluator import HeuristicEvaluator
     from returns import NStepAccumulator, Transition, shaped_reward
     from run_paths import checkpoint_filename, named_directory, validate_run_name
 
@@ -62,7 +64,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-checkpoint", type=int, default=1_000_000)
     parser.add_argument("--load-opponent", type=int, default=2_000_000)
     parser.add_argument("--checkpoint-rand", type=int, default=10)
+    parser.add_argument("--num-sidecar-actors", type=int, default=2)
+    parser.add_argument("--sidecar-envs-per-actor", type=int, default=16)
+    parser.add_argument("--sidecar-batch-size", type=int, default=256)
+    parser.add_argument("--sidecar-queue-size", type=int, default=8)
+    parser.add_argument("--replay-b-size", type=int, default=50_000)
+    parser.add_argument("--replay-b-min-size", type=int, default=1_000)
+    parser.add_argument("--replay-b-fraction", type=float, default=0.20)
     parser.add_argument("--load-optimizer", action="store_true")
+    parser.add_argument("--heuristic-eval-games", type=int, default=16)
+    parser.add_argument("--disable-heuristic-eval", action="store_true")
 
     parser.add_argument("--hidden-channels", type=int, default=96)
     parser.add_argument("--num-res-blocks", type=int, default=4)
@@ -84,7 +95,7 @@ def parse_args() -> argparse.Namespace:
         help="Disable multi-step returns and use one-step TD targets.",
     )
     parser.add_argument(
-        "--reward-shaping-scale", type=float, default=0.0,
+        "--reward-shaping-scale", type=float, default=0.02,
         help="Potential-based shaping strength; 0 (the default) disables shaping.",
     )
     parser.add_argument(
@@ -183,8 +194,8 @@ def maybe_reload_opponent(
 ) -> Any:
     checkpoints = history_checkpoints(args.history_dir)
     if not checkpoints:
-        print("Opponent reload skipped: no history checkpoints yet")
-        return None
+        print("No history checkpoint available; using random legal-move agent")
+        return RandomAgent(seed=seed)
 
     recent = checkpoints[-max(1, args.checkpoint_rand) :]
     checkpoint = rng.choice(recent)
@@ -241,7 +252,8 @@ def info_value(
 def print_log(
     *,
     total_black_steps: int,
-    start_time: float,
+    interval_steps: int,
+    interval_seconds: float,
     epsilon: float,
     replay_size: int,
     updates: int,
@@ -249,8 +261,7 @@ def print_log(
     last_loss: Optional[Dict[str, float]],
     collector_text: str = "",
 ) -> None:
-    elapsed = max(1e-6, time.time() - start_time)
-    steps_per_second = total_black_steps / elapsed
+    steps_per_second = interval_steps / max(1e-6, interval_seconds)
     episodes = max(1, int(stats["episodes"]))
     win_rate = stats["black_wins"] / episodes
     loss_rate = stats["black_losses"] / episodes
@@ -295,18 +306,25 @@ class TensorBoardLogger:
         replay_size: int,
         updates: int,
         stats: Dict[str, float],
+        window_stats: Dict[str, float],
         train_metrics: Optional[Dict[str, float]],
     ) -> None:
         if self.writer is None:
             return
 
-        episodes = max(1.0, stats["episodes"])
-        self.writer.add_scalar("Episode/mean_length", stats["episode_black_steps"] / episodes, step)
-        self.writer.add_scalar("Episode/mean_return", stats["episode_return"] / episodes, step)
+        window_episodes = max(1.0, window_stats["episodes"])
+        self.writer.add_scalar("Episode/mean_length", window_stats["episode_black_steps"] / window_episodes, step)
+        self.writer.add_scalar("Episode/mean_return", window_stats["episode_return"] / window_episodes, step)
+        self.writer.add_scalar("Outcome/win_rate", window_stats["black_wins"] / window_episodes, step)
+        self.writer.add_scalar("Outcome/loss_rate", window_stats["black_losses"] / window_episodes, step)
+        self.writer.add_scalar("Outcome/draw_rate", window_stats["draws"] / window_episodes, step)
 
-        self.writer.add_scalar("Outcome/win_rate", stats["black_wins"] / episodes, step)
-        self.writer.add_scalar("Outcome/loss_rate", stats["black_losses"] / episodes, step)
-        self.writer.add_scalar("Outcome/draw_rate", stats["draws"] / episodes, step)
+        cumulative_episodes = max(1.0, stats["episodes"])
+        self.writer.add_scalar("Cumulative/episode_mean_length", stats["episode_black_steps"] / cumulative_episodes, step)
+        self.writer.add_scalar("Cumulative/episode_mean_return", stats["episode_return"] / cumulative_episodes, step)
+        self.writer.add_scalar("Cumulative/win_rate", stats["black_wins"] / cumulative_episodes, step)
+        self.writer.add_scalar("Cumulative/loss_rate", stats["black_losses"] / cumulative_episodes, step)
+        self.writer.add_scalar("Cumulative/draw_rate", stats["draws"] / cumulative_episodes, step)
 
         self.writer.add_scalar("Train/epsilon", epsilon, step)
         self.writer.add_scalar("Train/replay_size", replay_size, step)
@@ -323,9 +341,64 @@ class TensorBoardLogger:
 
 def initial_opponent_payload(opponent: Any) -> Optional[Any]:
     if isinstance(opponent, RandomAgent):
-        return None
+        return ("random",)
     from DQN.async_train import cpu_state_dict
-    return (cpu_state_dict(opponent.online_net), dict(opponent.model_kwargs))
+    return ("dqn", cpu_state_dict(opponent.online_net), dict(opponent.model_kwargs))
+
+
+def opponent_control_command(opponent: Any) -> Any:
+    if isinstance(opponent, RandomAgent):
+        return ("opponent_random",)
+    from DQN.async_train import cpu_state_dict
+    return (
+        "opponent", cpu_state_dict(opponent.online_net), dict(opponent.model_kwargs)
+    )
+
+
+def report_evaluation_results(
+    evaluator: Optional[HeuristicEvaluator],
+    tb_logger: TensorBoardLogger,
+    failure_count: int,
+    messages: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    if evaluator is None and messages is None:
+        return failure_count
+    results = messages if messages is not None else evaluator.poll()
+    for result in results:
+        step = int(result["step"])
+        if result["type"] == "evaluation_error":
+            failure_count += 1
+            print(
+                f"WARNING: heuristic evaluation failed checkpoint={result['checkpoint']} "
+                f"step={step}\n{result['traceback']}",
+                flush=True,
+            )
+            if tb_logger.writer is not None:
+                tb_logger.writer.add_scalar(
+                    "Evaluation/heuristic_failures_total", failure_count, step
+                )
+                tb_logger.writer.flush()
+            continue
+        games = max(1, int(result["games"]))
+        win_rate = result["wins"] / games
+        loss_rate = result["losses"] / games
+        draw_rate = result["draws"] / games
+        print(
+            f"Heuristic evaluation checkpoint={result['checkpoint']} step={step} "
+            f"W/L/D={result['wins']}/{result['losses']}/{result['draws']} "
+            f"win_rate={win_rate:.3f} duration={result['duration_seconds']:.2f}s",
+            flush=True,
+        )
+        if tb_logger.writer is not None:
+            tb_logger.writer.add_scalar("Evaluation/heuristic_win_rate", win_rate, step)
+            tb_logger.writer.add_scalar("Evaluation/heuristic_loss_rate", loss_rate, step)
+            tb_logger.writer.add_scalar("Evaluation/heuristic_draw_rate", draw_rate, step)
+            tb_logger.writer.add_scalar(
+                "Evaluation/heuristic_duration_seconds",
+                float(result["duration_seconds"]), step,
+            )
+            tb_logger.writer.flush()
+    return failure_count
 
 
 def update_episode_stats(
@@ -342,6 +415,14 @@ def update_episode_stats(
         stats["black_losses"] += 1
     else:
         stats["draws"] += 1
+
+
+def stats_since(
+    current: Dict[str, float],
+    previous: Dict[str, float],
+) -> Dict[str, float]:
+    """Return per-log-window counters without mutating cumulative statistics."""
+    return {key: current[key] - previous.get(key, 0.0) for key in current}
 
 
 def add_n_step_transition(
@@ -399,6 +480,7 @@ def run_async_training(
     opponent: Any,
     opponent_rng: random.Random,
     tb_logger: TensorBoardLogger,
+    evaluator: Optional[HeuristicEvaluator],
 ) -> None:
     """Run the asynchronous actor-learner training pipeline.
 
@@ -413,6 +495,7 @@ def run_async_training(
     is ignored by this function.
     """
     from DQN.async_train import actor_worker, cpu_state_dict
+    from DQN.heuristic_sidecar import HeuristicSidecar
 
     for name in ("num_actors", "envs_per_actor", "actor_batch_size", "actor_queue_size"):
         if getattr(args, name) < 1:
@@ -421,6 +504,18 @@ def run_async_training(
         raise ValueError("--policy-sync-steps must be at least 1")
     if args.updates_per_step < 0:
         raise ValueError("--updates-per-step cannot be negative")
+    if args.num_sidecar_actors < 0:
+        raise ValueError("--num-sidecar-actors cannot be negative")
+    for name in (
+        "sidecar_envs_per_actor", "sidecar_batch_size", "sidecar_queue_size",
+        "replay_b_size", "replay_b_min_size",
+    ):
+        if getattr(args, name) < 1:
+            raise ValueError(f"--{name.replace('_', '-')} must be at least 1")
+    if args.replay_b_min_size > args.replay_b_size:
+        raise ValueError("--replay-b-min-size cannot exceed --replay-b-size")
+    if not 0.0 <= args.replay_b_fraction <= 1.0:
+        raise ValueError("--replay-b-fraction must be between 0 and 1")
     if args.async_envs:
         print("Warning: --async-envs is ignored when --num-actors > 0", flush=True)
 
@@ -461,6 +556,33 @@ def run_async_training(
     # copied CPU NumPy arrays so IPC does not depend on CUDA tensors or PyTorch's
     # file-descriptor-based tensor sharing mechanism.
     initial_policy = cpu_state_dict(train_agent.online_net)
+
+    # Rollout B owns different processes, queues, environments and transition
+    # collectors. Nothing from this controller is passed into rollout-A actors.
+    sidecar_enabled = args.num_sidecar_actors > 0 and args.replay_b_fraction > 0.0
+    replay_b = ReplayBuffer(
+        args.replay_b_size if sidecar_enabled else 1,
+        args.board_size, args.board_size * args.board_size,
+        seed=args.seed + 80_000,
+    )
+    sidecar: Optional[HeuristicSidecar] = None
+    if sidecar_enabled:
+        sidecar = HeuristicSidecar(
+            config={
+                "seed": args.seed,
+                "board_size": args.board_size,
+                "envs_per_actor": args.sidecar_envs_per_actor,
+                "batch_size": args.sidecar_batch_size,
+                "n_step": args.n_step,
+                "gamma": args.gamma,
+                "reward_shaping_scale": args.reward_shaping_scale,
+            },
+            initial_policy=initial_policy,
+            model_kwargs=dict(train_agent.model_kwargs),
+            num_actors=args.num_sidecar_actors,
+            queue_size=args.sidecar_queue_size,
+            context=ctx,
+        )
 
     # Prepare the white-player policy that every actor receives at startup.
     # - RandomAgent -> None: the child constructs its own seeded RandomPolicy.
@@ -515,12 +637,22 @@ def run_async_training(
         "episodes": 0.0, "black_wins": 0.0, "black_losses": 0.0, "draws": 0.0,
         "episode_black_steps": 0.0, "episode_return": 0.0,
     }
+    last_log_stats = {key: 0.0 for key in stats}
     actor_versions = [-1] * args.num_actors
     blocked_seconds = 0.0
     received_batches = 0
     queue_put_timeouts = 0
+    last_log_queue_put_timeouts = 0
+    evaluation_failures = 0
     start_time = time.time()
+    last_log_time = start_time
     updates_at_start = train_agent.update_steps
+    last_log_updates = train_agent.update_steps
+    last_log_blocked_seconds = 0.0
+    last_log_sidecar_transitions = 0
+    last_log_sidecar_outcomes = {
+        "agent_wins": 0, "agent_losses": 0, "draws": 0,
+    }
 
     print(
         f"Async training: actors={args.num_actors} envs/actor={args.envs_per_actor} "
@@ -532,9 +664,25 @@ def run_async_training(
     # wait for actor_worker to return here.
     for process in actors:
         process.start()
+    if sidecar is not None:
+        sidecar.start()
+        print(
+            f"Rollout B: actors={args.num_sidecar_actors} "
+            f"envs/actor={args.sidecar_envs_per_actor} "
+            f"replay={args.replay_b_size} warmup={args.replay_b_min_size} "
+            f"sample_fraction={args.replay_b_fraction:g}",
+            flush=True,
+        )
 
     try:
         while total_black_steps < args.total_black_steps:
+            # This is deliberately non-blocking. A slow or failed rollout B
+            # cannot delay consumption of the rollout-A transition queue.
+            if sidecar is not None:
+                sidecar.drain_into(replay_b)
+            evaluation_failures = report_evaluation_results(
+                evaluator, tb_logger, evaluation_failures
+            )
             # Non-blockingly drain the dedicated actor status channel. This is
             # done before consuming transitions so timeout warnings are handled
             # even while the main result queue remains full.
@@ -590,9 +738,15 @@ def run_async_training(
             update_credit -= requested_updates  # Preserve the fractional quota for later batches.
             log_due = total_black_steps - last_log_step >= args.log_interval  # Whether metrics are due.
             for update_index in range(requested_updates):
+                ready_replay_b = (
+                    replay_b if sidecar is not None
+                    and len(replay_b) >= args.replay_b_min_size else None
+                )
                 metrics = train_agent.train_step(
                     force=True,
                     collect_metrics=log_due and update_index == requested_updates - 1,
+                    replay_b=ready_replay_b,
+                    replay_b_fraction=args.replay_b_fraction,
                 )
                 if metrics is not None:
                     last_loss = metrics
@@ -602,12 +756,16 @@ def run_async_training(
             queue_put_timeouts = report_actor_status_events(
                 status_queue, tb_logger, total_black_steps, queue_put_timeouts
             )
+            if sidecar is not None:
+                sidecar.drain_into(replay_b)
 
             while args.save_checkpoint > 0 and total_black_steps >= next_save_step:
                 path = save_history_checkpoint(
                     train_agent, args.history_dir, history_index, total_black_steps, args
                 )
                 print(f"Saved history checkpoint: {path}")
+                if evaluator is not None:
+                    evaluator.submit(path, total_black_steps)
                 history_index += 1
                 next_save_step += args.save_checkpoint
 
@@ -617,13 +775,12 @@ def run_async_training(
                 )
                 if reloaded is not None:
                     opponent = reloaded
-                    state = cpu_state_dict(opponent.online_net)
-                    kwargs = dict(opponent.model_kwargs)
+                    command = opponent_control_command(opponent)
                     # Queue items are point-to-point, so explicitly put one
                     # opponent command into every actor's private control queue
                     # to implement a broadcast.
                     for control in control_queues:
-                        control.put(("opponent", state, kwargs))
+                        control.put(command)
                 next_load_step += args.load_opponent
 
             while total_black_steps >= next_policy_sync:
@@ -634,50 +791,134 @@ def run_async_training(
                 # commands between transition batches, not during a game step.
                 for control in control_queues:
                     control.put(("policy", version, state))
+                if sidecar is not None:
+                    sidecar.sync_policy(version, state)
                 next_policy_sync += args.policy_sync_steps
 
             if total_black_steps - last_log_step >= args.log_interval:
-                elapsed = max(1e-6, time.time() - start_time)
+                now = time.time()
+                elapsed = max(1e-6, now - start_time)
+                interval_seconds = max(1e-6, now - last_log_time)
+                interval_steps = total_black_steps - last_log_step
                 updates = train_agent.update_steps - updates_at_start
+                interval_updates = train_agent.update_steps - last_log_updates
+                window_stats = stats_since(stats, last_log_stats)
                 valid_versions = [version for version in actor_versions if version >= 0]
                 max_lag = total_black_steps - min(valid_versions) if valid_versions else total_black_steps
+                interval_actor_wait = (
+                    (blocked_seconds - last_log_blocked_seconds)
+                    / max(1e-6, args.num_actors * interval_seconds)
+                )
+                sidecar_transitions = (
+                    int(sidecar.stats["transitions"]) if sidecar is not None else 0
+                )
+                sidecar_rate = (
+                    (sidecar_transitions - last_log_sidecar_transitions)
+                    / interval_seconds
+                )
+                active_b_fraction = (
+                    args.replay_b_fraction
+                    if sidecar is not None and len(replay_b) >= args.replay_b_min_size
+                    else 0.0
+                )
+                sidecar_outcomes = {
+                    key: int(sidecar.stats[key]) if sidecar is not None else 0
+                    for key in ("agent_wins", "agent_losses", "draws")
+                }
+                sidecar_window_outcomes = {
+                    key: sidecar_outcomes[key] - last_log_sidecar_outcomes[key]
+                    for key in sidecar_outcomes
+                }
+                sidecar_window_episodes = max(
+                    1, sum(sidecar_window_outcomes.values())
+                )
+                sidecar_window_rates = {
+                    key: value / sidecar_window_episodes
+                    for key, value in sidecar_window_outcomes.items()
+                }
+                sidecar_outcome_text = (
+                    ""
+                    if sidecar is None else
+                    f" b_W/L/D={sidecar_window_rates['agent_wins']:.3f}/"
+                    f"{sidecar_window_rates['agent_losses']:.3f}/"
+                    f"{sidecar_window_rates['draws']:.3f}"
+                )
                 collector_text = (
-                    f" sample={total_black_steps / elapsed:.1f}/s"
-                    f" update={updates / elapsed:.1f}/s"
+                    f" sample={interval_steps / interval_seconds:.1f}/s"
+                    f" update={interval_updates / interval_seconds:.1f}/s"
                     # qsize() is diagnostic only and may be approximate (or
                     # unsupported) on some multiprocessing platforms.
                     f" queue={queue_size(result_queue)}/{args.actor_queue_size}"
-                    f" actor_wait={blocked_seconds / max(1, args.num_actors * elapsed):.3f}"
+                    f" actor_wait={interval_actor_wait:.3f}"
                     f" policy_lag={max_lag}"
+                    f" replay_b={len(replay_b)}"
+                    f" b_rate={sidecar_rate:.1f}/s"
+                    f" b_sample={active_b_fraction:.3f}"
+                    f"{sidecar_outcome_text}"
                 )
                 print_log(
-                    total_black_steps=total_black_steps, start_time=start_time,
+                    total_black_steps=total_black_steps,
+                    interval_steps=interval_steps, interval_seconds=interval_seconds,
                     epsilon=epsilon_by_step(args, total_black_steps), replay_size=len(train_agent.replay),
-                    updates=train_agent.update_steps, stats=stats, last_loss=last_loss,
+                    updates=train_agent.update_steps, stats=window_stats, last_loss=last_loss,
                     collector_text=collector_text,
                 )
                 tb_logger.add_scalars(
                     step=total_black_steps, epsilon=epsilon_by_step(args, total_black_steps),
                     replay_size=len(train_agent.replay), updates=train_agent.update_steps,
-                    stats=stats, train_metrics=last_loss,
+                    stats=stats, window_stats=window_stats, train_metrics=last_loss,
                 )
                 if tb_logger.writer is not None:
-                    tb_logger.writer.add_scalar("Throughput/sample_steps_per_second", total_black_steps / elapsed, total_black_steps)
-                    tb_logger.writer.add_scalar("Throughput/updates_per_second", updates / elapsed, total_black_steps)
+                    tb_logger.writer.add_scalar("Throughput/sample_steps_per_second", interval_steps / interval_seconds, total_black_steps)
+                    tb_logger.writer.add_scalar("Throughput/updates_per_second", interval_updates / interval_seconds, total_black_steps)
+                    tb_logger.writer.add_scalar("Cumulative/sample_steps_per_second", total_black_steps / elapsed, total_black_steps)
+                    tb_logger.writer.add_scalar("Cumulative/updates_per_second", updates / elapsed, total_black_steps)
                     tb_logger.writer.add_scalar("Actors/policy_lag_steps", max_lag, total_black_steps)
                     tb_logger.writer.add_scalar("Actors/queue_size", max(0, queue_size(result_queue)), total_black_steps)
+                    tb_logger.writer.add_scalar("Actors/queue_put_timeouts_interval", queue_put_timeouts - last_log_queue_put_timeouts, total_black_steps)
+                    tb_logger.writer.add_scalar("ReplayB/size", len(replay_b), total_black_steps)
+                    tb_logger.writer.add_scalar("ReplayB/transitions_per_second", sidecar_rate, total_black_steps)
+                    tb_logger.writer.add_scalar("ReplayB/sample_fraction", active_b_fraction, total_black_steps)
+                    if sidecar is not None:
+                        cumulative_episodes = max(1, sum(sidecar_outcomes.values()))
+                        tb_logger.writer.add_scalar("ReplayB/queue_size", max(0, sidecar.queue_size()), total_black_steps)
+                        tb_logger.writer.add_scalar("ReplayB/policy_lag_steps", sidecar.max_policy_lag(total_black_steps), total_black_steps)
+                        tb_logger.writer.add_scalar("ReplayB/agent_win_rate", sidecar_window_rates["agent_wins"], total_black_steps)
+                        tb_logger.writer.add_scalar("ReplayB/agent_loss_rate", sidecar_window_rates["agent_losses"], total_black_steps)
+                        tb_logger.writer.add_scalar("ReplayB/draw_rate", sidecar_window_rates["draws"], total_black_steps)
+                        tb_logger.writer.add_scalar("ReplayB/cumulative_agent_win_rate", sidecar_outcomes["agent_wins"] / cumulative_episodes, total_black_steps)
+                        tb_logger.writer.add_scalar("ReplayB/cumulative_agent_loss_rate", sidecar_outcomes["agent_losses"] / cumulative_episodes, total_black_steps)
+                        tb_logger.writer.add_scalar("ReplayB/cumulative_draw_rate", sidecar_outcomes["draws"] / cumulative_episodes, total_black_steps)
+                        tb_logger.writer.add_scalar("ReplayB/queue_put_timeouts_total", sidecar.stats["queue_put_timeouts"], total_black_steps)
+                        tb_logger.writer.add_scalar("ReplayB/actor_failures_total", sidecar.stats["failures"], total_black_steps)
+                    tb_logger.writer.flush()
                 last_log_step = total_black_steps
+                last_log_time = now
+                last_log_updates = train_agent.update_steps
+                last_log_blocked_seconds = blocked_seconds
+                last_log_queue_put_timeouts = queue_put_timeouts
+                last_log_stats = dict(stats)
+                last_log_sidecar_transitions = sidecar_transitions
+                last_log_sidecar_outcomes = sidecar_outcomes
 
         if args.save_final:
             path = save_history_checkpoint(
                 train_agent, args.history_dir, history_index, total_black_steps, args
             )
             print(f"Saved final checkpoint: {path}")
+            if evaluator is not None:
+                evaluator.submit(path, total_black_steps)
     finally:
         # This block runs after normal completion, Ctrl+C, or an exception.
         # Set the shared event first so actors stop collecting and any actor
         # blocked in its retry loop can leave without successfully queueing.
         stop_event.set()
+
+        # Stop and reap the optional sidecar independently. Rollout A has
+        # already received its stop event, so waiting for a slow heuristic move
+        # cannot make rollout-A actors fill their queue during shutdown.
+        if sidecar is not None:
+            sidecar.close(replay_b)
 
         # Also enqueue a point-to-point stop command for each actor. It is
         # redundant with stop_event during normal shutdown, but lets actors
@@ -740,14 +981,41 @@ def main() -> None:
         raise ValueError("--n-step must be at least 1")
     if args.reward_shaping_scale < 0:
         raise ValueError("--reward-shaping-scale cannot be negative")
+    if args.heuristic_eval_games < 1:
+        raise ValueError("--heuristic-eval-games must be at least 1")
+
+    evaluator: Optional[HeuristicEvaluator] = None
+    if not args.disable_heuristic_eval:
+        evaluator = HeuristicEvaluator(
+            board_size=args.board_size,
+            num_games=args.heuristic_eval_games,
+            seed=args.seed + 90_000,
+        )
     if args.num_actors > 0:
         # Preferred path: independent actor processes asynchronously feed the
         # single learner. args.async_envs does not control this architecture.
+        completed = False
+        evaluation_failures = 0
         try:
-            run_async_training(args, train_agent, opponent, opponent_rng, tb_logger)
+            run_async_training(
+                args, train_agent, opponent, opponent_rng, tb_logger, evaluator
+            )
+            completed = True
         finally:
+            if evaluator is not None:
+                final_results = evaluator.close(drain=completed)
+                evaluation_failures = report_evaluation_results(
+                    None, tb_logger, evaluation_failures, final_results
+                )
             tb_logger.close()
         return
+
+    if args.num_sidecar_actors > 0 and args.replay_b_fraction > 0.0:
+        print(
+            "Warning: rollout B is disabled in the legacy --num-actors=0 path; "
+            "rollout A remains unchanged.",
+            flush=True,
+        )
 
     # Legacy path: there are no actor processes. In this path only,
     # --async-envs changes the Gymnasium vector implementation from
@@ -785,12 +1053,21 @@ def main() -> None:
         "episode_black_steps": 0.0,
         "episode_return": 0.0,
     }
+    last_log_stats = {key: 0.0 for key in stats}
     start_time = time.time()
+    last_log_time = start_time
+    updates_at_start = train_agent.update_steps
+    last_log_updates = train_agent.update_steps
+    evaluation_failures = 0
+    completed = False
 
     try:
         obs, _ = envs.reset(seed=args.seed)
 
         while total_black_steps < args.total_black_steps:
+            evaluation_failures = report_evaluation_results(
+                evaluator, tb_logger, evaluation_failures
+            )
             current_players = obs["current_player"].reshape(-1)
             actions = np.zeros(args.num_envs, dtype=np.int64)
 
@@ -923,6 +1200,8 @@ def main() -> None:
                     args,
                 )
                 print(f"Saved history checkpoint: {checkpoint_path}")
+                if evaluator is not None:
+                    evaluator.submit(checkpoint_path, total_black_steps)
                 history_index += 1
                 next_save_step += args.save_checkpoint
 
@@ -933,13 +1212,19 @@ def main() -> None:
                 next_load_step += args.load_opponent
 
             if total_black_steps - last_log_step >= args.log_interval:
+                now = time.time()
+                interval_seconds = max(1e-6, now - last_log_time)
+                interval_steps = total_black_steps - last_log_step
+                interval_updates = train_agent.update_steps - last_log_updates
+                window_stats = stats_since(stats, last_log_stats)
                 print_log(
                     total_black_steps=total_black_steps,
-                    start_time=start_time,
+                    interval_steps=interval_steps,
+                    interval_seconds=interval_seconds,
                     epsilon=epsilon_by_step(args, total_black_steps),
                     replay_size=len(train_agent.replay),
                     updates=train_agent.update_steps,
-                    stats=stats,
+                    stats=window_stats,
                     last_loss=last_loss,
                 )
                 tb_logger.add_scalars(
@@ -948,9 +1233,33 @@ def main() -> None:
                     replay_size=len(train_agent.replay),
                     updates=train_agent.update_steps,
                     stats=stats,
+                    window_stats=window_stats,
                     train_metrics=last_loss,
                 )
+                if tb_logger.writer is not None:
+                    elapsed = max(1e-6, now - start_time)
+                    tb_logger.writer.add_scalar(
+                        "Throughput/sample_steps_per_second",
+                        interval_steps / interval_seconds, total_black_steps,
+                    )
+                    tb_logger.writer.add_scalar(
+                        "Throughput/updates_per_second",
+                        interval_updates / interval_seconds, total_black_steps,
+                    )
+                    tb_logger.writer.add_scalar(
+                        "Cumulative/sample_steps_per_second",
+                        total_black_steps / elapsed, total_black_steps,
+                    )
+                    tb_logger.writer.add_scalar(
+                        "Cumulative/updates_per_second",
+                        (train_agent.update_steps - updates_at_start) / elapsed,
+                        total_black_steps,
+                    )
+                    tb_logger.writer.flush()
                 last_log_step = total_black_steps
+                last_log_time = now
+                last_log_updates = train_agent.update_steps
+                last_log_stats = dict(stats)
 
             obs = next_obs
 
@@ -963,9 +1272,17 @@ def main() -> None:
                 args,
             )
             print(f"Saved final checkpoint: {checkpoint_path}")
+            if evaluator is not None:
+                evaluator.submit(checkpoint_path, total_black_steps)
+        completed = True
 
     finally:
         envs.close()
+        if evaluator is not None:
+            final_results = evaluator.close(drain=completed)
+            evaluation_failures = report_evaluation_results(
+                None, tb_logger, evaluation_failures, final_results
+            )
         tb_logger.close()
 
 

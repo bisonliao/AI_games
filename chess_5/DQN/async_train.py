@@ -178,7 +178,7 @@ def actor_worker(
     config: Dict[str, Any],  # 主进程传入的只读采样配置。
     initial_policy: StateDict,  # 初始黑棋网络权重；每项都是 CPU NumPy 数组。
     model_kwargs: Mapping[str, Any],  # 重建黑棋推理网络所需的结构参数。
-    initial_opponent: Optional[Tuple[StateDict, Mapping[str, Any]]],  # 白棋权重与结构；None 表示随机白棋。
+    initial_opponent: Any,  # 带类型标签的初始白棋配置，不直接跨进程传递agent对象。
     result_queue: Any,  # actor -> learner：发送批量 transition 或异常信息。
     status_queue: Any,  # actor -> learner：发送队列写入超时等状态事件。
     control_queue: Any,  # learner -> 当前 actor：接收黑棋/白棋权重更新与停止命令。
@@ -205,13 +205,16 @@ def actor_worker(
             config["board_size"], model_kwargs, initial_policy,
             seed=seed, device=config["actor_device"],
         )  # 创建 actor 私有的黑棋推理网络，不含 replay、target net 和 optimizer。
-        if initial_opponent is None:  # 主进程未提供白棋 checkpoint 时使用随机陪练。
+        opponent_kind = initial_opponent[0]
+        if opponent_kind == "random":  # 主进程未提供白棋 checkpoint 时使用随机陪练。
             opponent: Any = RandomPolicy(seed + 10_000)  # 使用与黑棋不同的随机数流。
-        else:  # 根据主进程快照创建白棋 DQN 推理网络。
+        elif opponent_kind == "dqn":  # 根据主进程快照创建白棋 DQN 推理网络。
             opponent = InferencePolicy(
-                config["board_size"], initial_opponent[1], initial_opponent[0],
+                config["board_size"], initial_opponent[2], initial_opponent[1],
                 seed=seed + 10_000, device=config["actor_device"],
             )  # 白棋只负责选动作，不参与梯度更新。
+        else:
+            raise ValueError(f"Unsupported rollout-A opponent type: {opponent_kind!r}")
 
         num_envs = int(config["envs_per_actor"])
         board_size = int(config["board_size"])
