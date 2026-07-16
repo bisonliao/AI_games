@@ -1,3 +1,5 @@
+"""DQN智能体核心：包含replay buffer、动作选择、梯度更新、棋盘编码与checkpoint读写。"""
+
 from __future__ import annotations
 
 import random
@@ -280,11 +282,19 @@ class DQNAgent:
         if replay_a_count == 0:
             return replay_b.sample(replay_b_count, self.device), 1.0
 
+        # ReplayBuffer.sample() 返回的不是单个Tensor，而是包含7个Tensor的tuple，字段顺序固定为：
+        # (states, actions, rewards, next_states, next_masks, dones, discounts)。
+        # batch_a中每个Tensor的首维是replay_a_count，即形状分别类似[Na,3,H,W]、[Na]、[Na,A]；
+        # batch_b的结构完全相同，只是每个Tensor的首维是replay_b_count（Nb）。
         batch_a = self.replay.sample(replay_a_count, self.device)
         batch_b = replay_b.sample(replay_b_count, self.device)
-        combined = tuple(
+        # 把下面的生成器物化为7元tuple，使返回类型与ReplayBuffer.sample()完全一致。
+        # zip按相同字段配对，例如先得到(A的states, B的states)，再得到(A的actions, B的actions)；
+        # torch.cat只沿batch维dim=0拼接，所以每个结果字段的首维都变成Na+Nb=self.batch_size，
+        # 而状态通道、棋盘尺寸、动作mask宽度等其余维度保持不变。
+        combined = tuple(  
             torch.cat((value_a, value_b), dim=0)
-            for value_a, value_b in zip(batch_a, batch_b)
+            for value_a, value_b in zip(batch_a, batch_b)  # 共遍历7对同类型、同字段的Tensor。
         )
         return combined, replay_b_count / self.batch_size
 

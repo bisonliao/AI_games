@@ -1,3 +1,5 @@
+"""Rollout A采样模块：在独立CPU进程中批量推进环境，只生成黑棋transition并接收策略/对手更新。"""
+
 from __future__ import annotations
 
 import queue

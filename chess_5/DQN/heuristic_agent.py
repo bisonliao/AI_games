@@ -1,3 +1,5 @@
+"""启发式五子棋机器人：实现立即胜负、威胁/双杀判断、浅层搜索和静态局面评分。"""
+
 from __future__ import annotations
 
 from typing import Iterable, List, Sequence, Tuple

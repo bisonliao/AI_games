@@ -1,3 +1,5 @@
+"""通用单玩家transition处理：维护pending决策、闭合对手回应区间并执行n-step聚合。"""
+
 from __future__ import annotations
 
 from typing import Dict, List, Sequence

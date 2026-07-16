@@ -1,3 +1,5 @@
+"""人机对弈入口：渲染棋盘，让人类执黑连续对战DQN checkpoint或启发式机器人。"""
+
 from __future__ import annotations
 
 import argparse

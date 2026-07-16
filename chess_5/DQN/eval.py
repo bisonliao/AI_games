@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate one or all DQN checkpoints as white against heuristic black."""
+"""离线评测入口：按路径或run-name加载checkpoint，分别执黑、执白对战启发式机器人并输出结果。"""
 
 from __future__ import annotations
 

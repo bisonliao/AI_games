@@ -1,3 +1,5 @@
+"""回报处理模块：定义Transition、n-step return累积器以及势能奖励塑形。"""
+
 from __future__ import annotations
 
 from collections import deque

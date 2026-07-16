@@ -1,3 +1,5 @@
+"""异步评测模块：用独立CPU进程按FIFO评测checkpoint，并将胜负、和棋与耗时返回训练主进程。"""
+
 from __future__ import annotations
 
 import multiprocessing as mp

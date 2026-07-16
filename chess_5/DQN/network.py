@@ -1,3 +1,5 @@
+"""DQN网络结构：定义带残差主干、优势头和价值头的Dueling Gomoku Q网络。"""
+
 from __future__ import annotations
 
 import torch

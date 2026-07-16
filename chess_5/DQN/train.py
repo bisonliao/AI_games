@@ -1,3 +1,5 @@
+"""Actor–learner训练入口：协调Rollout A/B、GPU learner、策略同步、日志、checkpoint与异步评测。"""
+
 from __future__ import annotations
 
 import argparse
@@ -18,17 +20,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from env import make_vector_env
-
 try:
-    from .agent import DQNAgent, RandomAgent, ReplayBuffer, encode_boards, slice_obs
+    from .agent import DQNAgent, RandomAgent, ReplayBuffer
     from .evaluator import HeuristicEvaluator
-    from .returns import NStepAccumulator, Transition, shaped_reward
     from .run_paths import checkpoint_filename, named_directory, validate_run_name
 except ImportError:
-    from agent import DQNAgent, RandomAgent, ReplayBuffer, encode_boards, slice_obs
+    from agent import DQNAgent, RandomAgent, ReplayBuffer
     from evaluator import HeuristicEvaluator
-    from returns import NStepAccumulator, Transition, shaped_reward
     from run_paths import checkpoint_filename, named_directory, validate_run_name
 
 
@@ -36,56 +34,44 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a Gomoku black-side DQN agent by self-play.")
 
     parser.add_argument("--run-name", required=True, help="Required name used to isolate checkpoints and logs.")
-    parser.add_argument("--board-size", type=int, default=5)
-    parser.add_argument("--num-envs", type=int, default=16)
-    parser.add_argument(
-        "--async-envs",
-        action="store_true",
-        help=(
-            "Deprecated: only when --num-actors=0, use Gymnasium "
-            "AsyncVectorEnv (one worker process per env). This is unrelated "
-            "to the asynchronous actor-learner pipeline."
-        ),
-    )
-    parser.add_argument("--num-actors", type=int, default=1)
-    parser.add_argument("--envs-per-actor", type=int, default=16)
-    parser.add_argument("--actor-batch-size", type=int, default=256)
-    parser.add_argument("--actor-queue-size", type=int, default=8)
-    parser.add_argument("--policy-sync-steps", type=int, default=5_000)
-    parser.add_argument("--updates-per-step", type=float, default=0.25)
-    parser.add_argument("--actor-device", choices=("cpu",), default="cpu")
-    parser.add_argument("--total-black-steps", type=int, default=50_000_000)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--board-size", type=int, default=5)  # 五子棋棋盘边长，支持5～9。
+    parser.add_argument("--num-actors", type=int, default=1)  # rollout A的actor进程数，必须至少为1。
+    parser.add_argument("--envs-per-actor", type=int, default=16)  # 每个rollout A actor内部的同步环境数。
+    parser.add_argument("--actor-batch-size", type=int, default=256)  # rollout A累计多少条transition后发送给learner。
+    parser.add_argument("--actor-queue-size", type=int, default=8)  # rollout A数据队列最多容纳的批次数。
+    parser.add_argument("--policy-sync-steps", type=int, default=5_000)  # learner向各actor同步黑棋权重的步数间隔。
+    parser.add_argument("--updates-per-step", type=float, default=0.25)  # 每条rollout A数据对应的梯度更新次数。
+    parser.add_argument("--total-black-steps", type=int, default=50_000_000)  # 本次训练接收的黑棋transition总目标数。
+    parser.add_argument("--seed", type=int, default=0)  # 训练、actor和环境的根随机种子。
+    parser.add_argument("--device", type=str, default="auto")  # learner训练设备；auto优先使用CUDA。
 
-    parser.add_argument("--black-checkpoint", type=Path, default=None)
-    parser.add_argument("--opponent-checkpoint", type=Path, default=None)
-    parser.add_argument("--history-dir", type=Path, default=Path(__file__).resolve().parent / "history")
-    parser.add_argument("--save-checkpoint", type=int, default=1_000_000)
-    parser.add_argument("--load-opponent", type=int, default=2_000_000)
-    parser.add_argument("--checkpoint-rand", type=int, default=10)
-    parser.add_argument("--num-sidecar-actors", type=int, default=2)
-    parser.add_argument("--sidecar-envs-per-actor", type=int, default=16)
-    parser.add_argument("--sidecar-batch-size", type=int, default=256)
-    parser.add_argument("--sidecar-queue-size", type=int, default=8)
-    parser.add_argument("--replay-b-size", type=int, default=50_000)
-    parser.add_argument("--replay-b-min-size", type=int, default=1_000)
-    parser.add_argument("--replay-b-fraction", type=float, default=0.20)
-    parser.add_argument("--load-optimizer", action="store_true")
-    parser.add_argument("--heuristic-eval-games", type=int, default=16)
-    parser.add_argument("--disable-heuristic-eval", action="store_true")
+    parser.add_argument("--black-checkpoint", type=Path, default=None)  # 用指定checkpoint初始化待训练的黑棋网络。
+    parser.add_argument("--opponent-checkpoint", type=Path, default=None)  # 用指定checkpoint初始化rollout A白棋对手。
+    parser.add_argument("--history-dir", type=Path, default=Path(__file__).resolve().parent / "history")  # checkpoint历史目录根路径。
+    parser.add_argument("--save-checkpoint", type=int, default=1_000_000)  # 保存历史checkpoint的黑棋步数间隔。
+    parser.add_argument("--load-opponent", type=int, default=2_000_000)  # rollout A重新抽取历史对手的步数间隔。
+    parser.add_argument("--checkpoint-rand", type=int, default=10)  # rollout A从最近多少个checkpoint中随机选对手。
+    parser.add_argument("--num-sidecar-actors", type=int, default=2)  # rollout B启发式旁路的独立actor进程数。
+    parser.add_argument("--sidecar-envs-per-actor", type=int, default=16)  # 每个rollout B actor内部的同步环境数。
+    parser.add_argument("--sidecar-batch-size", type=int, default=256)  # rollout B累计多少条双方transition后发送。
+    parser.add_argument("--sidecar-queue-size", type=int, default=8)  # rollout B数据队列最多容纳的批次数。
+    parser.add_argument("--replay-b-size", type=int, default=50_000)  # learner侧replay buffer B的最大容量。
+    parser.add_argument("--replay-b-min-size", type=int, default=5_000)  # replay B达到此大小后才参与采样。
+    parser.add_argument("--replay-b-fraction", type=float, default=0.20)  # 每个learner minibatch从replay B采样的目标比例。
+    parser.add_argument("--load-optimizer", action="store_true")  # 加载黑棋checkpoint时同时恢复optimizer状态。
+    parser.add_argument("--heuristic-eval-games", type=int, default=16)  # 每个checkpoint异步对战启发式机器人的评测局数。
+    parser.add_argument("--disable-heuristic-eval", action="store_true")  # 禁用checkpoint的异步启发式评测。
 
-    parser.add_argument("--hidden-channels", type=int, default=96)
-    parser.add_argument("--num-res-blocks", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--replay-size", type=int, default=200_000)
-    parser.add_argument("--min-replay-size", type=int, default=10_000)
-    parser.add_argument("--target-update", type=int, default=2_000)
-    parser.add_argument("--train-freq", type=int, default=1)
-    parser.add_argument("--grad-clip", type=float, default=10.0)
-    parser.add_argument("--no-double-dqn", action="store_true")
+    parser.add_argument("--hidden-channels", type=int, default=96)  # DQN卷积主干的隐藏通道数。
+    parser.add_argument("--num-res-blocks", type=int, default=4)  # DQN卷积主干的残差块数量。
+    parser.add_argument("--lr", type=float, default=1e-4)  # AdamW optimizer的学习率。
+    parser.add_argument("--gamma", type=float, default=0.99)  # TD回报和n-step return的折扣因子。
+    parser.add_argument("--batch-size", type=int, default=256)  # 每次梯度更新使用的minibatch大小。
+    parser.add_argument("--replay-size", type=int, default=200_000)  # rollout A replay buffer的最大容量。
+    parser.add_argument("--min-replay-size", type=int, default=10_000)  # rollout A达到此大小后才开始更新。
+    parser.add_argument("--target-update", type=int, default=2_000)  # 同步target network的梯度更新次数间隔。
+    parser.add_argument("--grad-clip", type=float, default=10.0)  # 梯度范数裁剪上限；不大于0表示关闭。
+    parser.add_argument("--no-double-dqn", action="store_true")  # 关闭Double DQN，改用普通DQN target。
     parser.add_argument(
         "--n-step", type=int, default=1,
         help="N-step return horizon; 1 (the default) uses one-step TD.",
@@ -101,16 +87,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-reward-shaping", dest="reward_shaping_scale",
         action="store_const", const=0.0,
-    )
+    )  # 强制关闭奖励塑形，将塑形强度设为0。
 
-    parser.add_argument("--epsilon-start", type=float, default=1.0)
-    parser.add_argument("--epsilon-end", type=float, default=0.05)
-    parser.add_argument("--epsilon-decay-steps", type=int, default=1_000_000)
-    parser.add_argument("--opponent-epsilon", type=float, default=0.0)
-    parser.add_argument("--log-interval", type=int, default=100_000)
-    parser.add_argument("--tb-log-dir", type=Path, default=Path(__file__).resolve().parent / "runs")
-    parser.add_argument("--disable-tensorboard", action="store_true")
-    parser.add_argument("--save-final", action="store_true")
+    parser.add_argument("--epsilon-start", type=float, default=1.0)  # 黑棋epsilon-greedy探索率的初始值。
+    parser.add_argument("--epsilon-end", type=float, default=0.05)  # 黑棋epsilon-greedy探索率的最终值。
+    parser.add_argument("--epsilon-decay-steps", type=int, default=1_000_000)  # epsilon从初值线性衰减到终值的步数。
+    parser.add_argument("--opponent-epsilon", type=float, default=0.0)  # rollout A白棋DQN对手的epsilon探索率。
+    parser.add_argument("--log-interval", type=int, default=100_000)  # 控制台和TensorBoard指标的上报步数间隔。
+    parser.add_argument("--tb-log-dir", type=Path, default=Path(__file__).resolve().parent / "runs")  # TensorBoard日志目录根路径。
+    parser.add_argument("--disable-tensorboard", action="store_true")  # 禁止创建和写入TensorBoard event文件。
+    parser.add_argument("--save-final", action="store_true")  # 训练正常结束时额外保存最终checkpoint。
 
     return parser.parse_args()
 
@@ -133,7 +119,6 @@ def make_agent(args: argparse.Namespace, seed: int) -> DQNAgent:
         replay_size=args.replay_size,
         min_replay_size=args.min_replay_size,
         target_update=args.target_update,
-        train_freq=args.train_freq,
         grad_clip=args.grad_clip,
         double_dqn=not args.no_double_dqn,
         device=args.device,
@@ -203,50 +188,6 @@ def maybe_reload_opponent(
     opponent.load_checkpoint(checkpoint, load_optimizer=False)
     print(f"Reloaded opponent from history: {checkpoint}")
     return opponent
-
-
-def info_value(
-    infos: Dict[str, Any],
-    key: str,
-    env_index: int,
-    done: bool,
-    default: Any,
-) -> Any:
-    """Read per-env info without mixing terminal and reset episodes.
-
-    With SameStep autoreset, top-level ``infos`` belongs to the newly reset
-    episode for a done env.  The step that actually terminated is stored under
-    ``final_info`` and must be used for its reward and outcome.
-    """
-    if done:
-        final_info_mask = infos.get("_final_info")
-        if final_info_mask is None or not final_info_mask[env_index]:
-            raise RuntimeError(
-                "Done environment is missing final_info; "
-                "the vector autoreset contract does not match the training loop."
-            )
-        final_infos = infos.get("final_info")
-        # Gymnasium 1.x vectorizes final_info as a dict of arrays. Older
-        # releases exposed an object array containing one dict per env.
-        if isinstance(final_infos, dict):
-            key_mask = final_infos.get(f"_{key}")
-            if key in final_infos and (key_mask is None or key_mask[env_index]):
-                return final_infos[key][env_index]
-        elif final_infos is not None:
-            final_info = final_infos[env_index]
-            if final_info is not None:
-                return final_info.get(key, default)
-        # Never fall through to top-level info for a done SameStep env: those
-        # values belong to the reset episode.
-        return default
-
-    if key not in infos:
-        return default
-    value = infos[key]
-    try:
-        return value[env_index]
-    except Exception:
-        return default
 
 
 def print_log(
@@ -425,19 +366,6 @@ def stats_since(
     return {key: current[key] - previous.get(key, 0.0) for key in current}
 
 
-def add_n_step_transition(
-    agent: DQNAgent,
-    accumulator: NStepAccumulator,
-    env_index: int,
-    transition: Transition,
-) -> None:
-    for item in accumulator.add(env_index, transition):
-        agent.add_transition(
-            item.state, item.action, item.reward, item.next_state,
-            item.next_mask, item.done, item.discount,
-        )
-
-
 def queue_size(value: Any) -> int:
     try:
         return int(value.qsize())
@@ -474,7 +402,7 @@ def report_actor_status_events(
     return timeout_count
 
 
-def run_async_training(
+def run_actor_learner_training(
     args: argparse.Namespace,
     train_agent: DQNAgent,
     opponent: Any,
@@ -482,18 +410,7 @@ def run_async_training(
     tb_logger: TensorBoardLogger,
     evaluator: Optional[HeuristicEvaluator],
 ) -> None:
-    """Run the asynchronous actor-learner training pipeline.
-
-    Here ``async`` describes the relationship between actors and the learner:
-    actor processes generate transition batches while the main-process learner
-    independently consumes queued batches and updates the network.  Each actor
-    deliberately uses a synchronous vector environment internally because a
-    Gomoku ``env.step()`` is much cheaper than cross-process Gymnasium IPC.
-
-    This is distinct from ``args.async_envs``.  That deprecated flag selects
-    Gymnasium ``AsyncVectorEnv`` only in the legacy ``--num-actors=0`` path and
-    is ignored by this function.
-    """
+    """Run CPU rollout actors and the main-process learner concurrently."""
     from DQN.async_train import actor_worker, cpu_state_dict
     from DQN.heuristic_sidecar import HeuristicSidecar
 
@@ -516,8 +433,6 @@ def run_async_training(
         raise ValueError("--replay-b-min-size cannot exceed --replay-b-size")
     if not 0.0 <= args.replay_b_fraction <= 1.0:
         raise ValueError("--replay-b-fraction must be between 0 and 1")
-    if args.async_envs:
-        print("Warning: --async-envs is ignored when --num-actors > 0", flush=True)
 
     # Always use the "spawn" start method. Each actor starts a fresh Python
     # interpreter instead of inheriting the learner with fork(). This has more
@@ -600,7 +515,7 @@ def run_async_training(
         "board_size": args.board_size,
         "envs_per_actor": args.envs_per_actor,
         "actor_batch_size": args.actor_batch_size,
-        "actor_device": args.actor_device,
+        "actor_device": "cpu",
         "epsilon_start": args.epsilon_start,
         "epsilon_end": args.epsilon_end,
         "epsilon_decay_steps": args.epsilon_decay_steps,
@@ -655,7 +570,7 @@ def run_async_training(
     }
 
     print(
-        f"Async training: actors={args.num_actors} envs/actor={args.envs_per_actor} "
+        f"Actor-learner training: actors={args.num_actors} envs/actor={args.envs_per_actor} "
         f"batch={args.actor_batch_size} UTD={args.updates_per_step:g}",
         flush=True,
     )
@@ -956,6 +871,15 @@ def run_async_training(
 
 def main() -> None:
     args = parse_args()
+    if args.num_actors < 1:
+        raise ValueError("--num-actors must be at least 1")
+    if args.n_step < 1:
+        raise ValueError("--n-step must be at least 1")
+    if args.reward_shaping_scale < 0:
+        raise ValueError("--reward-shaping-scale cannot be negative")
+    if args.heuristic_eval_games < 1:
+        raise ValueError("--heuristic-eval-games must be at least 1")
+
     args.run_name = validate_run_name(args.run_name)
     args.history_dir = named_directory(args.history_dir, args.run_name)
     args.tb_log_dir = named_directory(args.tb_log_dir, args.run_name)
@@ -975,15 +899,6 @@ def main() -> None:
     opponent = build_opponent(args, args.seed + 10_000)
     opponent_rng = random.Random(args.seed + 20_000)
 
-    if args.num_actors < 0:
-        raise ValueError("--num-actors cannot be negative")
-    if args.n_step < 1:
-        raise ValueError("--n-step must be at least 1")
-    if args.reward_shaping_scale < 0:
-        raise ValueError("--reward-shaping-scale cannot be negative")
-    if args.heuristic_eval_games < 1:
-        raise ValueError("--heuristic-eval-games must be at least 1")
-
     evaluator: Optional[HeuristicEvaluator] = None
     if not args.disable_heuristic_eval:
         evaluator = HeuristicEvaluator(
@@ -991,296 +906,17 @@ def main() -> None:
             num_games=args.heuristic_eval_games,
             seed=args.seed + 90_000,
         )
-    if args.num_actors > 0:
-        # Preferred path: independent actor processes asynchronously feed the
-        # single learner. args.async_envs does not control this architecture.
-        completed = False
-        evaluation_failures = 0
-        try:
-            run_async_training(
-                args, train_agent, opponent, opponent_rng, tb_logger, evaluator
-            )
-            completed = True
-        finally:
-            if evaluator is not None:
-                final_results = evaluator.close(drain=completed)
-                evaluation_failures = report_evaluation_results(
-                    None, tb_logger, evaluation_failures, final_results
-                )
-            tb_logger.close()
-        return
-
-    if args.num_sidecar_actors > 0 and args.replay_b_fraction > 0.0:
-        print(
-            "Warning: rollout B is disabled in the legacy --num-actors=0 path; "
-            "rollout A remains unchanged.",
-            flush=True,
-        )
-
-    # Legacy path: there are no actor processes. In this path only,
-    # --async-envs changes the Gymnasium vector implementation from
-    # SyncVectorEnv to AsyncVectorEnv (one environment worker per process).
-    if args.async_envs:
-        print(
-            "Warning: --async-envs is deprecated; the lightweight Gomoku env "
-            "is normally faster with synchronous vectorization.",
-            flush=True,
-        )
-
-    envs = make_vector_env(
-        args.num_envs,
-        board_size=args.board_size,
-        asynchronous=args.async_envs,
-        seed=args.seed,
-    )
-
-    pending_states: List[Optional[np.ndarray]] = [None for _ in range(args.num_envs)]
-    pending_actions: List[Optional[int]] = [None for _ in range(args.num_envs)]
-    episode_black_steps = np.zeros(args.num_envs, dtype=np.int64)
-    n_step_accumulator = NStepAccumulator(args.num_envs, args.n_step, args.gamma)
-
-    total_black_steps = 0
-    next_save_step = args.save_checkpoint
-    next_load_step = args.load_opponent
-    history_index = next_history_index(args.history_dir)
-    last_log_step = 0
-    last_loss: Optional[Dict[str, float]] = None
-    stats = {
-        "episodes": 0.0,
-        "black_wins": 0.0,
-        "black_losses": 0.0,
-        "draws": 0.0,
-        "episode_black_steps": 0.0,
-        "episode_return": 0.0,
-    }
-    last_log_stats = {key: 0.0 for key in stats}
-    start_time = time.time()
-    last_log_time = start_time
-    updates_at_start = train_agent.update_steps
-    last_log_updates = train_agent.update_steps
-    evaluation_failures = 0
     completed = False
-
+    evaluation_failures = 0
     try:
-        obs, _ = envs.reset(seed=args.seed)
-
-        while total_black_steps < args.total_black_steps:
-            evaluation_failures = report_evaluation_results(
-                evaluator, tb_logger, evaluation_failures
-            )
-            current_players = obs["current_player"].reshape(-1)
-            actions = np.zeros(args.num_envs, dtype=np.int64)
-
-            black_indices = np.flatnonzero(current_players == 1)
-            white_indices = np.flatnonzero(current_players == -1)
-
-            if len(black_indices) > 0:
-                epsilon = epsilon_by_step(args, total_black_steps)
-                boards, players, masks = slice_obs(obs, black_indices)
-                black_actions = train_agent.select_actions(boards, players, masks, epsilon=epsilon)
-                encoded_states = encode_boards(boards, players)
-                actions[black_indices] = black_actions
-
-                for row, env_index in enumerate(black_indices):
-                    pending_states[env_index] = encoded_states[row]
-                    pending_actions[env_index] = int(black_actions[row])
-                    episode_black_steps[env_index] += 1
-
-                total_black_steps += len(black_indices)
-
-            if len(white_indices) > 0:
-                boards, players, masks = slice_obs(obs, white_indices)
-                white_actions = opponent.select_actions(
-                    boards,
-                    players,
-                    masks,
-                    epsilon=args.opponent_epsilon,
-                )
-                actions[white_indices] = white_actions
-
-            # make_vector_env uses SameStep autoreset. For done envs, next_obs
-            # is already the initial observation of the next episode; terminal
-            # data is in infos["final_obs"] / infos["final_info"].
-            next_obs, _, terminated, truncated, infos = envs.step(actions)
-            done_flags = np.logical_or(terminated, truncated)
-
-            for env_index in range(args.num_envs):
-                acted_player = int(current_players[env_index])
-                done = bool(done_flags[env_index])
-
-                # One replay transition is one BLACK decision interval:
-                #   black state/action -> optional white reply -> next black state.
-                # Therefore a non-terminal black move remains pending until the
-                # white move has been stepped. A terminal black move closes it
-                # immediately.
-                if acted_player == 1:
-                    if done:
-                        reward_black = float(info_value(infos, "reward_black", env_index, done, 0.0))
-                        zero_state = np.zeros(
-                            (3, args.board_size, args.board_size),
-                            dtype=np.float32,
-                        )
-                        zero_mask = np.zeros(args.board_size * args.board_size, dtype=np.bool_)
-                        reward_black = shaped_reward(
-                            reward_black, pending_states[env_index], zero_state, True,
-                            args.gamma, args.reward_shaping_scale,
-                        )
-                        add_n_step_transition(
-                            train_agent, n_step_accumulator, env_index,
-                            Transition(
-                                pending_states[env_index], int(pending_actions[env_index]),
-                                reward_black, zero_state, zero_mask, True,
-                            ),
-                        )
-                        pending_states[env_index] = None
-                        pending_actions[env_index] = None
-                    else:
-                        continue
-
-                if pending_states[env_index] is None:
-                    if not done:
-                        continue
-                else:
-                    reward_black = float(info_value(infos, "reward_black", env_index, done, 0.0))
-                    if done:
-                        # next_obs belongs to the next episode under SameStep;
-                        # never connect that state to this terminal transition.
-                        next_state = np.zeros((3, args.board_size, args.board_size), dtype=np.float32)
-                        next_mask = np.zeros(args.board_size * args.board_size, dtype=np.bool_)
-                    else:
-                        next_state = encode_boards(
-                            next_obs["board"][env_index],
-                            next_obs["current_player"][env_index],
-                        )[0]
-                        next_mask = next_obs["action_mask"][env_index].astype(np.bool_)
-
-                    reward_black = shaped_reward(
-                        reward_black, pending_states[env_index], next_state, done,
-                        args.gamma, args.reward_shaping_scale,
-                    )
-                    add_n_step_transition(
-                        train_agent, n_step_accumulator, env_index,
-                        Transition(
-                            pending_states[env_index], int(pending_actions[env_index]),
-                            reward_black, next_state, next_mask, done,
-                        ),
-                    )
-                    pending_states[env_index] = None
-                    pending_actions[env_index] = None
-
-                if done:
-                    winner = int(info_value(infos, "winner", env_index, done, 0))
-                    episode_return = float(info_value(infos, "reward_black", env_index, done, 0.0))
-                    episode_length = int(episode_black_steps[env_index])
-                    stats["episodes"] += 1
-                    stats["episode_black_steps"] += float(episode_length)
-                    stats["episode_return"] += episode_return
-                    if winner == 1:
-                        stats["black_wins"] += 1
-                    elif winner == -1:
-                        stats["black_losses"] += 1
-                    else:
-                        stats["draws"] += 1
-                    episode_black_steps[env_index] = 0
-
-            log_due = total_black_steps - last_log_step >= args.log_interval
-            for update_index in range(len(black_indices)):
-                metrics = train_agent.train_step(
-                    collect_metrics=log_due and update_index == len(black_indices) - 1
-                )
-                if metrics is not None:
-                    last_loss = metrics
-
-            while args.save_checkpoint > 0 and total_black_steps >= next_save_step:
-                checkpoint_path = save_history_checkpoint(
-                    train_agent,
-                    args.history_dir,
-                    history_index,
-                    total_black_steps,
-                    args,
-                )
-                print(f"Saved history checkpoint: {checkpoint_path}")
-                if evaluator is not None:
-                    evaluator.submit(checkpoint_path, total_black_steps)
-                history_index += 1
-                next_save_step += args.save_checkpoint
-
-            while args.load_opponent > 0 and total_black_steps >= next_load_step:
-                reloaded = maybe_reload_opponent(args, opponent_rng, args.seed + 30_000 + history_index)
-                if reloaded is not None:
-                    opponent = reloaded
-                next_load_step += args.load_opponent
-
-            if total_black_steps - last_log_step >= args.log_interval:
-                now = time.time()
-                interval_seconds = max(1e-6, now - last_log_time)
-                interval_steps = total_black_steps - last_log_step
-                interval_updates = train_agent.update_steps - last_log_updates
-                window_stats = stats_since(stats, last_log_stats)
-                print_log(
-                    total_black_steps=total_black_steps,
-                    interval_steps=interval_steps,
-                    interval_seconds=interval_seconds,
-                    epsilon=epsilon_by_step(args, total_black_steps),
-                    replay_size=len(train_agent.replay),
-                    updates=train_agent.update_steps,
-                    stats=window_stats,
-                    last_loss=last_loss,
-                )
-                tb_logger.add_scalars(
-                    step=total_black_steps,
-                    epsilon=epsilon_by_step(args, total_black_steps),
-                    replay_size=len(train_agent.replay),
-                    updates=train_agent.update_steps,
-                    stats=stats,
-                    window_stats=window_stats,
-                    train_metrics=last_loss,
-                )
-                if tb_logger.writer is not None:
-                    elapsed = max(1e-6, now - start_time)
-                    tb_logger.writer.add_scalar(
-                        "Throughput/sample_steps_per_second",
-                        interval_steps / interval_seconds, total_black_steps,
-                    )
-                    tb_logger.writer.add_scalar(
-                        "Throughput/updates_per_second",
-                        interval_updates / interval_seconds, total_black_steps,
-                    )
-                    tb_logger.writer.add_scalar(
-                        "Cumulative/sample_steps_per_second",
-                        total_black_steps / elapsed, total_black_steps,
-                    )
-                    tb_logger.writer.add_scalar(
-                        "Cumulative/updates_per_second",
-                        (train_agent.update_steps - updates_at_start) / elapsed,
-                        total_black_steps,
-                    )
-                    tb_logger.writer.flush()
-                last_log_step = total_black_steps
-                last_log_time = now
-                last_log_updates = train_agent.update_steps
-                last_log_stats = dict(stats)
-
-            obs = next_obs
-
-        if args.save_final:
-            checkpoint_path = save_history_checkpoint(
-                train_agent,
-                args.history_dir,
-                history_index,
-                total_black_steps,
-                args,
-            )
-            print(f"Saved final checkpoint: {checkpoint_path}")
-            if evaluator is not None:
-                evaluator.submit(checkpoint_path, total_black_steps)
+        run_actor_learner_training(
+            args, train_agent, opponent, opponent_rng, tb_logger, evaluator
+        )
         completed = True
-
     finally:
-        envs.close()
         if evaluator is not None:
             final_results = evaluator.close(drain=completed)
-            evaluation_failures = report_evaluation_results(
+            report_evaluation_results(
                 None, tb_logger, evaluation_failures, final_results
             )
         tb_logger.close()

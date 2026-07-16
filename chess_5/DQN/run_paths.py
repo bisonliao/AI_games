@@ -1,3 +1,5 @@
+"""训练路径工具：校验run-name并统一生成隔离的checkpoint目录和文件名。"""
+
 from __future__ import annotations
 
 import re
