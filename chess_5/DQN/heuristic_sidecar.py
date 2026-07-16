@@ -321,7 +321,13 @@ class HeuristicSidecar:
         self.context = context or mp.get_context("spawn")
         self.result_queue = self.context.Queue(maxsize=queue_size)
         self.status_queue = self.context.Queue()
-        self.control_queues = [self.context.Queue() for _ in range(num_actors)]
+        # Rollout B only needs a pending policy snapshot, not every historical
+        # snapshot.  A single-slot queue prevents large state dicts from
+        # accumulating in multiprocessing.Queue's feeder/IPC buffers when the
+        # sidecar produces batches more slowly than the learner synchronizes.
+        self.control_queues = [
+            self.context.Queue(maxsize=1) for _ in range(num_actors)
+        ]
         self.stop_event = self.context.Event()
         self.processes = [
             self.context.Process(
@@ -398,7 +404,13 @@ class HeuristicSidecar:
     def sync_policy(self, version: int, state_dict: StateDict) -> None:
         for process, control in zip(self.processes, self.control_queues):
             if process.is_alive():
-                control.put(("policy", int(version), state_dict))
+                try:
+                    control.put_nowait(("policy", int(version), state_dict))
+                except queue.Full:
+                    # The actor will consume the already-pending snapshot at
+                    # its next batch boundary.  A later sync will then enqueue
+                    # a fresh snapshot without building an obsolete backlog.
+                    pass
 
     def queue_size(self) -> int:
         try:
