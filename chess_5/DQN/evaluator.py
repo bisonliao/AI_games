@@ -71,6 +71,9 @@ def evaluate_checkpoint(
             f"Checkpoint board size {checkpoint_board_size} does not match {board_size}"
         )
     heuristic = HeuristicAgent(seed=seed + 100_000)
+    # make_vector_env固定使用SameStep自动重置：终局step返回的next_obs已经是
+    # 下一局初始观测，上一局胜者保存在infos["final_info"]中。较早结束的槽位
+    # 会继续新对局，因此用finished保证每个槽位只统计第一局。
     envs = make_vector_env(
         num_games, board_size=board_size, asynchronous=False, seed=seed
     )

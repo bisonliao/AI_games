@@ -1,4 +1,15 @@
-"""人机对弈入口：渲染棋盘，让人类执黑连续对战DQN checkpoint或启发式机器人。"""
+"""五子棋人机对弈命令行入口。
+
+人类固定执黑，程序渲染棋盘并让白方使用以下两种互斥对手之一：
+
+1. ``--opponent dqn``：加载指定训练 run 的 DQN checkpoint。必须同时提供
+   ``--run-name``；可用 ``--checkpoint`` 选择序号或文件名，省略时加载该 run
+   序号最大的 checkpoint。
+2. ``--opponent heuristic``：使用启发式机器人，不需要 run 或 checkpoint。
+
+DQN 默认使用开局受控采样、随后转为 greedy 的策略，也可通过
+``--dqn-policy greedy`` 在整局中使用确定性 greedy 策略。
+"""
 
 from __future__ import annotations
 
@@ -32,14 +43,49 @@ DEFAULT_HISTORY_DIR = Path(__file__).resolve().parent / "history"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Play Gomoku as black against a white DQN or heuristic agent."
+        description="五子棋人机对弈：你执黑棋，DQN 或启发式机器人执白棋。",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用方式：
+
+  1. 对战某个 run 的最新 DQN checkpoint
+     --opponent 默认为 dqn，因此可以省略；--run-name 必须指定。
+
+       python DQN/play.py --run-name RUN_NAME --board-size 9
+
+  2. 对战某个 run 的指定 DQN checkpoint
+     --checkpoint 可写 checkpoint 序号或该 run 目录下的完整文件名。
+
+       python DQN/play.py --run-name RUN_NAME --checkpoint 3 --board-size 9
+       python DQN/play.py --run-name RUN_NAME --checkpoint RUN_NAME_000003.pt --board-size 9
+
+  3. 对战启发式机器人
+     该模式不加载 checkpoint，不需要 --run-name、--checkpoint 或 --device。
+
+       python DQN/play.py --opponent heuristic --board-size 9
+
+  4. 使用旧版平铺 checkpoint 目录
+     当 checkpoint 直接位于 --history-dir、没有 run 子目录时，传入空 run-name。
+
+       python DQN/play.py --run-name "" --history-dir DQN/history --checkpoint 3
+
+DQN 策略：
+  --dqn-policy controlled（默认）仅在每局开局阶段从 Q 值靠前的合法动作中
+  受控采样；--opening-top-k、--opening-temperature、--stochastic-agent-moves
+  和 --play-seed 只影响该模式。遇到一步必杀或必堵局面时改用网络 greedy。
+
+  --dqn-policy greedy 在整局中选择 Q 值最大的合法动作，适合复现确定性对局。
+""",
     )
-    parser.add_argument("--opponent", choices=("dqn", "heuristic"), default="dqn")
+    parser.add_argument(
+        "--opponent", choices=("dqn", "heuristic"), default="dqn",
+        help="白方对手类型：DQN checkpoint（默认）或启发式机器人。",
+    )
     parser.add_argument(
         "--run-name", default=None,
         help=(
-            "Training name required for a DQN opponent. "
-            "Pass an empty string to use legacy checkpoints directly under --history-dir."
+            "DQN对手所属的训练run名称；DQN模式必填。传空字符串表示直接从"
+            "--history-dir读取旧版平铺checkpoint。"
         ),
     )
     parser.add_argument(
@@ -47,13 +93,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "Checkpoint filename or sequence number under --history-dir. "
-            "Defaults to the checkpoint with the largest sequence number."
+            "run目录下的checkpoint序号或文件名；省略时使用序号最大的checkpoint。"
         ),
     )
-    parser.add_argument("--history-dir", type=Path, default=DEFAULT_HISTORY_DIR)
-    parser.add_argument("--board-size", type=int, default=5)
-    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument(
+        "--history-dir", type=Path, default=DEFAULT_HISTORY_DIR,
+        help=f"Checkpoint历史目录根路径（默认：{DEFAULT_HISTORY_DIR}）。",
+    )
+    parser.add_argument("--board-size", type=int, default=5, help="棋盘边长，默认5。")
+    parser.add_argument(
+        "--device", type=str, default="auto",
+        help="DQN推理设备，默认auto（CUDA可用时优先使用CUDA）。",
+    )
     parser.add_argument(
         "--dqn-policy",
         choices=("controlled", "greedy"),
