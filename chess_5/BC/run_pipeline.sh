@@ -18,7 +18,12 @@ TRAIN_WORKERS="${TRAIN_WORKERS:-4}"
 DEVICE="${DEVICE:-auto}"
 SEED="${SEED:-0}"
 AGGREGATE_MAX_SAMPLES="${AGGREGATE_MAX_SAMPLES:-100000}"
-CACHE_LABELS_PER_STATE="${CACHE_LABELS_PER_STATE:-4}"
+EXPERT_TOP_K="${EXPERT_TOP_K:-${CACHE_LABELS_PER_STATE:-4}}"
+EXPERT_TEMPERATURE="${EXPERT_TEMPERATURE:-1.0}"
+EXPERT_STOCHASTIC_MOVES="${EXPERT_STOCHASTIC_MOVES:-6}"
+BC_TOP_K="${BC_TOP_K:-4}"
+BC_TEMPERATURE="${BC_TEMPERATURE:-1.0}"
+BC_STOCHASTIC_MOVES="${BC_STOCHASTIC_MOVES:-6}"
 MAX_CANDIDATES="${MAX_CANDIDATES:-12}"
 
 DATA_ROOT="$ARTIFACT_ROOT/data/$RUN_NAME"
@@ -32,6 +37,7 @@ BC_V1_DIR="$CHECKPOINT_ROOT/02_bc_v1"
 EVAL_V1_JSON="$EVAL_ROOT/03_eval_bc_v1.json"
 AGGREGATE_DATA="$DATA_ROOT/04_aggregate"
 BC_V2_DIR="$CHECKPOINT_ROOT/05_bc_v2"
+EVAL_V2_JSON="$EVAL_ROOT/06_eval_bc_v2.json"
 
 mkdir -p "$TB_ROOT" "$EVAL_ROOT" "$STATE_ROOT"
 
@@ -64,7 +70,11 @@ else
   run_logged 01_generate_expert "${PYTHON[@]}" BC/generate.py \
     --output "$EXPERT_DATA" --mode expert --board-size "$BOARD_SIZE" \
     --games "$EXPERT_GAMES" --workers "$GEN_WORKERS" --seed "$SEED" \
-    --max-candidates "$MAX_CANDIDATES" --cache-labels-per-state "$CACHE_LABELS_PER_STATE" \
+    --max-candidates "$MAX_CANDIDATES" --expert-top-k "$EXPERT_TOP_K" \
+    --expert-temperature "$EXPERT_TEMPERATURE" \
+    --expert-stochastic-moves "$EXPERT_STOCHASTIC_MOVES" \
+    --bc-top-k "$BC_TOP_K" --bc-temperature "$BC_TEMPERATURE" \
+    --bc-stochastic-moves "$BC_STOCHASTIC_MOVES" --quality-gate \
     --tb-dir "$TB_ROOT/01_generate_expert"
 fi
 
@@ -87,6 +97,8 @@ else
     --checkpoint "$BC_V1_DIR/best.pt" --board-size "$BOARD_SIZE" \
     --games-per-color "$EVAL_GAMES" --workers "$EVAL_WORKERS" --seed "$((SEED + 10000))" \
     --max-candidates "$MAX_CANDIDATES" \
+    --expert-top-k "$EXPERT_TOP_K" --expert-temperature "$EXPERT_TEMPERATURE" \
+    --expert-stochastic-moves "$EXPERT_STOCHASTIC_MOVES" --min-decisive-rate 0.20 \
     --output "$EVAL_V1_JSON" --tb-dir "$TB_ROOT/03_eval_bc_v1"
 fi
 
@@ -97,7 +109,10 @@ else
     --output "$AGGREGATE_DATA" --mode aggregate --board-size "$BOARD_SIZE" \
     --checkpoint "$BC_V1_DIR/best.pt" --games "$AGGREGATE_GAMES" \
     --workers "$GEN_WORKERS" --seed "$SEED" --max-candidates "$MAX_CANDIDATES" \
-    --cache-labels-per-state "$CACHE_LABELS_PER_STATE" \
+    --expert-top-k "$EXPERT_TOP_K" --expert-temperature "$EXPERT_TEMPERATURE" \
+    --expert-stochastic-moves "$EXPERT_STOCHASTIC_MOVES" \
+    --bc-top-k "$BC_TOP_K" --bc-temperature "$BC_TEMPERATURE" \
+    --bc-stochastic-moves "$BC_STOCHASTIC_MOVES" --quality-gate \
     --tb-dir "$TB_ROOT/04_generate_aggregate"
 fi
 
@@ -115,7 +130,20 @@ else
     --tb-dir "$TB_ROOT/05_train_bc_v2" "${RESUME[@]}"
 fi
 
+if [[ -f "$STATE_ROOT/06_eval_bc_v2.done" ]]; then
+  echo "SKIP 06_eval_bc_v2 (already complete)"
+else
+  run_logged 06_eval_bc_v2 "${PYTHON[@]}" BC/eval.py \
+    --checkpoint "$BC_V2_DIR/best.pt" --board-size "$BOARD_SIZE" \
+    --games-per-color "$EVAL_GAMES" --workers "$EVAL_WORKERS" --seed "$((SEED + 20000))" \
+    --max-candidates "$MAX_CANDIDATES" \
+    --expert-top-k "$EXPERT_TOP_K" --expert-temperature "$EXPERT_TEMPERATURE" \
+    --expert-stochastic-moves "$EXPERT_STOCHASTIC_MOVES" --min-decisive-rate 0.20 \
+    --output "$EVAL_V2_JSON" --tb-dir "$TB_ROOT/06_eval_bc_v2"
+fi
+
 echo
 echo "Pipeline complete: $RUN_NAME"
 echo "Best BC-v2 checkpoint: $BC_V2_DIR/best.pt"
+echo "Final BC-v2 evaluation: $EVAL_V2_JSON"
 echo "TensorBoard root: $TB_ROOT"

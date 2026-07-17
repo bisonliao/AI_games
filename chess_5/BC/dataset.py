@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from typing import Sequence
 
@@ -31,6 +32,11 @@ def discover_shards(roots: Sequence[Path]) -> list[Path]:
     return shards
 
 
+def is_validation_group(group: bytes, seed: int, val_fraction: float) -> bool:
+    digest = hashlib.sha256(int(seed).to_bytes(8, "little", signed=True) + bytes(group)).digest()
+    return int.from_bytes(digest[:8], "little") / 2**64 < val_fraction
+
+
 class GomokuDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
     def __init__(self, shards: Sequence[Path], *, split: str, val_fraction: float = 0.1,
                  augment: bool = False, seed: int = 0, max_samples: int | None = None) -> None:
@@ -38,8 +44,13 @@ class GomokuDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
         for path in shards:
             with np.load(path) as data:
                 games = data["games"]
-                val = np.asarray([((int(g) * 2654435761 + seed) & 0xffffffff) / 2**32 < val_fraction
-                                  for g in games])
+                if "trajectory_groups" in data:
+                    groups = data["trajectory_groups"]
+                    val = np.asarray([is_validation_group(bytes(group), seed, val_fraction)
+                                      for group in groups])
+                else:
+                    val = np.asarray([((int(g) * 2654435761 + seed) & 0xffffffff) / 2**32
+                                      < val_fraction for g in games])
                 take = val if split == "val" else ~val
                 selected_boards = data["boards"][take]
                 selected_actions = data["actions"][take]

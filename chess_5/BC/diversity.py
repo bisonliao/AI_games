@@ -23,6 +23,47 @@ def _game_ranges(game_ids: np.ndarray) -> Iterable[tuple[int, int]]:
     yield from zip(starts.tolist(), ends.tolist())
 
 
+def canonical_trajectory_hash(boards: np.ndarray, players: np.ndarray) -> bytes:
+    hashers = [hashlib.sha256() for _ in range(8)]
+    for board, player in zip(boards, players):
+        player_byte = bytes((int(player) + 1,))
+        for transform, hasher in enumerate(hashers):
+            hasher.update(player_byte)
+            hasher.update(transform_board(board, transform).tobytes())
+    return min(hasher.digest() for hasher in hashers)
+
+
+def assess_diversity(metrics: dict[str, Any], *, hard_min_games: int = 100,
+                     min_effective_ratio: float = 0.01,
+                     max_dominant_fraction: float = 0.50,
+                     min_state_unique_ratio: float = 0.001) -> dict[str, Any]:
+    warnings: list[str] = []
+    failures: list[str] = []
+    checks = (
+        (metrics["canonical_effective_trajectory_ratio"], 0.05, "below",
+         "effective trajectory ratio"),
+        (metrics["dominant_canonical_trajectory_fraction"], 0.20, "above",
+         "dominant trajectory fraction"),
+        (metrics["canonical_state_unique_ratio"], 0.005, "below", "state unique ratio"),
+    )
+    for value, threshold, direction, name in checks:
+        bad = value < threshold if direction == "below" else value > threshold
+        if bad:
+            warnings.append(f"{name} {value:.6f} is {direction} warning threshold {threshold:.6f}")
+    if metrics["games"] >= hard_min_games:
+        if metrics["canonical_effective_trajectory_ratio"] < min_effective_ratio:
+            failures.append("canonical effective trajectory ratio below hard minimum")
+        if metrics["dominant_canonical_trajectory_fraction"] > max_dominant_fraction:
+            failures.append("dominant canonical trajectory fraction above hard maximum")
+        if metrics["canonical_state_unique_ratio"] < min_state_unique_ratio:
+            failures.append("canonical state unique ratio below hard minimum")
+    return {"passed": not failures, "warnings": warnings, "failures": failures,
+            "thresholds": {"hard_min_games": hard_min_games,
+                           "min_effective_trajectory_ratio": min_effective_ratio,
+                           "max_dominant_trajectory_fraction": max_dominant_fraction,
+                           "min_state_unique_ratio": min_state_unique_ratio}}
+
+
 def analyze_shards(shards: Iterable[Path]) -> dict[str, Any]:
     """Compute three symmetry-aware coverage indicators in one dataset scan.
 
@@ -39,19 +80,16 @@ def analyze_shards(shards: Iterable[Path]) -> dict[str, Any]:
             boards = np.asarray(data["boards"], dtype=np.int8)
             players = np.asarray(data["players"], dtype=np.int8)
             game_ids = np.asarray(data["games"], dtype=np.int64)
+            stored_groups = data["trajectory_groups"] if "trajectory_groups" in data else None
             samples += len(boards)
             for start, end in _game_ranges(game_ids):
-                hashers = [hashlib.sha256() for _ in range(8)]
                 for board, player in zip(boards[start:end], players[start:end]):
                     variants = [transform_board(board, transform).tobytes() for transform in range(8)]
                     player_byte = bytes((int(player) + 1,))
                     canonical_states.add(hashlib.sha256(player_byte + min(variants)).digest())
-                    for hasher, raw in zip(hashers, variants):
-                        hasher.update(player_byte)
-                        hasher.update(raw)
-                # Taking the minimum over all global board transforms makes the
-                # trajectory identity invariant to rotations and reflections.
-                trajectory_counts[min(hasher.digest() for hasher in hashers)] += 1
+                group = (bytes(stored_groups[start]) if stored_groups is not None else
+                         canonical_trajectory_hash(boards[start:end], players[start:end]))
+                trajectory_counts[group] += 1
                 games += 1
 
     if games:

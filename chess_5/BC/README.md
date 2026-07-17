@@ -50,7 +50,7 @@
 2. 用 SQLite 持久化该 key 对应的专家动作；
 3. 再遇到相同或对称局面时直接复用结果，并把动作坐标变换回原棋盘。
 
-默认每个 canonical 状态缓存 4 次专家选择，再从中随机采样。这是因为专家在多个动作同分时带有随机性；只缓存一个动作会让自博弈反复生成几乎相同的轨迹。可用 `--cache-labels-per-state` 调整这个数量。
+每个 canonical 状态只执行一次完整启发式搜索，缓存最多 4 个按优先级排列的合理候选。除一步必杀/必堵外，前 6 次己方落子使用 rank-softmax 采样并逐步退火，随后转为 greedy。rank-softmax 使用动作名次而不是原始评分幅值，避免评分尺度使采样退化为近似 greedy。可用 `--expert-top-k`、`--expert-temperature` 和 `--expert-stochastic-moves` 调整。
 
 缓存会校验棋盘尺寸、专家参数、随机种子等配置，防止 5×5、9×9 或不同专家配置之间错误复用。
 
@@ -142,6 +142,8 @@ canonical_state_unique_ratio = 0.31
 5. 数据中保存的是专家动作，而不是 BC 动作；
 6. 聚合结束后关闭专家进程，再用基础数据和聚合数据共同训练新模型。
 
+聚合时 BC 也在前 6 次己方落子使用网络合法动作排名的 top-4 rank-softmax。检测到一步必杀或必堵时只关闭采样并切换网络 greedy，规则不会替 BC 落子，因此网络的真实战术错误仍会形成局外状态并得到专家标签。
+
 最关键的一步可以表示为：
 
 ```text
@@ -182,7 +184,7 @@ canonical_state_unique_ratio = 0.31
 
 ### 一条命令运行完整 pipeline
 
-`run_pipeline.sh` 会依次执行下面列出的五个步骤。直接执行时会自动生成带时间戳的 run name：
+`run_pipeline.sh` 会依次执行六个步骤，并在 v2 训练后执行最终评测。直接执行时会自动生成带时间戳的 run name：
 
 脚本直接使用当前 shell 中的 `python`，不会自行调用 conda。请先在脚本外激活训练服务器上的 Python 环境：
 
@@ -227,12 +229,15 @@ bash BC/run_pipeline.sh 5x5-small
 - `EVAL_GAMES`：每种执子颜色的评测局数，默认 `200`；
 - `EVAL_WORKERS`：评测进程数，默认 `8`；
 - `EPOCHS`、`BATCH_SIZE`、`TRAIN_WORKERS`、`DEVICE`：训练 epoch、batch 大小、DataLoader 进程数和设备；
-- `CACHE_LABELS_PER_STATE`、`MAX_CANDIDATES`：专家缓存标签数和专家候选数；
+- `EXPERT_TOP_K`、`EXPERT_TEMPERATURE`、`EXPERT_STOCHASTIC_MOVES`：专家 top-k、初始温度和采样步数；
+- `BC_TOP_K`、`BC_TEMPERATURE`、`BC_STOCHASTIC_MOVES`：聚合时 BC 的对应参数；
+- `CACHE_LABELS_PER_STATE`：旧配置兼容别名，仅在未设置 `EXPERT_TOP_K` 时生效；
+- `MAX_CANDIDATES`：启发式浅层搜索 shortlist 上限；
 - `ARTIFACT_ROOT`：全部输出的根目录，默认 `BC/`；
 
 ### TensorBoard 日志组织
 
-五个步骤共享同一个顶层 run name，每个步骤拥有带序号和名称的子 run：
+六个步骤共享同一个顶层 run name，每个步骤拥有带序号和名称的子 run：
 
 ```text
 BC/runs/<run-name>/
@@ -240,7 +245,8 @@ BC/runs/<run-name>/
 ├── 02_train_bc_v1/
 ├── 03_eval_bc_v1/
 ├── 04_generate_aggregate/
-└── 05_train_bc_v2/
+├── 05_train_bc_v2/
+└── 06_eval_bc_v2/
 ```
 
 一次监控整个 pipeline：
@@ -249,7 +255,9 @@ BC/runs/<run-name>/
 tensorboard --logdir BC/runs/<run-name>
 ```
 
-TensorBoard 会把五个子目录显示为五条带步骤名的 run，但它们都归属于同一个顶层实验目录。产数步骤记录上述三项 `Diversity/*` 指标，以及样本量、缓存命中率、专家查询吞吐和写盘耗时；训练步骤按 epoch 记录 loss、accuracy、合法动作率、吞吐和学习率；评测步骤记录黑白双方的胜负和、得分率、平均局长和非法动作数。
+TensorBoard 会把六个子目录显示为带步骤名的 run，但它们都归属于同一个顶层实验目录。产数步骤记录上述三项 `Diversity/*` 指标，以及样本量、缓存命中率、专家查询吞吐和写盘耗时；训练步骤按 epoch 记录 loss、accuracy、合法动作率、吞吐和学习率；评测步骤记录黑白双方的胜负和、得分率、决定局比例、平均局长和非法动作数。
+
+对局数不少于 100 时，pipeline 会拒绝满足任一条件的数据：有效轨迹比例低于 1%、最大轨迹占比高于 50%、状态唯一比例低于 0.1%。被拒绝的数据写入 `status: rejected` 后立即停止，不会进入训练。建议先以 `EXPERT_GAMES=1000` 做 5×5 pilot。
 
 ### 第一步：生成 5×5 初始专家数据
 
@@ -275,7 +283,7 @@ conda run -n mygames python BC/eval.py \
   --board-size 5 --games-per-color 200 --workers 8 --seed 10000
 ```
 
-评测输出胜、负、和、原始胜率、得分率 `win + 0.5 × draw`、95% 置信区间、平均局长和非法动作数。最终确认时应再换一组固定种子，例如 `--seed 20000`。
+评测输出胜、负、和、原始胜率、得分率 `win + 0.5 × draw`、决定局比例、95% 置信区间、平均局长和非法动作数。只有黑白双方得分率均在 45%–55% 且决定局比例至少 20% 时才通过；100% 和棋不会再被判定成功。
 
 ### 第四步：生成一轮聚合数据
 
@@ -295,7 +303,7 @@ conda run -n mygames python BC/train.py \
   --run-name 5x5-bc-v2 --board-size 5
 ```
 
-之后重新评测 `5x5-bc-v2/best.pt`。如果仍未达到目标，就用 BC-v2 生成 `aggregate-v3`，训练时同时传入基础数据和需要保留的各轮聚合数据。
+pipeline 会在第六步自动评测 `5x5-bc-v2/best.pt`。如果仍未达到目标，就用 BC-v2 生成 `aggregate-v3`，训练时同时传入基础数据和需要保留的各轮聚合数据。
 
 ## 7. 目录职责
 
@@ -308,4 +316,68 @@ conda run -n mygames python BC/train.py \
 - `agent.py`：checkpoint 加载、批量推理和合法动作 mask；
 - `train.py`：监督训练、验证、early stopping 和 checkpoint；
 - `eval.py`：分别执黑、执白对战启发式专家。
-- `run_pipeline.sh`：串联五个步骤、组织统一日志，并处理中断恢复。
+- `sampling.py`：专家、BC、play 和 eval 共用的 rank-softmax 与战术检测；
+- `run_pipeline.sh`：串联六个步骤、组织统一日志、质量门禁和中断恢复。
+
+## 8. 对弈与独立评测
+
+`BC/` 自带启发式机器人和 checkpoint 解析，不会引用 `DQN/` 下的实现。`play.py` 和 `eval.py` 只共享 `BC/` 自己的网络、agent 和专家代码，以及项目公共的 `env/` 棋盘环境。
+
+### 人类对战 BC
+
+默认从指定 pipeline run 中选择序号最大的阶段（通常是 `05_bc_v2/best.pt`）：
+
+```bash
+python BC/play.py --run-name 5x5-production --board-size 5
+```
+
+也可以固定阶段、checkpoint 类型或直接路径：
+
+```bash
+python BC/play.py --run-name 5x5-production --stage 02_bc_v1 \
+  --checkpoint-name latest.pt --board-size 5
+
+python BC/play.py \
+  --checkpoint BC/checkpoints/5x5-production/05_bc_v2/best.pt \
+  --board-size 5 --bc-policy greedy
+```
+
+人类固定执黑，BC 执白。BC 默认在前几步从网络 logits 排名前列的合法动作中受控采样；`--bc-policy greedy` 用于确定性复现。也可以直接与 BC 内置的启发式专家对弈：
+
+```bash
+python BC/play.py --opponent heuristic --board-size 5
+```
+
+### 单 checkpoint 对启发式专家
+
+```bash
+python BC/eval.py \
+  --checkpoint BC/checkpoints/5x5-production/05_bc_v2/best.pt \
+  --board-size 5 --games 200 --workers 8
+```
+
+### 评测一个 run 的所有阶段
+
+默认寻找该 run 下所有 `best.pt`，因此会依次评测 `02_bc_v1`、`05_bc_v2` 等阶段：
+
+```bash
+python BC/eval.py --run-name 5x5-production \
+  --checkpoint-kind best --board-size 5 --games 200
+```
+
+`--checkpoint-kind` 还支持 `latest` 和 `all`。
+
+### 两个 BC checkpoint 直接对弈
+
+以下命令会交换执子，各评测 `--games` 局：
+
+```bash
+python BC/eval.py --checkpoint-a A.pt --checkpoint-b B.pt \
+  --board-size 5 --games 200 --workers 8
+```
+
+新增文件职责：
+
+- `heuristic_agent.py`：BC 本地启发式专家；
+- `checkpoints.py`：解析 pipeline run、阶段和 checkpoint；
+- `play.py`：人类对战 BC 或启发式专家。
