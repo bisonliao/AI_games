@@ -55,7 +55,7 @@ def _worker(task: dict[str, Any]) -> dict[str, Any]:
     started = time.perf_counter()
     with ExpertCache(cache_path, board_size, int(task["max_candidates"]), seed,
                      top_k=int(task.get("expert_top_k", 4)),
-                     temperature=float(task.get("expert_temperature", 1.0)),
+                     temperature=float(task.get("expert_temperature", 1.5)),
                      stochastic_moves=int(task.get("expert_stochastic_moves", 6))) as expert:
         for local_game in range(int(task["games"])):
             game_id = (worker << 32) | local_game
@@ -120,7 +120,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expert-top-k", "--cache-labels-per-state", dest="expert_top_k",
                         type=int, default=4,
                         help="Ranked expert candidates; old cache option is a deprecated alias.")
-    parser.add_argument("--expert-temperature", type=float, default=1.0)
+    parser.add_argument("--expert-temperature", type=float, default=1.5)
     parser.add_argument("--expert-stochastic-moves", type=int, default=6)
     parser.add_argument("--bc-top-k", type=int, default=4)
     parser.add_argument("--bc-temperature", type=float, default=1.0)
@@ -211,11 +211,27 @@ def main() -> None:
                                min_state_unique_ratio=args.min_state_unique_ratio)
     diversity["quality"] = quality; atomic_json(args.output / "diversity.json", diversity)
     for warning in quality["warnings"]:
-        print(f"WARNING: {warning}", flush=True)
-    print("diversity: effective_trajectory_ratio="
-          f"{diversity['canonical_effective_trajectory_ratio']:.3f} "
-          f"dominant_trajectory_fraction={diversity['dominant_canonical_trajectory_fraction']:.3f} "
-          f"state_unique_ratio={diversity['canonical_state_unique_ratio']:.3f}", flush=True)
+        print(f"!!!!!!!!!!!!!!!! 数据多样性警告：{warning} !!!!!!!!!!!!!!!!", flush=True)
+    print("!!!!!!!!!!!!!!!! 数据多样性量化结果 !!!!!!!!!!!!!!!!", flush=True)
+    print(f"!!!!!!!!!!!!!!!! 有效轨迹比例："
+          f"{diversity['canonical_effective_trajectory_ratio']:.2%}（越高越好） !!!!!!!!!!!!!!!!",
+          flush=True)
+    print(f"!!!!!!!!!!!!!!!! 最大单一轨迹占比："
+          f"{diversity['dominant_canonical_trajectory_fraction']:.2%}（越低越好） !!!!!!!!!!!!!!!!",
+          flush=True)
+    print(f"!!!!!!!!!!!!!!!! 独特状态比例："
+          f"{diversity['canonical_state_unique_ratio']:.2%}（越高越好） !!!!!!!!!!!!!!!!",
+          flush=True)
+    if not quality["passed"]:
+        conclusion = "不可接受，将拒绝进入训练" if args.quality_gate else "不可接受"
+    elif quality["warnings"]:
+        conclusion = "可接受，但多样性仍有警告，需要关注"
+    else:
+        conclusion = "可接受，多样性良好"
+    print(f"!!!!!!!!!!!!!!!! 数据质量结论：{conclusion} !!!!!!!!!!!!!!!!", flush=True)
+    if quality["failures"]:
+        print("!!!!!!!!!!!!!!!! 不通过原因：" + " | ".join(quality["failures"])
+              + " !!!!!!!!!!!!!!!!", flush=True)
     hits = sum(r["hits"] for r in results); misses = sum(r["misses"] for r in results)
     metadata.update({"status": "complete" if quality["passed"] or not args.quality_gate else "rejected",
                      "shards": [r["shard"] for r in results],

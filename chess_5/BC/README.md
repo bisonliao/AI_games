@@ -79,7 +79,21 @@ dominant_canonical_trajectory_fraction = 0.42
 canonical_state_unique_ratio = 0.31
 ```
 
-这表示数据虽然可能有很多对局，但有效轨迹只相当于总局数的约 8%，且一种轨迹占了 42%，需要警惕专家自博弈分支不足。当前实现只做可观测性，不用未经实测校准的固定阈值自动中止 pipeline；应先根据 5×5 正式数据建立正常区间。
+这表示数据虽然可能有很多对局，但有效轨迹只相当于总局数的约 8%，且一种轨迹占了 42%，需要警惕专家自博弈分支不足。pipeline 会按下文的硬阈值拒绝灾难性重复数据，较严格的告警线则只提示观察；仍建议根据 5×5 正式数据持续校准正常区间。
+
+每次 `train.py` 启动后、第一轮 epoch 开始前，还会重新读取本轮所有输入数据版本的多样性报告。标准输出用连续感叹号突出显示，例如：
+
+```text
+!!!!!!!!!!!!!!!! 数据多样性检查开始 !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据集：01_expert !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 有效轨迹比例：23.03%（越高越好，表示真正不同的对局分支） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 最大单一轨迹占比：31.00%（越低越好，表示是否被一种对局垄断） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 独特状态比例：20.80%（越高越好，表示不同棋盘局面的覆盖程度） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据质量结论：可接受，但多样性仍有警告，需要关注 !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据多样性检查结束 !!!!!!!!!!!!!!!!
+```
+
+v2 混合训练会分别显示基础专家集和聚合集，避免只看到合并后的训练 loss 而忽略某个输入数据版本已经退化。对应指标也会写入训练步骤的 `DataDiversity/dataset_<序号>_<名称>/*` TensorBoard tags，包括三项多样性指标和 `quality_gate_passed`。
 
 ## 3. 数据如何用于训练
 
@@ -229,7 +243,7 @@ bash BC/run_pipeline.sh 5x5-small
 - `EVAL_GAMES`：每种执子颜色的评测局数，默认 `200`；
 - `EVAL_WORKERS`：评测进程数，默认 `8`；
 - `EPOCHS`、`BATCH_SIZE`、`TRAIN_WORKERS`、`DEVICE`：训练 epoch、batch 大小、DataLoader 进程数和设备；
-- `EXPERT_TOP_K`、`EXPERT_TEMPERATURE`、`EXPERT_STOCHASTIC_MOVES`：专家 top-k、初始温度和采样步数；
+- `EXPERT_TOP_K`、`EXPERT_TEMPERATURE`、`EXPERT_STOCHASTIC_MOVES`：专家 top-k、初始温度和采样步数，默认分别为 `4`、`1.5`、`6`；
 - `BC_TOP_K`、`BC_TEMPERATURE`、`BC_STOCHASTIC_MOVES`：聚合时 BC 的对应参数；
 - `CACHE_LABELS_PER_STATE`：旧配置兼容别名，仅在未设置 `EXPERT_TOP_K` 时生效；
 - `MAX_CANDIDATES`：启发式浅层搜索 shortlist 上限；

@@ -41,22 +41,23 @@ def assess_diversity(metrics: dict[str, Any], *, hard_min_games: int = 100,
     failures: list[str] = []
     checks = (
         (metrics["canonical_effective_trajectory_ratio"], 0.05, "below",
-         "effective trajectory ratio"),
+         "有效轨迹比例"),
         (metrics["dominant_canonical_trajectory_fraction"], 0.20, "above",
-         "dominant trajectory fraction"),
-        (metrics["canonical_state_unique_ratio"], 0.005, "below", "state unique ratio"),
+         "最大单一轨迹占比"),
+        (metrics["canonical_state_unique_ratio"], 0.005, "below", "独特状态比例"),
     )
     for value, threshold, direction, name in checks:
         bad = value < threshold if direction == "below" else value > threshold
         if bad:
-            warnings.append(f"{name} {value:.6f} is {direction} warning threshold {threshold:.6f}")
+            relation = "低于" if direction == "below" else "高于"
+            warnings.append(f"{name} {value:.2%}，{relation}建议线 {threshold:.2%}")
     if metrics["games"] >= hard_min_games:
         if metrics["canonical_effective_trajectory_ratio"] < min_effective_ratio:
-            failures.append("canonical effective trajectory ratio below hard minimum")
+            failures.append(f"有效轨迹比例低于硬门槛 {min_effective_ratio:.2%}")
         if metrics["dominant_canonical_trajectory_fraction"] > max_dominant_fraction:
-            failures.append("dominant canonical trajectory fraction above hard maximum")
+            failures.append(f"最大单一轨迹占比高于硬门槛 {max_dominant_fraction:.2%}")
         if metrics["canonical_state_unique_ratio"] < min_state_unique_ratio:
-            failures.append("canonical state unique ratio below hard minimum")
+            failures.append(f"独特状态比例低于硬门槛 {min_state_unique_ratio:.2%}")
     return {"passed": not failures, "warnings": warnings, "failures": failures,
             "thresholds": {"hard_min_games": hard_min_games,
                            "min_effective_trajectory_ratio": min_effective_ratio,

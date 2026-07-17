@@ -16,7 +16,7 @@ class ExpertCache:
     FORMAT_VERSION = 2
 
     def __init__(self, path: Path, board_size: int, max_candidates: int, seed: int,
-                 top_k: int = 4, temperature: float = 1.0,
+                 top_k: int = 4, temperature: float = 1.5,
                  stochastic_moves: int = 6) -> None:
         self.path = Path(path); self.path.parent.mkdir(parents=True, exist_ok=True)
         self.size = int(board_size); self.top_k = max(1, int(top_k))

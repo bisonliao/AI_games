@@ -19,7 +19,69 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from BC.dataset import GomokuDataset, discover_shards
+from BC.diversity import assess_diversity
 from BC.network import GomokuPolicyNet
+
+
+DIVERSITY_KEYS = (
+    "canonical_effective_trajectory_ratio",
+    "dominant_canonical_trajectory_fraction",
+    "canonical_state_unique_ratio",
+)
+
+
+def load_diversity_reports(data_dirs: list[Path]) -> list[dict[str, Any]]:
+    """Load the immutable diversity report for every dataset used by training."""
+    reports: list[dict[str, Any]] = []
+    for root in data_dirs:
+        root = root.expanduser().resolve()
+        metadata = json.loads((root / "metadata.json").read_text())
+        diversity = metadata.get("diversity")
+        if diversity is None and (root / "diversity.json").is_file():
+            diversity = json.loads((root / "diversity.json").read_text())
+        if not isinstance(diversity, dict):
+            raise ValueError(f"diversity report is missing from dataset: {root}")
+        missing = [key for key in DIVERSITY_KEYS if key not in diversity]
+        if missing:
+            raise ValueError(f"diversity report missing {missing}: {root}")
+        # Recompute with the current standard thresholds so legacy reports also
+        # receive consistent Chinese conclusions instead of stale message text.
+        quality = assess_diversity(diversity)
+        reports.append({"root": str(root), "label": root.name, "diversity": diversity,
+                        "quality": quality})
+    return reports
+
+
+def print_diversity_reports(reports: list[dict[str, Any]]) -> None:
+    marker = "!!!!!!!!!!!!!!!!"
+    print(f"{marker} 数据多样性检查开始 {marker}", flush=True)
+    for report in reports:
+        values = report["diversity"]
+        print(f"{marker} 数据集：{report['label']} {marker}", flush=True)
+        print(f"{marker} 有效轨迹比例："
+              f"{values['canonical_effective_trajectory_ratio']:.2%}（越高越好，表示真正不同的对局分支） {marker}",
+              flush=True)
+        print(f"{marker} 最大单一轨迹占比："
+              f"{values['dominant_canonical_trajectory_fraction']:.2%}（越低越好，表示是否被一种对局垄断） {marker}",
+              flush=True)
+        print(f"{marker} 独特状态比例："
+              f"{values['canonical_state_unique_ratio']:.2%}（越高越好，表示不同棋盘局面的覆盖程度） {marker}",
+              flush=True)
+        quality = report.get("quality") or {}
+        if quality.get("passed") is False:
+            conclusion = "不可接受，禁止训练"
+        elif quality.get("warnings"):
+            conclusion = "可接受，但多样性仍有警告，需要关注"
+        else:
+            conclusion = "可接受，多样性良好"
+        print(f"{marker} 数据质量结论：{conclusion} {marker}", flush=True)
+        if quality.get("warnings"):
+            print(f"{marker} 警告："
+                  + " | ".join(quality["warnings"]) + f" {marker}", flush=True)
+        if quality.get("passed") is False:
+            print(f"{marker} 不通过原因："
+                  + " | ".join(quality.get("failures", [])) + f" {marker}", flush=True)
+    print(f"{marker} 数据多样性检查结束 {marker}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -113,6 +175,8 @@ def main() -> None:
     train_data, val_data = _datasets(args, "train"), _datasets(args, "val")
     if len(train_data) == 0 or len(val_data) == 0:
         raise ValueError("train and validation splits must both contain samples")
+    diversity_reports = load_diversity_reports(args.data_dir)
+    print_diversity_reports(diversity_reports)
     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.workers, pin_memory=device.type == "cuda")
     val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False,
@@ -152,6 +216,18 @@ def main() -> None:
             "data_versions": [str(path.resolve()) for path in args.data_dir],
             "device": str(device),
         }, ensure_ascii=False, indent=2), start_epoch - 1)
+        for index, report in enumerate(diversity_reports):
+            values = report["diversity"]
+            label = f"dataset_{index}_{report['label']}"
+            writer.add_text(f"DataDiversity/{label}/details",
+                            json.dumps({"root": report["root"], **values},
+                                       ensure_ascii=False, indent=2), 0)
+            for key in DIVERSITY_KEYS:
+                writer.add_scalar(f"DataDiversity/{label}/{key}", values[key], 0)
+            quality = report.get("quality") or {}
+            if "passed" in quality:
+                writer.add_scalar(f"DataDiversity/{label}/quality_gate_passed",
+                                  float(bool(quality["passed"])), 0)
     try:
         for epoch in range(start_epoch, args.epochs + 1):
             train_metrics = run_epoch(model, train_loader, device, optimizer, args.grad_clip)

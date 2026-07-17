@@ -103,7 +103,7 @@ def _expert_worker(task: dict[str, Any]) -> dict[str, int]:
 
 def evaluate(checkpoint: Path, board_size: int, games: int, seed: int,
              workers: int, max_candidates: int, agent_player: int,
-             expert_top_k: int = 4, expert_temperature: float = 1.0,
+             expert_top_k: int = 4, expert_temperature: float = 1.5,
              expert_stochastic_moves: int = 6) -> dict[str, Any]:
     """Evaluate one greedy BC policy against the BC-local heuristic expert."""
     if games < 1 or workers < 1 or agent_player not in (1, -1):
@@ -193,7 +193,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=10_000)
     parser.add_argument("--max-candidates", type=int, default=12)
     parser.add_argument("--expert-top-k", type=int, default=4)
-    parser.add_argument("--expert-temperature", type=float, default=1.0)
+    parser.add_argument("--expert-temperature", type=float, default=1.5)
     parser.add_argument("--expert-stochastic-moves", type=int, default=6)
     parser.add_argument("--min-decisive-rate", type=float, default=0.20)
     parser.add_argument("--output", type=Path, default=None)
