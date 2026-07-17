@@ -184,6 +184,12 @@ canonical_state_unique_ratio = 0.31
 
 `run_pipeline.sh` 会依次执行下面列出的五个步骤。直接执行时会自动生成带时间戳的 run name：
 
+脚本直接使用当前 shell 中的 `python`，不会自行调用 conda。请先在脚本外激活训练服务器上的 Python 环境：
+
+```bash
+conda activate mygames  # 环境名以当前服务器为准
+```
+
 ```bash
 bash BC/run_pipeline.sh
 ```
@@ -223,7 +229,6 @@ bash BC/run_pipeline.sh 5x5-small
 - `EPOCHS`、`BATCH_SIZE`、`TRAIN_WORKERS`、`DEVICE`：训练 epoch、batch 大小、DataLoader 进程数和设备；
 - `CACHE_LABELS_PER_STATE`、`MAX_CANDIDATES`：专家缓存标签数和专家候选数；
 - `ARTIFACT_ROOT`：全部输出的根目录，默认 `BC/`；
-- `CONDA_ENV`：conda 环境名，默认 `mygames`。
 
 ### TensorBoard 日志组织
 
@@ -241,7 +246,7 @@ BC/runs/<run-name>/
 一次监控整个 pipeline：
 
 ```bash
-conda run -n mygames tensorboard --logdir BC/runs/<run-name>
+tensorboard --logdir BC/runs/<run-name>
 ```
 
 TensorBoard 会把五个子目录显示为五条带步骤名的 run，但它们都归属于同一个顶层实验目录。产数步骤记录上述三项 `Diversity/*` 指标，以及样本量、缓存命中率、专家查询吞吐和写盘耗时；训练步骤按 epoch 记录 loss、accuracy、合法动作率、吞吐和学习率；评测步骤记录黑白双方的胜负和、得分率、平均局长和非法动作数。

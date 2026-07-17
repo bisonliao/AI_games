@@ -6,7 +6,6 @@ cd "$ROOT"
 
 BOARD_SIZE="${BOARD_SIZE:-5}"
 RUN_NAME="${1:-bc-${BOARD_SIZE}x${BOARD_SIZE}-$(date +%Y%m%d-%H%M%S)}"
-CONDA_ENV="${CONDA_ENV:-mygames}"
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-$ROOT/BC}"
 EXPERT_GAMES="${EXPERT_GAMES:-10000}"
 AGGREGATE_GAMES="${AGGREGATE_GAMES:-5000}"
@@ -52,12 +51,12 @@ is_complete_dataset() {
   [[ -f "$metadata" ]] && rg -q '"status": "complete"' "$metadata"
 }
 
-PYTHON=(conda run --no-capture-output -n "$CONDA_ENV" python)
+PYTHON=(python)
 
 echo "BC pipeline run: $RUN_NAME"
 echo "Board: ${BOARD_SIZE}x${BOARD_SIZE}"
 echo "TensorBoard: $TB_ROOT"
-echo "Monitor with: conda run -n $CONDA_ENV tensorboard --logdir $TB_ROOT"
+echo "Monitor with: tensorboard --logdir $TB_ROOT"
 
 if [[ -f "$STATE_ROOT/01_generate_expert.done" ]] || is_complete_dataset "$EXPERT_DATA"; then
   echo "SKIP 01_generate_expert (already complete)"
