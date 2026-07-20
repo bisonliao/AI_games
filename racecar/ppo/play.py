@@ -6,6 +6,7 @@ Run from the project root::
 
 The policy controls the car. Focus the PyBullet GUI and press ``q`` to exit;
 otherwise a new episode starts after every success, collision, or time limit.
+Each episode samples a fresh start pose using the checkpoint's training noise.
 """
 
 from __future__ import annotations
@@ -49,7 +50,10 @@ def _load_policy(checkpoint_path: Path) -> tuple[ActorCritic, dict]:
 
 
 def play(checkpoint_path: Path, *, fps: int | None = None,
-         max_episode_steps: int | None = None, stochastic: bool = False) -> None:
+         max_episode_steps: int | None = None, stochastic: bool = False,
+         start_position_noise: float | None = None,
+         start_heading_noise: float | None = None,
+         seed: int | None = None) -> None:
     model, checkpoint = _load_policy(checkpoint_path)
     saved_config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
     fps = int(fps if fps is not None else saved_config.get("fps", 20))
@@ -57,19 +61,37 @@ def play(checkpoint_path: Path, *, fps: int | None = None,
         max_episode_steps if max_episode_steps is not None
         else saved_config.get("max_episode_steps", DEFAULT_MAX_STEPS)
     )
+    start_position_noise = float(
+        start_position_noise if start_position_noise is not None
+        else saved_config.get("start_position_noise", 0.15)
+    )
+    start_heading_noise = float(
+        start_heading_noise if start_heading_noise is not None
+        else saved_config.get("start_heading_noise", 0.08)
+    )
     if fps <= 0 or max_episode_steps <= 0:
         raise ValueError("fps and max_episode_steps must be positive")
+    if start_position_noise < 0 or start_heading_noise < 0:
+        raise ValueError("start pose noise must be non-negative")
 
-    env = RaceCarEnv(render=True, fps=fps, max_steps=max_episode_steps)
+    env = RaceCarEnv(
+        render=True, fps=fps, max_steps=max_episode_steps,
+        start_position_noise=start_position_noise,
+        start_heading_noise=start_heading_noise,
+    )
     episode_number = 1
     episode_return = 0.0
     try:
-        observation, _ = env.reset()
+        # Seed only the first explicit reset. Later reset() calls advance this
+        # environment's RNG, giving every episode a different but reproducible
+        # start sequence when --seed is supplied.
+        observation, _ = env.reset(seed=seed)
         global_steps = checkpoint.get("global_steps", "unknown")
         print(
             f"Loaded {checkpoint_path} (training steps={global_steps}).\n"
             f"Policy mode={'stochastic' if stochastic else 'deterministic'}, "
-            f"episode limit={max_episode_steps}. Focus GUI and press q to quit."
+            f"episode limit={max_episode_steps}, position noise=±{start_position_noise}m, "
+            f"heading noise=±{start_heading_noise}rad. Focus GUI and press q to quit."
         )
 
         while p.isConnected(env.physicsClient):
@@ -121,11 +143,18 @@ def main() -> None:
                         help="override checkpoint episode limit")
     parser.add_argument("--stochastic", action="store_true",
                         help="sample the policy instead of choosing its most likely action")
+    parser.add_argument("--start-position-noise", type=float, default=None,
+                        help="override checkpoint x/y start-position noise in meters")
+    parser.add_argument("--start-heading-noise", type=float, default=None,
+                        help="override checkpoint start-heading noise in radians")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="reproduce the sequence of randomized episode starts")
     args = parser.parse_args()
     play(args.checkpoint, fps=args.fps,
-         max_episode_steps=args.max_episode_steps, stochastic=args.stochastic)
+         max_episode_steps=args.max_episode_steps, stochastic=args.stochastic,
+         start_position_noise=args.start_position_noise,
+         start_heading_noise=args.start_heading_noise, seed=args.seed)
 
 
 if __name__ == "__main__":
     main()
-

@@ -35,27 +35,34 @@ class Config:
     max_episode_steps: int = 1500
     fps: int = 20
     seed: int = 1
-    start_position_noise: float = 0.05
-    start_heading_noise: float = 0.03
+    start_position_noise: float = 0.15
+    start_heading_noise: float = 0.08
     evaluation_episodes: int = 32
     evaluation_envs: int = 8
     # Deliberately outside the actor seed ranges used by the default setup.
     evaluation_seed: int = 2_000_000_000
+    evaluation_action_seed: int = 2_100_000_000
     fine_tune_start_steps: int = 5_000_000
+    entropy_anneal_end_steps: int = 12_000_000
+    fine_tune_tighten_steps: int = 15_000_000
     learning_rate: float = 3e-4
     fine_tune_learning_rate: float = 5e-5
-    final_learning_rate: float = 1e-5
+    tightened_learning_rate: float = 1e-5
+    final_learning_rate: float = 5e-6
     gamma: float = 0.995
     gae_lambda: float = 0.95
     update_epochs: int = 8
     fine_tune_update_epochs: int = 4
+    final_update_epochs: int = 2
     minibatch_size: int = 512
     clip_coef: float = 0.2
     fine_tune_clip_coef: float = 0.1
+    final_clip_coef: float = 0.05
     entropy_coef: float = 0.01
-    final_entropy_coef: float = 0.001
+    final_entropy_coef: float = 0.0
     target_kl: float = 0.01
     fine_tune_target_kl: float = 0.003
+    final_target_kl: float = 0.001
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
     report_interval: int = 200_000
@@ -76,39 +83,61 @@ class PPOSettings:
     clip_coef: float
     update_epochs: int
     target_kl: float
-    fine_tune_phase: float
-    fine_tune_progress: float
 
 
 def _settings_at_step(config: Config, global_steps: int) -> PPOSettings:
     """Return a re-entrant schedule that is identical after any checkpoint resume."""
     if global_steps < config.fine_tune_start_steps:
-        return PPOSettings(
-            learning_rate=config.learning_rate,
-            entropy_coef=config.entropy_coef,
-            clip_coef=config.clip_coef,
-            update_epochs=config.update_epochs,
-            target_kl=config.target_kl,
-            fine_tune_phase=0.0,
-            fine_tune_progress=0.0,
-        )
+        learning_rate = config.learning_rate
+        clip_coef = config.clip_coef
+        update_epochs = config.update_epochs
+        target_kl = config.target_kl
+    elif global_steps < config.fine_tune_tighten_steps:
+        fine_tune_progress = float(np.clip(
+            (global_steps - config.fine_tune_start_steps)
+            / max(1, config.fine_tune_tighten_steps
+                  - config.fine_tune_start_steps),
+            0.0, 1.0,
+        ))
+        learning_rate = (config.fine_tune_learning_rate
+                         + fine_tune_progress
+                         * (config.tightened_learning_rate
+                            - config.fine_tune_learning_rate))
+        clip_coef = config.fine_tune_clip_coef
+        update_epochs = config.fine_tune_update_epochs
+        target_kl = config.fine_tune_target_kl
+    else:
+        tighten_progress = float(np.clip(
+            (global_steps - config.fine_tune_tighten_steps)
+            / max(1, config.total_timesteps - config.fine_tune_tighten_steps),
+            0.0, 1.0,
+        ))
+        learning_rate = (config.tightened_learning_rate
+                         + tighten_progress
+                         * (config.final_learning_rate
+                            - config.tightened_learning_rate))
+        clip_coef = (config.fine_tune_clip_coef
+                     + tighten_progress
+                     * (config.final_clip_coef - config.fine_tune_clip_coef))
+        update_epochs = config.final_update_epochs
+        target_kl = (config.fine_tune_target_kl
+                     + tighten_progress
+                     * (config.final_target_kl - config.fine_tune_target_kl))
 
-    denominator = max(1, config.total_timesteps - config.fine_tune_start_steps)
-    progress = float(np.clip(
-        (global_steps - config.fine_tune_start_steps) / denominator, 0.0, 1.0
+    entropy_progress = float(np.clip(
+        (global_steps - config.fine_tune_start_steps)
+        / max(1, config.entropy_anneal_end_steps - config.fine_tune_start_steps),
+        0.0, 1.0,
     ))
+    entropy_coef = (config.entropy_coef
+                    + entropy_progress * (config.final_entropy_coef
+                                          - config.entropy_coef))
     return PPOSettings(
-        learning_rate=(config.fine_tune_learning_rate
-                       + progress * (config.final_learning_rate
-                                     - config.fine_tune_learning_rate)),
-        entropy_coef=(config.entropy_coef
-                      + progress * (config.final_entropy_coef
-                                    - config.entropy_coef)),
-        clip_coef=config.fine_tune_clip_coef,
-        update_epochs=config.fine_tune_update_epochs,
-        target_kl=config.fine_tune_target_kl,
-        fine_tune_phase=1.0,
-        fine_tune_progress=progress,
+        learning_rate=learning_rate,
+        entropy_coef=entropy_coef,
+        clip_coef=clip_coef,
+        update_epochs=update_epochs,
+        target_kl=target_kl,
     )
 
 
@@ -215,8 +244,6 @@ def _ppo_update(model: ActorCritic, optimizer: torch.optim.Optimizer,
     metrics["clip_coef"] = settings.clip_coef
     metrics["target_kl"] = settings.target_kl
     metrics["update_epochs_used"] = float(epochs_used)
-    metrics["fine_tune_phase"] = settings.fine_tune_phase
-    metrics["fine_tune_progress"] = settings.fine_tune_progress
     metrics["explained_variance"] = _explained_variance(
         batch["values"], batch["returns"]
     )
@@ -378,7 +405,7 @@ class Learner:
                     "config": asdict(self.config)}, path)
         return path
 
-    def _evaluate_greedy(self):
+    def _evaluate_success_rate(self, *, stochastic: bool):
         evaluation_model = ActorCritic().cpu().eval()
         evaluation_model.load_state_dict({
             name: torch.from_numpy(value)
@@ -392,6 +419,11 @@ class Learner:
             start_position_noise=self.config.start_position_noise,
             start_heading_noise=self.config.start_heading_noise,
         )
+        # One fixed action RNG stream per evaluation episode avoids coupling
+        # stochastic results to vector scheduling or other episodes' lengths.
+        action_generators = [torch.Generator(device="cpu") for _ in range(num_envs)]
+        for index, generator in enumerate(action_generators):
+            generator.manual_seed(self.config.evaluation_action_seed + index)
         try:
             next_episode = num_envs
             observations, _ = environments.reset([
@@ -405,7 +437,17 @@ class Learner:
                     logits = evaluation_model.policy(
                         evaluation_model.trunk(observation_tensor)
                     )
-                    actions = logits.argmax(dim=-1).numpy()
+                    if stochastic:
+                        probabilities = logits.softmax(dim=-1)
+                        actions = np.asarray([
+                            int(torch.multinomial(
+                                probabilities[index], num_samples=1,
+                                replacement=True, generator=action_generators[index],
+                            ).item())
+                            for index in range(num_envs)
+                        ], dtype=np.int64)
+                    else:
+                        actions = logits.argmax(dim=-1).numpy()
                 next_observations, _, terminated, truncated, infos = environments.step(
                     actions_to_steering(actions)
                 )
@@ -414,23 +456,23 @@ class Learner:
                 reset_seeds = []
                 for index in done_indices:
                     if active[index]:
-                        position = np.asarray(infos[index]["position"], dtype=np.float32)
-                        results.append({
-                            "success": bool(infos[index].get("is_success", False)),
-                            "steps": int(infos[index]["steps"]),
-                            "terminal_distance": float(np.linalg.norm(
-                                position - np.asarray((14.5, 7.5), dtype=np.float32)
-                            )),
-                        })
+                        results.append(bool(infos[index].get("is_success", False)))
                     reset_indices.append(int(index))
                     if next_episode < episode_count:
-                        reset_seeds.append(self.config.evaluation_seed + next_episode)
+                        episode_id = next_episode
+                        reset_seeds.append(self.config.evaluation_seed + episode_id)
+                        action_generators[index].manual_seed(
+                            self.config.evaluation_action_seed + episode_id
+                        )
                         next_episode += 1
                         active[index] = True
                     else:
                         # Keep the fixed-size vector valid while the remaining
                         # active evaluation episodes finish; ignore this dummy.
                         reset_seeds.append(self.config.evaluation_seed + episode_count + int(index))
+                        action_generators[index].manual_seed(
+                            self.config.evaluation_action_seed + episode_count + int(index)
+                        )
                         active[index] = False
                 observations = next_observations
                 for index, (reset_observation, _) in environments.reset_at(
@@ -438,40 +480,26 @@ class Learner:
                 ).items():
                     observations[index] = reset_observation
 
-            successes = [item for item in results if item["success"]]
-            return {
-                "episodes": len(results),
-                "successes": len(successes),
-                "success_rate": len(successes) / len(results),
-                "mean_episode_steps": float(np.mean([item["steps"] for item in results])),
-                "mean_success_steps": (float(np.mean([item["steps"] for item in successes]))
-                                       if successes else 0.0),
-                "mean_terminal_distance": float(np.mean([
-                    item["terminal_distance"] for item in results
-                ])),
-            }
+            return float(sum(results) / len(results))
         finally:
             environments.close()
 
     def _evaluate_and_save_best(self):
-        result = self._evaluate_greedy()
+        greedy_success_rate = self._evaluate_success_rate(stochastic=False)
+        stochastic_success_rate = self._evaluate_success_rate(stochastic=True)
         step = self.global_steps
         self.last_evaluation_step = step
-        self.writer.add_scalar("eval/greedy_success_rate", result["success_rate"], step)
-        self.writer.add_scalar("eval/greedy_successes", result["successes"], step)
-        self.writer.add_scalar("eval/greedy_mean_episode_steps",
-                               result["mean_episode_steps"], step)
-        self.writer.add_scalar("eval/greedy_mean_success_steps",
-                               result["mean_success_steps"], step)
-        self.writer.add_scalar("eval/greedy_mean_terminal_distance",
-                               result["mean_terminal_distance"], step)
-        # Prefer success rate, then efficient successful routes, then distance.
-        score = (result["success_rate"], -result["mean_success_steps"],
-                 -result["mean_terminal_distance"])
+        self.writer.add_scalar("eval/greedy_success_rate", greedy_success_rate, step)
+        self.writer.add_scalar("eval/stochastic_success_rate", stochastic_success_rate, step)
+        # Prefer deployment-time greedy success; use stochastic success as tie-breaker.
+        score = (greedy_success_rate, stochastic_success_rate)
         if self.best_greedy_score is None or score > self.best_greedy_score:
             self.best_greedy_score = score
             self._save_checkpoint("best_greedy")
-        return result
+        return {
+            "greedy_success_rate": greedy_success_rate,
+            "stochastic_success_rate": stochastic_success_rate,
+        }
 
     def train(self):
         config = self.config
@@ -568,8 +596,7 @@ class Learner:
             self.writer.add_scalar(f"actions/{name}_rate", window["action_counts"][index] / total, step)
         for name in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction",
                      "learning_rate", "entropy_coef", "clip_coef", "target_kl",
-                     "update_epochs_used", "fine_tune_phase", "fine_tune_progress",
-                     "explained_variance"):
+                     "update_epochs_used", "explained_variance"):
             values = [metric[name] for metric in window["metrics"]]
             self.writer.add_scalar(f"ppo/{name}", np.mean(values) if values else 0.0, step)
         self.writer.add_scalar("perf/steps_per_second",
@@ -609,10 +636,16 @@ def main():
     config = parse_args()
     if config.num_actors < 1 or config.envs_per_actor < 1:
         raise ValueError("num_actors and envs_per_actor must be positive")
-    if not 0 <= config.fine_tune_start_steps < config.total_timesteps:
-        raise ValueError("fine_tune_start_steps must be in [0, total_timesteps)")
+    if not (0 <= config.fine_tune_start_steps
+            < config.entropy_anneal_end_steps
+            <= config.fine_tune_tighten_steps
+            < config.total_timesteps):
+        raise ValueError(
+            "schedule must satisfy 0 <= fine-tune start < entropy end "
+            "<= tighten start < total"
+        )
     if min(config.learning_rate, config.fine_tune_learning_rate,
-           config.final_learning_rate) <= 0:
+           config.tightened_learning_rate, config.final_learning_rate) <= 0:
         raise ValueError("all learning rates must be positive")
     if min(config.entropy_coef, config.final_entropy_coef) < 0:
         raise ValueError("entropy coefficients must be non-negative")
@@ -620,6 +653,15 @@ def main():
         raise ValueError("evaluation_episodes and evaluation_envs must be positive")
     if config.start_position_noise < 0 or config.start_heading_noise < 0:
         raise ValueError("start pose noise must be non-negative")
+    if min(config.clip_coef, config.fine_tune_clip_coef,
+           config.final_clip_coef) <= 0:
+        raise ValueError("all clip coefficients must be positive")
+    if min(config.update_epochs, config.fine_tune_update_epochs,
+           config.final_update_epochs) < 1:
+        raise ValueError("all update epoch counts must be positive")
+    if min(config.target_kl, config.fine_tune_target_kl,
+           config.final_target_kl) <= 0:
+        raise ValueError("all target KL values must be positive")
     Learner(config).train()
 
 
