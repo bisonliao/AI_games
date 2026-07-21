@@ -26,9 +26,67 @@ from ppo.actor import actor_process
 from ppo.model import ACTION_NAMES, ActorCritic, actions_to_steering
 
 
+# Each item is (absolute environment step, value). Values between adjacent
+# points are linearly interpolated; values outside the listed range are clamped
+# to the nearest endpoint. Edit only these lists when tuning the schedules.
+LEARNING_RATE_POINTS = [
+    (0, 3e-4),
+    (4_000_000, 3e-4),
+    (5_000_000, 5e-5),
+    (15_000_000, 1e-5),
+]
+ENTROPY_COEF_POINTS = [
+    (0, 0.005),
+    (5_000_000, 0.005),
+    (12_000_000, 0.0),
+]
+
+
+def _validate_step_points(
+        name: str, points: list[tuple[int, float]], *, allow_zero: bool) -> None:
+    if not points:
+        raise ValueError(f"{name} must not be empty")
+    previous_step = -1
+    for step, value in points:
+        if not isinstance(step, int) or step < 0:
+            raise ValueError(f"{name} steps must be non-negative integers")
+        if step <= previous_step:
+            raise ValueError(f"{name} steps must be strictly increasing")
+        if not math.isfinite(value) or value < 0 or (not allow_zero and value == 0):
+            qualifier = "non-negative" if allow_zero else "positive"
+            raise ValueError(f"{name} values must be finite and {qualifier}")
+        previous_step = step
+
+
+def _interpolate_step_points(
+        global_steps: int, points: list[tuple[int, float]]) -> float:
+    """Linearly interpolate a sorted list of ``(step, value)`` anchors."""
+    if not points:
+        raise ValueError("schedule point list must not be empty")
+    if global_steps <= points[0][0]:
+        return float(points[0][1])
+    for right_index in range(1, len(points)):
+        right_step, right_value = points[right_index]
+        if global_steps <= right_step:
+            left_step, left_value = points[right_index - 1]
+            fraction = (global_steps - left_step) / (right_step - left_step)
+            return float(left_value + fraction * (right_value - left_value))
+    return float(points[-1][1])
+
+
+def learning_rate_at_step(global_steps: int) -> float:
+    """Return the learning rate at an absolute environment step."""
+    return _interpolate_step_points(global_steps, LEARNING_RATE_POINTS)
+
+
+def entropy_coef_at_step(global_steps: int) -> float:
+    """Return the entropy coefficient at an absolute environment step."""
+    return _interpolate_step_points(global_steps, ENTROPY_COEF_POINTS)
+
+
 @dataclass
 class Config:
-    total_timesteps: int = 20_000_000
+    total_timesteps: int = 30_000_000
     num_actors: int = 8
     envs_per_actor: int = 2
     rollout_steps: int = 512
@@ -42,27 +100,12 @@ class Config:
     # Deliberately outside the actor seed ranges used by the default setup.
     evaluation_seed: int = 2_000_000_000
     evaluation_action_seed: int = 2_100_000_000
-    fine_tune_start_steps: int = 5_000_000
-    entropy_anneal_end_steps: int = 12_000_000
-    fine_tune_tighten_steps: int = 15_000_000
-    learning_rate: float = 3e-4
-    fine_tune_learning_rate: float = 5e-5
-    tightened_learning_rate: float = 1e-5
-    final_learning_rate: float = 5e-6
     gamma: float = 0.995
     gae_lambda: float = 0.95
     update_epochs: int = 8
-    fine_tune_update_epochs: int = 4
-    final_update_epochs: int = 2
     minibatch_size: int = 512
     clip_coef: float = 0.2
-    fine_tune_clip_coef: float = 0.1
-    final_clip_coef: float = 0.05
-    entropy_coef: float = 0.01
-    final_entropy_coef: float = 0.0
     target_kl: float = 0.01
-    fine_tune_target_kl: float = 0.003
-    final_target_kl: float = 0.001
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
     report_interval: int = 200_000
@@ -87,57 +130,12 @@ class PPOSettings:
 
 def _settings_at_step(config: Config, global_steps: int) -> PPOSettings:
     """Return a re-entrant schedule that is identical after any checkpoint resume."""
-    if global_steps < config.fine_tune_start_steps:
-        learning_rate = config.learning_rate
-        clip_coef = config.clip_coef
-        update_epochs = config.update_epochs
-        target_kl = config.target_kl
-    elif global_steps < config.fine_tune_tighten_steps:
-        fine_tune_progress = float(np.clip(
-            (global_steps - config.fine_tune_start_steps)
-            / max(1, config.fine_tune_tighten_steps
-                  - config.fine_tune_start_steps),
-            0.0, 1.0,
-        ))
-        learning_rate = (config.fine_tune_learning_rate
-                         + fine_tune_progress
-                         * (config.tightened_learning_rate
-                            - config.fine_tune_learning_rate))
-        clip_coef = config.fine_tune_clip_coef
-        update_epochs = config.fine_tune_update_epochs
-        target_kl = config.fine_tune_target_kl
-    else:
-        tighten_progress = float(np.clip(
-            (global_steps - config.fine_tune_tighten_steps)
-            / max(1, config.total_timesteps - config.fine_tune_tighten_steps),
-            0.0, 1.0,
-        ))
-        learning_rate = (config.tightened_learning_rate
-                         + tighten_progress
-                         * (config.final_learning_rate
-                            - config.tightened_learning_rate))
-        clip_coef = (config.fine_tune_clip_coef
-                     + tighten_progress
-                     * (config.final_clip_coef - config.fine_tune_clip_coef))
-        update_epochs = config.final_update_epochs
-        target_kl = (config.fine_tune_target_kl
-                     + tighten_progress
-                     * (config.final_target_kl - config.fine_tune_target_kl))
-
-    entropy_progress = float(np.clip(
-        (global_steps - config.fine_tune_start_steps)
-        / max(1, config.entropy_anneal_end_steps - config.fine_tune_start_steps),
-        0.0, 1.0,
-    ))
-    entropy_coef = (config.entropy_coef
-                    + entropy_progress * (config.final_entropy_coef
-                                          - config.entropy_coef))
     return PPOSettings(
-        learning_rate=learning_rate,
-        entropy_coef=entropy_coef,
-        clip_coef=clip_coef,
-        update_epochs=update_epochs,
-        target_kl=target_kl,
+        learning_rate=learning_rate_at_step(global_steps),
+        entropy_coef=entropy_coef_at_step(global_steps),
+        clip_coef=config.clip_coef,
+        update_epochs=config.update_epochs,
+        target_kl=config.target_kl,
     )
 
 
@@ -277,6 +275,14 @@ def _format_checkpoint_suffix(suffix: str, total_timesteps: int) -> str:
     return str(suffix)
 
 
+def _config_snapshot(config: Config) -> dict:
+    """Include code-defined schedules in logs and checkpoints."""
+    snapshot = asdict(config)
+    snapshot["learning_rate_points"] = list(LEARNING_RATE_POINTS)
+    snapshot["entropy_coef_points"] = list(ENTROPY_COEF_POINTS)
+    return snapshot
+
+
 class Learner:
     def __init__(self, config: Config):
         self.run_name = _resolve_output_dirs(config)
@@ -287,7 +293,9 @@ class Learner:
             raise RuntimeError("CUDA is unavailable; use --device cpu explicitly for a smoke test")
         self.device = torch.device(config.device)
         self.model = ActorCritic().to(self.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate, eps=1e-5)
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(), lr=learning_rate_at_step(0), eps=1e-5
+        )
         self.global_steps = 0
         self.policy_version = 0
         self.best_greedy_score = None
@@ -315,7 +323,7 @@ class Learner:
         for actor in self.actors:
             actor.start()
         self.writer = SummaryWriter(config.log_dir)
-        self.writer.add_text("config", str(asdict(config)), 0)
+        self.writer.add_text("config", str(_config_snapshot(config)), 0)
         print(f"run={self.run_name}\nTensorBoard: {config.log_dir}\ncheckpoints: {config.checkpoint_dir}")
 
     def _load_resume(self):
@@ -402,7 +410,7 @@ class Learner:
         torch.save({"model": self.model.state_dict(), "optimizer": self.optimizer.state_dict(),
                     "global_steps": self.global_steps, "policy_version": self.policy_version,
                     "best_greedy_score": self.best_greedy_score,
-                    "config": asdict(self.config)}, path)
+                    "config": _config_snapshot(self.config)}, path)
         return path
 
     def _evaluate_success_rate(self, *, stochastic: bool):
@@ -636,32 +644,22 @@ def main():
     config = parse_args()
     if config.num_actors < 1 or config.envs_per_actor < 1:
         raise ValueError("num_actors and envs_per_actor must be positive")
-    if not (0 <= config.fine_tune_start_steps
-            < config.entropy_anneal_end_steps
-            <= config.fine_tune_tighten_steps
-            < config.total_timesteps):
-        raise ValueError(
-            "schedule must satisfy 0 <= fine-tune start < entropy end "
-            "<= tighten start < total"
-        )
-    if min(config.learning_rate, config.fine_tune_learning_rate,
-           config.tightened_learning_rate, config.final_learning_rate) <= 0:
-        raise ValueError("all learning rates must be positive")
-    if min(config.entropy_coef, config.final_entropy_coef) < 0:
-        raise ValueError("entropy coefficients must be non-negative")
+    _validate_step_points(
+        "learning-rate points", LEARNING_RATE_POINTS, allow_zero=False
+    )
+    _validate_step_points(
+        "entropy-coefficient points", ENTROPY_COEF_POINTS, allow_zero=True
+    )
     if config.evaluation_episodes < 1 or config.evaluation_envs < 1:
         raise ValueError("evaluation_episodes and evaluation_envs must be positive")
     if config.start_position_noise < 0 or config.start_heading_noise < 0:
         raise ValueError("start pose noise must be non-negative")
-    if min(config.clip_coef, config.fine_tune_clip_coef,
-           config.final_clip_coef) <= 0:
-        raise ValueError("all clip coefficients must be positive")
-    if min(config.update_epochs, config.fine_tune_update_epochs,
-           config.final_update_epochs) < 1:
-        raise ValueError("all update epoch counts must be positive")
-    if min(config.target_kl, config.fine_tune_target_kl,
-           config.final_target_kl) <= 0:
-        raise ValueError("all target KL values must be positive")
+    if config.clip_coef <= 0:
+        raise ValueError("clip_coef must be positive")
+    if config.update_epochs < 1:
+        raise ValueError("update_epochs must be positive")
+    if config.target_kl <= 0:
+        raise ValueError("target_kl must be positive")
     Learner(config).train()
 
 

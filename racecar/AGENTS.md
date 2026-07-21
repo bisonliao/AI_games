@@ -63,16 +63,22 @@
   `--log-dir`/`--checkpoint-dir` 时则完全采用指定路径。
 - 使用 `python -m ppo.play checkpoints/<run>/checkpoint_final.pt` 可在 PyBullet GUI 中
   回放策略；默认确定性选取最大概率动作，按 `q` 退出，回合结束后自动循环。可以用
-  `--stochastic` 进行采样式回放。
-- PPO 调度是 absolute `global_steps` 的纯函数，以保证从 0 训练和任意 checkpoint 恢复
-  完全一致：0～5M 使用 learning rate `3e-4`、clip `0.2`、最多 8 epochs、target KL
-  `0.01`；5M 后切入精调，learning rate `5e-5 -> 1e-5`、entropy coefficient
-  `0.01 -> 0.001` 线性退火，并使用 clip `0.1`、最多 4 epochs、target KL `0.003`。
-- greedy 评测只在每次 1000000 步周期 checkpoint（以及恢复起点/最终点）运行；默认用
-  32 个固定、互异的 evaluation seeds 和 8 个环境，记录 `eval/greedy_*` 聚合指标。
-  固定评测 seed 集保证 checkpoint 间可比，同时初始位置/朝向扰动保证回合不重复。
-  最优策略保存为 `checkpoint_best_greedy.pt`，不要假设 final 一定最佳。
-- 训练默认对起始 x/y 各加入 `±0.05m`、heading 加入 `±0.03rad` 的 seeded uniform
+  `--stochastic` 进行采样式回放。每局初态按 checkpoint 的训练扰动重新采样；`--seed`
+  可复现整段初态序列，但不会让每局重复同一个初态。
+- PPO 的 learning rate 和 entropy coefficient 分别由
+  `ppo/train.py::learning_rate_at_step`、`entropy_coef_at_step` 两个 absolute-step 纯函数
+  计算。修改模块顶部的 `LEARNING_RATE_POINTS`、`ENTROPY_COEF_POINTS` 即可调参；每个元素
+  是 `(STEP, VALUE)`，STEP 必须严格递增且不重复。相邻锚点线性插值，首个锚点之前和最后
+  一个锚点之后分别保持首值和末值；调度点会写入 TensorBoard 配置和 checkpoint。当前
+  learning rate 在 15M 达到 `1e-5` 后保持，entropy coefficient 在 12M 达到 0 后保持。
+  clip `0.2`、最多 8 epochs、target KL `0.01` 在整个训练过程中保持不变。
+- 每次 1000000 步周期 checkpoint（以及恢复起点/最终点）都在相同的 32 个固定、互异
+  evaluation seeds 上各做一次 argmax 和 stochastic 评测，并且只记录
+  `eval/greedy_success_rate`、`eval/stochastic_success_rate`。stochastic 评测为每个回合使用
+  独立、固定的动作随机数流，保证 checkpoint 间可比且不受并行环境调度影响。
+  最优策略仍优先按 greedy 成功率选择、stochastic 成功率仅用于平分时比较，保存为
+  `checkpoint_best_greedy.pt`；不要假设 final 一定最佳。
+- 训练和评测默认对起始 x/y 各加入 `±0.15m`、heading 加入 `±0.08rad` 的 seeded uniform
   扰动。actor seed 由 base seed、resume global step 和 actor id 共同确定；actor 内每个
   环境使用不同 seed。策略的 Categorical 采样由各 actor 独立 torch RNG 驱动。
 - 周期 checkpoint 的纯数字 step 序号按 `total_timesteps` 位数左补零，保证文件名字典序
