@@ -4,9 +4,11 @@ Run from the project root::
 
     python -m ppo.play checkpoints/<run>/checkpoint_final.pt
 
-The policy controls the car. Focus the PyBullet GUI and press ``q`` to exit;
-otherwise a new episode starts after every success, collision, or time limit.
-Each episode samples a fresh start pose using the checkpoint's training noise.
+The policy samples actions from its categorical distribution by default. Focus
+the PyBullet GUI and press ``q`` to exit; otherwise a new episode starts after
+every success, collision, or time limit. Each episode samples a fresh start
+pose using the checkpoint's training noise. Pass ``--deterministic`` to use
+argmax actions instead.
 """
 
 from __future__ import annotations
@@ -50,7 +52,7 @@ def _load_policy(checkpoint_path: Path) -> tuple[ActorCritic, dict]:
 
 
 def play(checkpoint_path: Path, *, fps: int | None = None,
-         max_episode_steps: int | None = None, stochastic: bool = False,
+         max_episode_steps: int | None = None, stochastic: bool = True,
          start_position_noise: float | None = None,
          start_heading_noise: float | None = None,
          seed: int | None = None) -> None:
@@ -141,8 +143,12 @@ def main() -> None:
                         help="override checkpoint simulation/display frequency")
     parser.add_argument("--max-episode-steps", type=int, default=None,
                         help="override checkpoint episode limit")
-    parser.add_argument("--stochastic", action="store_true",
-                        help="sample the policy instead of choosing its most likely action")
+    policy_mode = parser.add_mutually_exclusive_group()
+    policy_mode.add_argument("--stochastic", dest="stochastic", action="store_true",
+                             help="sample policy actions (default)")
+    policy_mode.add_argument("--deterministic", dest="stochastic", action="store_false",
+                             help="choose the most likely action with argmax")
+    parser.set_defaults(stochastic=True)
     parser.add_argument("--start-position-noise", type=float, default=None,
                         help="override checkpoint x/y start-position noise in meters")
     parser.add_argument("--start-heading-noise", type=float, default=None,
