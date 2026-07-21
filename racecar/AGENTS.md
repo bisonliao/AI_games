@@ -54,6 +54,7 @@
   的连续转向值 `[0, -1, +1]`。
 - `ppo/model.py` 的训练适配层使用距离进展奖励、轻微步耗以及终点/碰撞终奖，避免原环境
   的全正距离奖励诱导拖延；TensorBoard 的 `window/*` 指标每 200000 环境步清零一次。
+  各项监控指标的计算口径、含义和联合诊断方法见项目根目录 `tensorboard.md`。
 - 性能监控只保留 `perf/mean_rollout_collect_seconds` 和
   `queue/mean_learner_rollout_wait_seconds` 两个关键时间指标，另结合
   `perf/steps_per_second` 判断 actor 采样是否成为瓶颈，避免高频队列探测反过来影响性能。
@@ -62,9 +63,9 @@
   `racecar_ppo_YYYYMMDD_HHMMSS_mmm_pidN` 唯一 run 名，支持并发实验；显式传入
   `--log-dir`/`--checkpoint-dir` 时则完全采用指定路径。
 - 使用 `python -m ppo.play checkpoints/<run>/checkpoint_final.pt` 可在 PyBullet GUI 中
-  回放策略；默认确定性选取最大概率动作，按 `q` 退出，回合结束后自动循环。可以用
-  `--stochastic` 进行采样式回放。每局初态按 checkpoint 的训练扰动重新采样；`--seed`
-  可复现整段初态序列，但不会让每局重复同一个初态。
+  回放策略；默认从策略分布采样动作，按 `q` 退出，回合结束后自动循环。可以用
+  `--deterministic` 改为 argmax 回放。每局初态按 checkpoint 的训练扰动重新采样；
+  `--seed` 可复现整段初态序列，但不会让每局重复同一个初态。
 - PPO 的 learning rate 和 entropy coefficient 分别由
   `ppo/train.py::learning_rate_at_step`、`entropy_coef_at_step` 两个 absolute-step 纯函数
   计算。修改模块顶部的 `LEARNING_RATE_POINTS`、`ENTROPY_COEF_POINTS` 即可调参；每个元素
