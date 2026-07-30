@@ -240,6 +240,15 @@ def _actor_main(
         )
         observations, _ = envs.reset(seed=seed)
         local_transitions = 0
+        # random_steps 是“所有 actor 合计”的纯随机探索预算，这里用整除把它
+        # 近似平均分给每个 actor。例如 random_steps=2000、num_actors=2 时，
+        # 每个 actor 的 random_budget=1000；在 local_transitions 达到 1000
+        # 之前，下面的动作分支完全忽略 actor 网络，直接从 [-1, 1] 均匀采样。
+        # 达到预算后才切换为“actor 输出 + 高斯探索噪声”。由于每次 vector
+        # step 会同时产生 envs_per_actor 条 transition，随机阶段只能按整批
+        # 切换，实际数量最多会比预算多 envs_per_actor-1 条。max 的第二项
+        # 保证即使 random_steps 很小，每个 actor 也至少执行一个完整的随机
+        # vector batch，从而让 replay 初始数据覆盖动作空间而非仅来自未训练模型。
         random_budget = max(
             train_config.random_steps // train_config.num_actors,
             train_config.envs_per_actor,
