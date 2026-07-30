@@ -31,7 +31,7 @@ class TrainConfig:
     envs_per_actor: int = 4
     actor_chunk_size: int = 256
     transition_queue_size: int = 8
-    replay_capacity: int = 200_000
+    replay_capacity: int = 50_000
     batch_size: int = 256
     learning_starts: int = 2_000
     random_steps: int = 2_000
@@ -132,6 +132,20 @@ def _create_run_directory(root: str, run_name: str | None) -> Path:
     raise RuntimeError(f"Could not reserve a unique run directory below {root_path}")
 
 
+def _training_run_name(
+    observation_mode: str, total_transitions: int, run_name: str | None
+) -> str:
+    """为训练 run 生成可读身份，避免只看 TensorBoard 路径时混淆实验。
+
+    ``rgb`` 和 ``vector`` 的网络、样本难度及默认训练预算不同，因此把模式和
+    实际目标步数放在用户自定义名称之前。用户仍可用 ``--run-name`` 添加项目、
+    seed 或超参数标签；这里不修改 checkpoint 内容，只影响 run 目录名称。
+    """
+    mode_label = "rgb" if observation_mode == "rgb" else "vec"
+    base_name = run_name or "td3"
+    return f"{mode_label}-steps{int(total_transitions)}-{base_name}"
+
+
 def _safe_qsize(target_queue: Any) -> int:
     try:
         return int(target_queue.qsize())
@@ -227,7 +241,14 @@ def _actor_main(
 
         # actor 只保留 CPU 上的 policy 副本，不会创建 CUDA context。启动后
         # 必须先拿到 learner 的初始参数，才能开始环境交互。
-        actor = Actor(hidden_dim=train_config.hidden_dim).cpu().eval()
+        actor = Actor(
+            hidden_dim=train_config.hidden_dim,
+            observation_shape=(
+                env_config.observation_shape
+                if env_config.observation_mode == "rgb"
+                else None
+            ),
+        ).cpu().eval()
         _, weights = weight_queue.get(timeout=60.0)
         actor.load_state_dict(
             {key: torch.as_tensor(value) for key, value in weights.items()}
@@ -446,7 +467,10 @@ def train_distributed(
     # 1. 在创建任何子进程之前确定设备和输出目录。时间戳目录同时容纳
     # TensorBoard event 与默认 checkpoint，便于并行实验隔离。
     resolve_device(cfg.device)  # Fail before creating any child process.
-    run_dir = _create_run_directory(cfg.run_root, cfg.run_name)
+    effective_run_name = _training_run_name(
+        env_cfg.observation_mode, cfg.total_transitions, cfg.run_name
+    )
+    run_dir = _create_run_directory(cfg.run_root, effective_run_name)
     checkpoint_path = (
         Path(cfg.checkpoint_path)
         if cfg.checkpoint_path is not None
@@ -464,6 +488,9 @@ def train_distributed(
         f"```json\n{json.dumps(asdict(env_cfg), indent=2, default=str)}\n```",
         0,
     )
+    writer.add_text("config/run_identity", effective_run_name, 0)
+    writer.add_text("config/observation_mode", env_cfg.observation_mode, 0)
+    writer.add_scalar("train/target_transitions", cfg.total_transitions, 0)
     writer.add_scalar("queue/transition_capacity", cfg.transition_queue_size, 0)
 
     # 2. learner 是唯一允许使用 cfg.device 的进程；CPU actor 的模型副本在
@@ -473,7 +500,7 @@ def train_distributed(
     if torch.device(cfg.device).type == "cpu":
         torch.set_num_threads(max(1, min(4, torch.get_num_threads())))
 
-    model_config = {
+    model_config: dict[str, Any] = {
         "obs_dim": 1,
         "action_dim": 1,
         "hidden_dim": cfg.hidden_dim,
@@ -481,8 +508,19 @@ def train_distributed(
         "critic_lr": cfg.critic_lr,
         "policy_delay": cfg.policy_delay,
     }
+    if env_cfg.observation_mode == "rgb":
+        # list 可直接写入 checkpoint metadata；BanditTD3 加载时会转为 tuple。
+        model_config["observation_shape"] = list(env_cfg.observation_shape)
     learner = BanditTD3(device=cfg.device, **model_config)
-    replay = ReplayBuffer(cfg.replay_capacity, seed=cfg.seed)
+    replay = ReplayBuffer(
+        cfg.replay_capacity,
+        observation_shape=env_cfg.observation_shape,
+        observation_dtype=env_cfg.observation_dtype,
+        # 本任务每条数据都 terminal，critic target 只等于即时 reward；不保存
+        # next observation 可避免像素 replay 内存直接翻倍。
+        store_next_observations=False,
+        seed=cfg.seed,
+    )
 
     # 3. 所有进程统一使用 spawn：避免 fork 复制 CUDA/PyBullet 状态。
     # transition_queue 传样本，event_queue 传健康/异常，weight_queues 为每个
@@ -692,6 +730,11 @@ def train_distributed(
                     )
                     writer.add_scalar("learner/updates", updates, received)
                     writer.add_scalar("learner/replay_size", len(replay), received)
+                    writer.add_scalar(
+                        "learner/replay_allocated_megabytes",
+                        replay.allocated_bytes / (1024**2),
+                        received,
+                    )
                     if critic_updates_since_log:
                         writer.add_scalar(
                             "learner/critic_loss",

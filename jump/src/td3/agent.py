@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -22,27 +22,91 @@ def resolve_device(device: str) -> torch.device:
     return resolved
 
 
-class Actor(nn.Module):
-    def __init__(self, obs_dim: int = 1, action_dim: int = 1, hidden_dim: int = 128):
+class PixelEncoder(nn.Module):
+    """Small convolutional encoder for the two-channel platform masks."""
+
+    def __init__(self, input_channels: int, feature_dim: int) -> None:
         super().__init__()
         self.network = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
+            nn.Conv2d(input_channels, 16, kernel_size=5, stride=2, padding=2),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim),
-            nn.Tanh(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.Flatten(),
+            nn.Linear(64 * 4 * 4, feature_dim),
+            nn.ReLU(),
         )
 
     def forward(self, observation: torch.Tensor) -> torch.Tensor:
-        return self.network(observation)
+        return self.network(observation.float())
+
+
+class Actor(nn.Module):
+    def __init__(
+        self,
+        obs_dim: int = 1,
+        action_dim: int = 1,
+        hidden_dim: int = 128,
+        observation_shape: Sequence[int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.observation_shape = (
+            tuple(int(value) for value in observation_shape)
+            if observation_shape is not None
+            else (obs_dim,)
+        )
+        self.pixel_observation = len(self.observation_shape) == 3
+        if self.pixel_observation:
+            self.encoder = PixelEncoder(self.observation_shape[0], hidden_dim)
+            self.network = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, action_dim),
+                nn.Tanh(),
+            )
+        else:
+            # Keep the original vector network layout and state-dict names so
+            # checkpoints produced before pixel observations remain loadable.
+            self.network = nn.Sequential(
+                nn.Linear(obs_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, action_dim),
+                nn.Tanh(),
+            )
+
+    def forward(self, observation: torch.Tensor) -> torch.Tensor:
+        if self.pixel_observation:
+            observation = self.encoder(observation)
+        return self.network(observation.float())
 
 
 class Critic(nn.Module):
-    def __init__(self, obs_dim: int = 1, action_dim: int = 1, hidden_dim: int = 128):
+    def __init__(
+        self,
+        obs_dim: int = 1,
+        action_dim: int = 1,
+        hidden_dim: int = 128,
+        observation_shape: Sequence[int] | None = None,
+    ) -> None:
         super().__init__()
+        self.observation_shape = (
+            tuple(int(value) for value in observation_shape)
+            if observation_shape is not None
+            else (obs_dim,)
+        )
+        self.pixel_observation = len(self.observation_shape) == 3
+        if self.pixel_observation:
+            self.encoder = PixelEncoder(self.observation_shape[0], hidden_dim)
+            critic_input_dim = hidden_dim + action_dim
+        else:
+            critic_input_dim = obs_dim + action_dim
         self.network = nn.Sequential(
-            nn.Linear(obs_dim + action_dim, hidden_dim),
+            nn.Linear(critic_input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -50,7 +114,9 @@ class Critic(nn.Module):
         )
 
     def forward(self, observation: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        return self.network(torch.cat((observation, action), dim=-1))
+        if self.pixel_observation:
+            observation = self.encoder(observation)
+        return self.network(torch.cat((observation.float(), action), dim=-1))
 
 
 @dataclass(slots=True)
@@ -72,15 +138,22 @@ class BanditTD3:
         obs_dim: int = 1,
         action_dim: int = 1,
         hidden_dim: int = 128,
+        observation_shape: Sequence[int] | None = None,
         actor_lr: float = 3e-4,
         critic_lr: float = 3e-4,
         policy_delay: int = 2,
         device: str | torch.device = "cpu",
     ) -> None:
         self.device = resolve_device(str(device))
-        self.actor = Actor(obs_dim, action_dim, hidden_dim).to(self.device)
-        self.critic1 = Critic(obs_dim, action_dim, hidden_dim).to(self.device)
-        self.critic2 = Critic(obs_dim, action_dim, hidden_dim).to(self.device)
+        self.actor = Actor(
+            obs_dim, action_dim, hidden_dim, observation_shape
+        ).to(self.device)
+        self.critic1 = Critic(
+            obs_dim, action_dim, hidden_dim, observation_shape
+        ).to(self.device)
+        self.critic2 = Critic(
+            obs_dim, action_dim, hidden_dim, observation_shape
+        ).to(self.device)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(
             list(self.critic1.parameters()) + list(self.critic2.parameters()),

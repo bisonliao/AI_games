@@ -7,7 +7,7 @@ from env.vector_env import final_info_at
 
 
 def test_same_step_vector_env_returns_reset_observation_and_final_info() -> None:
-    config = JumpEnvConfig()
+    config = JumpEnvConfig(observation_mode="vector")
     envs = make_async_vector_env(2, config, context="spawn")
     try:
         observations, _ = envs.reset(seed=900)
@@ -31,7 +31,8 @@ def test_same_step_vector_env_returns_reset_observation_and_final_info() -> None
 
 
 def test_vector_worker_seeds_are_distinct() -> None:
-    envs = make_async_vector_env(3, context="spawn")
+    config = JumpEnvConfig(observation_mode="vector")
+    envs = make_async_vector_env(3, config, context="spawn")
     try:
         observations, _ = envs.reset(seed=42)
         assert len(np.unique(observations[:, 0])) == 3

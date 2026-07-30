@@ -68,6 +68,11 @@ def env_config_from_metadata(metadata: dict[str, Any]) -> JumpEnvConfig:
     values = metadata.get("env_config", {})
     if not isinstance(values, dict):
         return JumpEnvConfig()
+    # Old checkpoints predate pixel observations and the nonlinear charge curve,
+    # so they imply vector mode and the original linear p=1 physics.
+    values = dict(values)
+    values.setdefault("observation_mode", "vector")
+    values.setdefault("charge_exponent", 1.0)
     allowed = {field.name for field in fields(JumpEnvConfig)}
     return JumpEnvConfig(
         **{key: value for key, value in values.items() if key in allowed}

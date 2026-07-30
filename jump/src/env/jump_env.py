@@ -15,6 +15,9 @@ from pybullet_utils.bullet_client import BulletClient
 class JumpEnvConfig:
     """Configuration for the one-action jump task, in SI units."""
 
+    observation_mode: str = "rgb"
+    observation_width: int = 64
+    observation_height: int = 64
     region_size: float = 6.0
     platform_size: float = 0.70
     platform_height: float = 0.25
@@ -25,6 +28,7 @@ class JumpEnvConfig:
     gravity: float = 9.81
     vertical_speed: float = 4.0
     charge_scale: float = 5.0
+    charge_exponent: float = 3.0
     max_hold_seconds: float = 1.0
     physics_hz: int = 240
     max_flight_seconds: float = 2.0
@@ -34,8 +38,23 @@ class JumpEnvConfig:
     rgb_height: int = 480
 
     def __post_init__(self) -> None:
+        if self.observation_mode not in {"rgb", "vector"}:
+            raise ValueError("observation_mode must be 'rgb' or 'vector'")
+        if self.observation_width < 16 or self.observation_height < 16:
+            raise ValueError("observation_width and observation_height must be >= 16")
         if self.region_size <= 0 or self.platform_size <= 0:
             raise ValueError("region_size and platform_size must be positive")
+        if (
+            self.gravity <= 0
+            or self.vertical_speed <= 0
+            or self.charge_scale <= 0
+            or self.charge_exponent <= 0
+            or self.max_hold_seconds <= 0
+        ):
+            raise ValueError(
+                "gravity, vertical_speed, charge_scale, charge_exponent and "
+                "max_hold_seconds must be positive"
+            )
         if not 0 < self.min_distance < self.max_distance:
             raise ValueError("Require 0 < min_distance < max_distance")
         if self.max_distance >= self.region_size * np.sqrt(2.0):
@@ -50,12 +69,50 @@ class JumpEnvConfig:
         """Ideal time for a ballistic return to the launch height."""
         return 2.0 * self.vertical_speed / self.gravity
 
+    @property
+    def maximum_jump_distance(self) -> float:
+        """Ideal distance at full charge under the equal-height assumption."""
+        maximum_horizontal_speed = self.charge_scale * self.max_hold_seconds
+        return maximum_horizontal_speed * self.flight_time
+
+    @property
+    def observation_shape(self) -> tuple[int, ...]:
+        if self.observation_mode == "rgb":
+            return (2, self.observation_height, self.observation_width)
+        return (1,)
+
+    @property
+    def observation_dtype(self) -> np.dtype[Any]:
+        return np.dtype(np.uint8 if self.observation_mode == "rgb" else np.float32)
+
     def oracle_action(self, distance: float) -> np.ndarray:
-        """Analytic action for equal-height platforms with no air drag."""
-        hold = distance / (self.charge_scale * self.flight_time)
-        hold = float(np.clip(hold, 0.0, self.max_hold_seconds))
+        """Analytic inverse of the power-law charge curve."""
+        # Ideal flight distance is
+        #   d(t) = d_max * (t / T) ** p,
+        # so the exact inverse is
+        #   t(d) = T * (d / d_max) ** (1 / p).
+        # Clipping also makes the oracle well-defined for diagnostic distances
+        # outside the configured reachable interval.
+        normalized_distance = float(
+            np.clip(distance / self.maximum_jump_distance, 0.0, 1.0)
+        )
+        normalized_hold = normalized_distance ** (1.0 / self.charge_exponent)
+        hold = self.max_hold_seconds * normalized_hold
         normalized = 2.0 * hold / self.max_hold_seconds - 1.0
         return np.asarray([normalized], dtype=np.float32)
+
+    def horizontal_speed_from_hold_time(self, hold_seconds: float) -> float:
+        """Map hold duration to release speed using the configured power law.
+
+        ``p=1`` reproduces the original linear rule. The default ``p=3`` keeps
+        the same full-charge speed while requiring increasingly precise timing
+        for long jumps.
+        """
+        normalized_hold = float(
+            np.clip(hold_seconds / self.max_hold_seconds, 0.0, 1.0)
+        )
+        maximum_horizontal_speed = self.charge_scale * self.max_hold_seconds
+        return maximum_horizontal_speed * normalized_hold**self.charge_exponent
 
     def action_from_hold_time(self, hold_seconds: float) -> np.ndarray:
         """Convert a real keyboard hold duration to a normalized action."""
@@ -88,11 +145,21 @@ class JumpEnv(gym.Env[np.ndarray, np.ndarray]):
             raise ValueError("playback_speed must be positive or None")
         self.playback_speed = playback_speed
 
-        self.observation_space = spaces.Box(
-            low=np.asarray([0.0], dtype=np.float32),
-            high=np.asarray([1.0], dtype=np.float32),
-            dtype=np.float32,
-        )
+        if self.config.observation_mode == "rgb":
+            # “rgb” 在本项目中表示平台语义像素观测，而不是相机的三通道颜色图：
+            # channel 0=A 平台，channel 1=B 平台，所有背景像素均为 0。
+            self.observation_space = spaces.Box(
+                low=0,
+                high=1,
+                shape=self.config.observation_shape,
+                dtype=np.uint8,
+            )
+        else:
+            self.observation_space = spaces.Box(
+                low=np.asarray([0.0], dtype=np.float32),
+                high=np.asarray([1.0], dtype=np.float32),
+                dtype=np.float32,
+            )
         self.action_space = spaces.Box(
             low=np.asarray([-1.0], dtype=np.float32),
             high=np.asarray([1.0], dtype=np.float32),
@@ -220,9 +287,62 @@ class JumpEnv(gym.Env[np.ndarray, np.ndarray]):
                 return a_xy, b_xy, distance
         raise RuntimeError("Could not sample a valid platform pair")
 
-    def _observation(self) -> np.ndarray:
+    def _vector_observation(self) -> np.ndarray:
         normalized = self._target_distance / self.config.max_distance
         return np.asarray([normalized], dtype=np.float32)
+
+    def _rgb_observation(self) -> np.ndarray:
+        """Rasterize A/B top faces into separate binary, channel-first masks."""
+        cfg = self.config
+        observation = np.zeros(cfg.observation_shape, dtype=np.uint8)
+        world_half = cfg.region_size / 2.0
+        platform_half = cfg.platform_size / 2.0
+
+        def draw_platform(channel: int, center: np.ndarray) -> None:
+            # x grows from left to right. Image row 0 represents +y so that the
+            # semantic image has the conventional top-down map orientation.
+            col_start = int(
+                np.floor(
+                    (center[0] - platform_half + world_half)
+                    / cfg.region_size
+                    * cfg.observation_width
+                )
+            )
+            col_stop = int(
+                np.ceil(
+                    (center[0] + platform_half + world_half)
+                    / cfg.region_size
+                    * cfg.observation_width
+                )
+            )
+            row_start = int(
+                np.floor(
+                    (world_half - (center[1] + platform_half))
+                    / cfg.region_size
+                    * cfg.observation_height
+                )
+            )
+            row_stop = int(
+                np.ceil(
+                    (world_half - (center[1] - platform_half))
+                    / cfg.region_size
+                    * cfg.observation_height
+                )
+            )
+            col_start = int(np.clip(col_start, 0, cfg.observation_width - 1))
+            col_stop = int(np.clip(col_stop, col_start + 1, cfg.observation_width))
+            row_start = int(np.clip(row_start, 0, cfg.observation_height - 1))
+            row_stop = int(np.clip(row_stop, row_start + 1, cfg.observation_height))
+            observation[channel, row_start:row_stop, col_start:col_stop] = 1
+
+        draw_platform(0, self._platform_a_xy)
+        draw_platform(1, self._platform_b_xy)
+        return observation
+
+    def _observation(self) -> np.ndarray:
+        if self.config.observation_mode == "rgb":
+            return self._rgb_observation()
+        return self._vector_observation()
 
     def _base_info(self) -> dict[str, Any]:
         return {
@@ -296,7 +416,10 @@ class JumpEnv(gym.Env[np.ndarray, np.ndarray]):
         hold_time = (scalar_action + 1.0) * 0.5 * cfg.max_hold_seconds
         direction = self._platform_b_xy - self._platform_a_xy
         direction /= np.linalg.norm(direction)
-        horizontal_speed = cfg.charge_scale * hold_time
+        # Release impulse follows the configured power law. With equal platform
+        # heights the flight time remains fixed, hence landing distance is
+        # d(t) = maximum_jump_distance * (t / max_hold_seconds) ** p.
+        horizontal_speed = cfg.horizontal_speed_from_hold_time(hold_time)
         self._p.resetBaseVelocity(
             self._player_id,
             linearVelocity=[

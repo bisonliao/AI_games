@@ -12,7 +12,8 @@ def test_gymnasium_contract_and_terminal_transition() -> None:
     try:
         check_env(env, skip_render_check=True)
         observation, info = env.reset(seed=7)
-        assert observation.shape == (1,)
+        assert observation.shape == (2, 64, 64)
+        assert observation.dtype == np.uint8
         action = env.config.oracle_action(info["target_distance"])
         _, reward, terminated, truncated, final_info = env.step(action)
         assert terminated and not truncated
@@ -42,6 +43,32 @@ def test_reset_seed_is_reproducible() -> None:
         )
         np.testing.assert_array_equal(
             first_info["platform_b_xy"], second_info["platform_b_xy"]
+        )
+    finally:
+        env.close()
+
+
+def test_rgb_observation_is_two_binary_platform_channels() -> None:
+    env = JumpEnv(JumpEnvConfig(observation_width=48, observation_height=32))
+    try:
+        observation, _ = env.reset(seed=9)
+        assert observation.shape == (2, 32, 48)
+        assert set(np.unique(observation)) <= {0, 1}
+        assert observation[0].sum() > 0
+        assert observation[1].sum() > 0
+        assert not np.any(observation[0] & observation[1])
+    finally:
+        env.close()
+
+
+def test_vector_observation_remains_available() -> None:
+    env = JumpEnv(JumpEnvConfig(observation_mode="vector"))
+    try:
+        observation, info = env.reset(seed=3)
+        assert observation.shape == (1,)
+        assert observation.dtype == np.float32
+        assert observation.item() == pytest.approx(
+            info["target_distance"] / env.config.max_distance
         )
     finally:
         env.close()
@@ -97,6 +124,34 @@ def test_hold_duration_maps_to_normalized_action() -> None:
     assert config.action_from_hold_time(0.5).item() == pytest.approx(0.0)
     assert config.action_from_hold_time(1.0).item() == pytest.approx(1.0)
     assert config.action_from_hold_time(5.0).item() == pytest.approx(1.0)
+
+
+def test_cubic_charge_curve_and_analytic_inverse() -> None:
+    config = JumpEnvConfig(max_hold_seconds=1.0, charge_exponent=3.0)
+    assert config.maximum_jump_distance == pytest.approx(
+        config.charge_scale * config.flight_time
+    )
+    assert config.horizontal_speed_from_hold_time(0.0) == pytest.approx(0.0)
+    assert config.horizontal_speed_from_hold_time(0.5) == pytest.approx(0.625)
+    assert config.horizontal_speed_from_hold_time(1.0) == pytest.approx(5.0)
+
+    for distance in (1.0, 2.0, 3.0, 4.0):
+        action = float(config.oracle_action(distance).item())
+        hold_time = (action + 1.0) * 0.5 * config.max_hold_seconds
+        ideal_distance = (
+            config.horizontal_speed_from_hold_time(hold_time)
+            * config.flight_time
+        )
+        assert ideal_distance == pytest.approx(distance, abs=1e-6)
+
+
+def test_linear_charge_curve_remains_available_for_old_checkpoints() -> None:
+    config = JumpEnvConfig(charge_exponent=1.0)
+    assert config.horizontal_speed_from_hold_time(0.5) == pytest.approx(2.5)
+    expected_hold = 2.0 / (config.charge_scale * config.flight_time)
+    action = float(config.oracle_action(2.0).item())
+    actual_hold = (action + 1.0) * 0.5 * config.max_hold_seconds
+    assert actual_hold == pytest.approx(expected_hold)
 
 
 def test_playback_speed_must_be_positive() -> None:

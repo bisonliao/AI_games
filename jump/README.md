@@ -1,8 +1,10 @@
 # PyBullet 跳一跳 + 单步 TD3
 
 这是一个类似微信“跳一跳”的最小强化学习工程。两个等高平台出现在固定区域内，
-agent 观察归一化平台距离并输出一个连续蓄力动作。一次 `env.step(action)` 会在
-PyBullet 内部完成整段抛物线飞行，因此每个回合恰好包含一个决策。
+agent 默认观察 `2×64×64` 的二值语义像素图并输出一个连续蓄力动作。通道 0 只标记
+A 平台，通道 1 只标记 B 平台，背景为 0；也可以通过命令行切换回归一化距离向量。
+一次 `env.step(action)` 会在 PyBullet 内部完成整段抛物线飞行，因此每个回合恰好包含
+一个决策。
 
 这个任务严格来说是 contextual bandit。默认算法是针对该结构简化的 TD3：critic
 直接拟合即时奖励，不进行下一状态 bootstrap，也不创建 target network。双 critic、
@@ -23,8 +25,8 @@ PyBullet 内部完成整段抛物线飞行，因此每个回合恰好包含一�
 | `src/env/gui_keys.py` | 统一不同 PyBullet 版本的空格、Escape 和退出按键兼容逻辑。 |
 | `src/env/play.py` | 打开 PyBullet GUI，将人工按住空格的真实时长转换为跳跃动作。 |
 | `src/env/__init__.py` | 导出环境配置、环境类和向量环境工厂。 |
-| `src/td3/agent.py` | 定义 actor、双 critic 以及不使用 bootstrap 的单步 TD3 更新逻辑。 |
-| `src/td3/replay.py` | 实现由 learner 独占的固定容量 NumPy replay buffer。 |
+| `src/td3/agent.py` | 定义 vector MLP、RGB CNN、双 critic 以及不使用 bootstrap 的单步 TD3。 |
+| `src/td3/replay.py` | 实现支持可变观测形状和 `uint8` 像素压缩的 learner replay buffer。 |
 | `src/td3/trainer.py` | 实现 CPU actor、多进程环境、队列通信、GPU/CPU learner、TensorBoard 和 checkpoint。 |
 | `src/td3/cli.py` | 提供环境检查、基准、训练和无 GUI checkpoint 评测命令。 |
 | `src/td3/eval.py` | 查找并加载 TD3 checkpoint，以可调速度在 GUI 中演示 agent。 |
@@ -80,12 +82,30 @@ buffer、优化器和指定设备。
 ```bash
 PYTHONPATH=src /home/bison/.conda/envs/mygames/bin/python -m td3.cli train \
   --device cuda --actors 2 --envs-per-actor 4 \
-  --transitions 100000 --run-name td3-main
+  --observation-mode rgb --run-name td3-rgb
 ```
 
+`rgb` 是默认模式，表示两通道二值语义图而不是普通三通道相机照片；可用
+`--observation-size 32` 或 `64` 调整正方形分辨率。切换回原结构化距离输入：
+
+```bash
+PYTHONPATH=src /home/bison/.conda/envs/mygames/bin/python -m td3.cli train \
+  --device cpu --observation-mode vector --run-name td3-vector
+```
+
+训练命令省略 `--transitions` 时，会按观测模式选择总 transition 预算：RGB 默认为
+500,000，vector 默认为 100,000。RGB 需要 CNN 从像素 mask 中学习平台几何关系，通常
+比直接输入距离向量更难，因此使用更长的默认训练预算；显式传入 `--transitions N`
+会覆盖该默认值。
+
+像素 replay 使用 `uint8` 且不重复存储 terminal next image。CLI 默认容量在 RGB 模式为
+50,000、vector 模式为 200,000；可用 `--replay-capacity` 显式覆盖。
+
 每次训练会建立独立目录，例如
-`runs/20260730-081530-pid12345-td3-main/`。目录名包含本地年月日时分秒和进程
-PID；即使同一秒并行启动多个训练也不会冲突。checkpoint 默认保存在该目录中。
+`runs/20260730-081530-pid12345-rgb-steps500000-td3-rgb/` 或
+`runs/20260730-081531-pid12346-vec-steps100000-td3-vector/`。目录名包含本地
+年月日时分秒、进程 PID、观测模式缩写（`rgb`/`vec`）和实际目标步数；即使同一秒
+并行启动多个训练也不会冲突。checkpoint 默认保存在该目录中。
 
 启动 TensorBoard：
 
@@ -115,7 +135,7 @@ PYTHONPATH=src /home/bison/.conda/envs/mygames/bin/python -m td3.cli train \
 
 ```bash
 PYTHONPATH=src /home/bison/.conda/envs/mygames/bin/python -m td3.cli evaluate \
-  runs/20260730-081530-pid12345-td3-main/checkpoint.pt --episodes 1000
+  runs/20260730-081530-pid12345-rgb-steps500000-td3-rgb/checkpoint.pt --episodes 1000
 ```
 
 ## GUI 人工操作
@@ -136,7 +156,7 @@ PYTHONPATH=src /home/bison/.conda/envs/mygames/bin/python -m env.play \
 
 ```bash
 PYTHONPATH=src /home/bison/.conda/envs/mygames/bin/python -m td3.eval \
-  runs/20260730-081530-pid12345-td3-main/checkpoint.pt \
+  runs/20260730-081530-pid12345-rgb-steps500000-td3-rgb/checkpoint.pt \
   --device cpu --speed 0.5 --episodes 20
 ```
 
@@ -153,9 +173,19 @@ PYTHONPATH=src /home/bison/.conda/envs/mygames/bin/python -m td3.eval \
 
 ## 环境语义
 
-- observation：`Box(0, 1, (1,))`，即目标距离除以最大采样距离。
+- 默认 RGB observation：`Box(0, 1, (2, H, W), uint8)`；通道 0 为 A 平台 mask，
+  通道 1 为 B 平台 mask，背景及其他物体均为 0。
+- vector observation：`Box(0, 1, (1,), float32)`，即目标距离除以最大采样距离。
+- `--observation-mode {rgb,vector}` 控制观测类型，默认 `rgb`；
+  `--observation-size` 控制 RGB 语义图边长。
 - action：`Box(-1, 1, (1,))`，线性映射为 0–1 秒蓄力。
-- `v_xy = charge_scale * hold_time`，竖直初速度固定，方向自动指向 B。
+- 默认使用三次幂蓄力曲线（`charge_exponent=3`）。令
+  `x = hold_time / max_hold_seconds`，则释放水平速度为
+  `v_xy = charge_scale * max_hold_seconds * x³`；竖直初速度固定，方向自动指向 B。
+- 等高平台的理想落点距离为
+  `distance = maximum_jump_distance * x³`，解析 oracle 使用其立方根反函数。完整曲线见
+  [`docs/charge_distance_curves.svg`](docs/charge_distance_curves.svg)。设置
+  `charge_exponent=1` 可以恢复旧版线性环境。
 - 默认 reward 是中心落点误差的稠密项加成功奖励；`info["is_success"]` 是独立二值指标。
 - 正常成功和失败均为 `terminated=True`；只有内部安全超时为 `truncated=True`。
 - 向量环境使用 `SAME_STEP` autoreset。返回 observation 已属于下一回合，终止回合

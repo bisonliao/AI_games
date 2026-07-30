@@ -5,9 +5,12 @@ from pathlib import Path
 
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
+from env import JumpEnv
+from td3.agent import BanditTD3
 from td3.trainer import (
     TrainConfig,
     _create_run_directory,
+    _training_run_name,
     train_distributed,
 )
 
@@ -19,6 +22,11 @@ def test_timestamped_run_directories_do_not_collide(tmp_path) -> None:
     assert re.fullmatch(pattern, first.name)
     assert re.fullmatch(pattern, second.name)
     assert first != second
+
+
+def test_training_run_name_includes_observation_mode_and_budget() -> None:
+    assert _training_run_name("rgb", 500_000, "main") == "rgb-steps500000-main"
+    assert _training_run_name("vector", 100_000, "main") == "vec-steps100000-main"
 
 
 def test_actor_learner_cpu_smoke(tmp_path) -> None:
@@ -45,8 +53,16 @@ def test_actor_learner_cpu_smoke(tmp_path) -> None:
     assert result.transitions >= 256
     assert result.updates > 0
     assert checkpoint.exists()
+    agent, metadata = BanditTD3.from_checkpoint(checkpoint, device="cpu")
+    assert metadata["env_config"]["observation_mode"] == "rgb"
+    env = JumpEnv()
+    try:
+        observation, _ = env.reset(seed=1)
+        assert agent.act(observation[None, :]).shape == (1, 1)
+    finally:
+        env.close()
     run_dir = Path(result.run_dir)
-    assert re.fullmatch(r"\d{8}-\d{6}-pid\d+-smoke", run_dir.name)
+    assert re.fullmatch(r"\d{8}-\d{6}-pid\d+-rgb-steps256-smoke", run_dir.name)
     event_files = list(run_dir.glob("events.out.tfevents.*"))
     assert event_files
 
@@ -55,6 +71,7 @@ def test_actor_learner_cpu_smoke(tmp_path) -> None:
     scalar_tags = set(accumulator.Tags()["scalars"])
     assert {
         "rollout/success_rate",
+        "train/target_transitions",
         "evaluation/final_success_rate",
         "queue/transition_size",
         "queue/actor_blocked_seconds_total",

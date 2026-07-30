@@ -29,6 +29,34 @@ def test_replay_wraps_and_samples() -> None:
     assert sample["actions"].dtype == np.float32
 
 
+def test_pixel_replay_stays_uint8_and_pixel_agent_updates() -> None:
+    rng = np.random.default_rng(8)
+    observations = rng.integers(0, 2, size=(8, 2, 32, 32), dtype=np.uint8)
+    batch = {
+        "observations": observations,
+        "actions": rng.uniform(-1, 1, size=(8, 1)).astype(np.float32),
+        "rewards": rng.normal(size=8).astype(np.float32),
+        "next_observations": observations.copy(),
+        "terminated": np.ones(8, dtype=np.bool_),
+        "truncated": np.zeros(8, dtype=np.bool_),
+    }
+    replay = ReplayBuffer(
+        capacity=16,
+        observation_shape=(2, 32, 32),
+        observation_dtype=np.uint8,
+        seed=0,
+    )
+    replay.add_batch(batch)
+    sample = replay.sample(4)
+    assert sample["observations"].dtype == np.uint8
+    assert replay.allocated_bytes < 16 * 2 * 32 * 32 + 1_000
+
+    agent = BanditTD3(hidden_dim=32, observation_shape=(2, 32, 32))
+    update = agent.update(sample)
+    assert np.isfinite(update.critic_loss)
+    assert agent.act(observations[:2]).shape == (2, 1)
+
+
 def test_critic_target_does_not_depend_on_next_observation() -> None:
     torch.manual_seed(5)
     first = BanditTD3(hidden_dim=32)

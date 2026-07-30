@@ -36,14 +36,16 @@ def benchmark_vector_env(
     envs = make_async_vector_env(num_envs, cfg, context="spawn")
     completed = 0
     try:
-        observations, _ = envs.reset(seed=seed)
+        observations, reset_info = envs.reset(seed=seed)
         started = perf_counter()
         while completed < transitions:
-            distances = observations[:, 0] * cfg.max_distance
+            # Oracle needs the hidden numeric distance. In RGB mode the image
+            # intentionally contains only A/B masks, so use vector reset info.
+            distances = np.asarray(reset_info["target_distance"], dtype=np.float32)
             actions = np.stack(
                 [cfg.oracle_action(float(distance)) for distance in distances]
             )
-            observations, _, _, _, _ = envs.step(actions)
+            observations, _, _, _, reset_info = envs.step(actions)
             completed += num_envs
         elapsed = perf_counter() - started
     finally:
