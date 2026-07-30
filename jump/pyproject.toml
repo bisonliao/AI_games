@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jump-rl"
+version = "0.1.0"
+description = "A PyBullet Jump-and-Jump contextual-bandit environment and distributed TD3 trainer"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "gymnasium>=1.1",
+    "numpy>=2.0",
+    "pybullet>=3.2",
+    "tensorboard>=2.15",
+    "torch>=2.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+td3-cli = "td3.cli:main"
+jump-play = "env.play:main"
+td3-eval-gui = "td3.eval:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

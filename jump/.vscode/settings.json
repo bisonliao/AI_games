@@ -1,0 +1,5 @@
+{
+  "python.defaultInterpreterPath": "/home/bison/.conda/envs/mygames/bin/python",
+  "python.terminal.activateEnvironment": true
+
+}
