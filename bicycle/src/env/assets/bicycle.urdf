@@ -1,0 +1,66 @@
+<?xml version="1.0"?>
+<robot name="reaction_wheel_bicycle">
+  <material name="frame_orange"><color rgba="0.95 0.35 0.05 1"/></material>
+  <material name="wheel_dark"><color rgba="0.05 0.05 0.05 1"/></material>
+  <material name="flywheel_blue"><color rgba="0.1 0.35 0.9 1"/></material>
+
+  <link name="frame">
+    <inertial>
+      <origin xyz="0 0 0"/>
+      <mass value="12.0"/>
+      <inertia ixx="1.2" ixy="0" ixz="0" iyy="1.4" iyz="0" izz="0.4"/>
+    </inertial>
+    <visual><origin xyz="0 0 -0.08"/><geometry><box size="1.0 0.08 0.08"/></geometry><material name="frame_orange"/></visual>
+    <collision><origin xyz="0 0 -0.08"/><geometry><box size="1.0 0.08 0.08"/></geometry></collision>
+    <visual><origin xyz="0 0 0.22"/><geometry><box size="0.12 0.08 0.60"/></geometry><material name="frame_orange"/></visual>
+    <collision><origin xyz="0 0 0.22"/><geometry><box size="0.12 0.08 0.60"/></geometry></collision>
+  </link>
+
+  <link name="rear_wheel">
+    <inertial><mass value="1.0"/><inertia ixx="0.055" ixy="0" ixz="0" iyy="0.11" iyz="0" izz="0.055"/></inertial>
+    <visual><origin rpy="1.5707963 0 0"/><geometry><cylinder radius="0.33" length="0.04"/></geometry><material name="wheel_dark"/></visual>
+    <collision><origin rpy="1.5707963 0 0"/><geometry><cylinder radius="0.33" length="0.04"/></geometry></collision>
+  </link>
+  <joint name="rear_wheel_joint" type="continuous">
+    <parent link="frame"/><child link="rear_wheel"/>
+    <origin xyz="-0.55 0 -0.42"/><axis xyz="0 1 0"/>
+    <limit effort="80" velocity="50"/><dynamics damping="0" friction="0"/>
+  </joint>
+
+  <link name="fork">
+    <inertial><origin xyz="0 0 -0.25"/><mass value="0.5"/><inertia ixx="0.03" ixy="0" ixz="0" iyy="0.03" iyz="0" izz="0.01"/></inertial>
+    <visual><origin xyz="0 0 -0.27"/><geometry><box size="0.05 0.12 0.58"/></geometry><material name="frame_orange"/></visual>
+    <collision><origin xyz="0 0 -0.27"/><geometry><box size="0.05 0.12 0.58"/></geometry></collision>
+  </link>
+  <joint name="steering_joint" type="revolute">
+    <parent link="frame"/><child link="fork"/>
+    <origin xyz="0.55 0 0.15"/><axis xyz="0 0 1"/>
+    <limit lower="-0.6" upper="0.6" effort="80" velocity="5"/>
+  </joint>
+
+  <link name="front_wheel">
+    <inertial><mass value="1.0"/><inertia ixx="0.055" ixy="0" ixz="0" iyy="0.11" iyz="0" izz="0.055"/></inertial>
+    <visual><origin rpy="1.5707963 0 0"/><geometry><cylinder radius="0.33" length="0.04"/></geometry><material name="wheel_dark"/></visual>
+    <collision><origin rpy="1.5707963 0 0"/><geometry><cylinder radius="0.33" length="0.04"/></geometry></collision>
+  </link>
+  <joint name="front_wheel_joint" type="continuous">
+    <parent link="fork"/><child link="front_wheel"/>
+    <origin xyz="0 0 -0.57"/><axis xyz="0 1 0"/>
+    <limit effort="10" velocity="50"/><dynamics damping="0" friction="0"/>
+  </joint>
+
+  <link name="reaction_wheel">
+    <inertial>
+      <mass value="4.0"/>
+      <inertia ixx="0.080" ixy="0" ixz="0" iyy="0.0402" iyz="0" izz="0.0402"/>
+    </inertial>
+    <visual><origin rpy="0 1.5707963 0"/><geometry><cylinder radius="0.20" length="0.04"/></geometry><material name="flywheel_blue"/></visual>
+    <collision><origin rpy="0 1.5707963 0"/><geometry><cylinder radius="0.20" length="0.04"/></geometry></collision>
+  </link>
+  <joint name="reaction_wheel_joint" type="continuous">
+    <parent link="frame"/><child link="reaction_wheel"/>
+    <origin xyz="0 0 0.12"/><axis xyz="1 0 0"/>
+    <limit effort="15" velocity="120"/><dynamics damping="0" friction="0"/>
+  </joint>
+</robot>
+

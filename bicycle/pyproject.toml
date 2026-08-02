@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bicycle-rl"
+version = "0.1.0"
+description = "PyBullet bicycle balancing with distributed DQN"
+requires-python = ">=3.11"
+dependencies = [
+  "gymnasium>=1.0",
+  "numpy>=1.24",
+  "pybullet>=3.2.7",
+  "torch>=2.0",
+  "tensorboard>=2.14",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+# TensorBoard 2.21 performs a blocking localhost port probe without a timeout.
+# This compatible shim keeps the standard command name and adds a deadline.
+tensorboard = "dqn.tensorboard:main"
+bicycle-tensorboard = "dqn.tensorboard:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+env = ["assets/*.urdf"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
