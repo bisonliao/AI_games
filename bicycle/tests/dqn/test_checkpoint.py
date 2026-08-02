@@ -1,3 +1,5 @@
+"""Checkpoint round-trip tests for learner, RNG metadata, and replay."""
+
 from pathlib import Path
 
 import numpy as np
@@ -36,13 +38,16 @@ def test_full_checkpoint_roundtrip(tmp_path: Path):
     rng = np.random.default_rng(9)
     learner.update(replay, rng)
     path = tmp_path / "checkpoint.pt"
-    save_checkpoint(path, learner, config, 123, rng, replay, best_success_rate=0.75)
+    save_checkpoint(
+        path, learner, config, 123, rng, replay, best_success_rate=0.75, env_id=2
+    )
 
     restored_learner = DQNLearner(config, torch.device("cpu"))
     restored_replay = ReplayBuffer(32, (5,))
     state = load_checkpoint(path, restored_learner, restored_replay)
     assert state["env_steps"] == 123
     assert state["best_success_rate"] == 0.75
+    assert state["env_id"] == 2
     assert len(restored_replay) == len(replay)
     for expected, actual in zip(
         learner.online.parameters(), restored_learner.online.parameters(), strict=True

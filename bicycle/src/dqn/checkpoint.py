@@ -23,6 +23,7 @@ def save_checkpoint(
     rng: np.random.Generator,
     replay: ReplayBuffer | None = None,
     best_success_rate: float = 0.0,
+    env_id: int = 1,
 ) -> None:
     """Atomically save learner state and optionally the potentially large replay."""
     destination = Path(path)
@@ -35,6 +36,7 @@ def save_checkpoint(
         "numpy_rng_state": rng.bit_generator.state,
         "torch_rng_state": torch.get_rng_state(),
         "best_success_rate": float(best_success_rate),
+        "env_id": int(env_id),
     }
     if torch.cuda.is_available():
         state["cuda_rng_states"] = torch.cuda.get_rng_state_all()

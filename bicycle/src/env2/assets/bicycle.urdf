@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<!-- Minimal bicycle with steerable front fork and no reaction wheel. -->
+<robot name="steering_balance_bicycle">
+  <material name="frame_green"><color rgba="0.10 0.65 0.25 1"/></material>
+  <material name="wheel_dark"><color rgba="0.05 0.05 0.05 1"/></material>
+
+  <link name="frame">
+    <inertial>
+      <origin xyz="0 0 0"/>
+      <mass value="16.0"/>
+      <inertia ixx="1.28" ixy="0" ixz="0" iyy="1.45" iyz="0" izz="0.42"/>
+    </inertial>
+    <visual><origin xyz="0 0 -0.08"/><geometry><box size="1.0 0.08 0.08"/></geometry><material name="frame_green"/></visual>
+    <collision><origin xyz="0 0 -0.08"/><geometry><box size="1.0 0.08 0.08"/></geometry></collision>
+    <visual><origin xyz="0 0 0.22"/><geometry><box size="0.12 0.08 0.60"/></geometry><material name="frame_green"/></visual>
+    <collision><origin xyz="0 0 0.22"/><geometry><box size="0.12 0.08 0.60"/></geometry></collision>
+  </link>
+
+  <link name="rear_wheel">
+    <inertial><mass value="1.0"/><inertia ixx="0.055" ixy="0" ixz="0" iyy="0.11" iyz="0" izz="0.055"/></inertial>
+    <visual><origin rpy="1.5707963 0 0"/><geometry><cylinder radius="0.33" length="0.04"/></geometry><material name="wheel_dark"/></visual>
+    <collision><origin rpy="1.5707963 0 0"/><geometry><cylinder radius="0.33" length="0.04"/></geometry></collision>
+  </link>
+  <joint name="rear_wheel_joint" type="continuous">
+    <parent link="frame"/><child link="rear_wheel"/>
+    <origin xyz="-0.55 0 -0.42"/><axis xyz="0 1 0"/>
+    <limit effort="80" velocity="50"/><dynamics damping="0" friction="0"/>
+  </joint>
+
+  <link name="fork">
+    <inertial><origin xyz="0 0 -0.25"/><mass value="0.5"/><inertia ixx="0.03" ixy="0" ixz="0" iyy="0.03" iyz="0" izz="0.01"/></inertial>
+    <visual><origin xyz="0 0 -0.27"/><geometry><box size="0.05 0.12 0.58"/></geometry><material name="frame_green"/></visual>
+    <collision><origin xyz="0 0 -0.27"/><geometry><box size="0.05 0.12 0.58"/></geometry></collision>
+  </link>
+  <joint name="steering_joint" type="revolute">
+    <parent link="frame"/><child link="fork"/>
+    <origin xyz="0.55 0 0.15"/><axis xyz="0 0 1"/>
+    <limit lower="-0.6" upper="0.6" effort="80" velocity="5"/>
+  </joint>
+
+  <link name="front_wheel">
+    <inertial><mass value="1.0"/><inertia ixx="0.055" ixy="0" ixz="0" iyy="0.11" iyz="0" izz="0.055"/></inertial>
+    <visual><origin rpy="1.5707963 0 0"/><geometry><cylinder radius="0.33" length="0.04"/></geometry><material name="wheel_dark"/></visual>
+    <collision><origin rpy="1.5707963 0 0"/><geometry><cylinder radius="0.33" length="0.04"/></geometry></collision>
+  </link>
+  <joint name="front_wheel_joint" type="continuous">
+    <parent link="fork"/><child link="front_wheel"/>
+    <origin xyz="0 0 -0.57"/><axis xyz="0 1 0"/>
+    <limit effort="10" velocity="50"/><dynamics damping="0" friction="0"/>
+  </joint>
+</robot>

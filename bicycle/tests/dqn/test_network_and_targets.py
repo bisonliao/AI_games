@@ -1,3 +1,5 @@
+"""Dueling aggregation and Double-DQN target-selection unit tests."""
+
 import torch
 from torch import nn
 
@@ -35,4 +37,3 @@ def test_double_dqn_selects_online_action_and_evaluates_with_target():
         discounts=torch.tensor([0.5, 0.0]),
     )
     torch.testing.assert_close(result, torch.tensor([3.5, 2.0]))
-

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 import os
 import queue
 import time
@@ -13,9 +14,8 @@ from gymnasium.vector import AsyncVectorEnv, AutoresetMode
 import numpy as np
 import torch
 
-from env import ENV_ID  # Registers the environment in every spawned process.
-
 from .config import DQNConfig
+from .environments import make_registered_environment
 from .network import DuelingQNetwork, load_numpy_state_dict
 from .nstep import NStepAccumulator, NStepTransition, StepTransition
 
@@ -64,6 +64,7 @@ def actor_process(
     metric_queue: Any,
     weight_queue: Any,
     stop_event: Any,
+    env_id: int = 1,
 ) -> None:
     """Collect n-step experience from one actor's vector of environments.
 
@@ -93,7 +94,9 @@ def actor_process(
     version, state = weight_queue.get()
     load_numpy_state_dict(network, state)
     network.eval()
-    env_fns = [make_registered_env for _ in range(env_count)]
+    # functools.partial is pickle-friendly under the spawn start method, unlike
+    # an inline closure, and carries the selected task into every vector worker.
+    env_fns = [partial(make_registered_env, env_id) for _ in range(env_count)]
     vector_env = AsyncVectorEnv(
         env_fns,
         context="spawn",
@@ -154,7 +157,7 @@ def actor_process(
                     peak_winds[env_index], abs(float(info.get("wind_peak_force_n", 0.0)))
                 )
                 saturation_steps[env_index] += int(
-                    bool(info.get("reaction_wheel_saturated", False))
+                    bool(info.get("control_saturated", False))
                 )
                 speed_error_sums[env_index] += abs(
                     float(info.get("forward_speed_mps", 0.0)) - 2.0
@@ -221,9 +224,9 @@ def actor_process(
         vector_env.close(terminate=True)
 
 
-def make_registered_env() -> gym.Env:
+def make_registered_env(env_id: int = 1) -> gym.Env:
     """Pickle-friendly factory used by spawned AsyncVectorEnv workers."""
-    return gym.make(ENV_ID)
+    return make_registered_environment(env_id)
 
 
 def _epsilon_greedy(

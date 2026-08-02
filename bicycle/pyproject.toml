@@ -33,6 +33,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 env = ["assets/*.urdf"]
+env2 = ["assets/*.urdf"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

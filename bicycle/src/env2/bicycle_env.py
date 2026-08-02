@@ -1,4 +1,4 @@
-"""PyBullet/Gymnasium bicycle task with reaction-wheel balance and gusts."""
+"""PyBullet/Gymnasium bicycle task balanced only through front steering."""
 
 from __future__ import annotations
 
@@ -11,34 +11,38 @@ from gymnasium import spaces
 import numpy as np
 import pybullet as p
 
-from .config import BicycleEnvConfig
-from .wind import SmoothGustGenerator, WindState
+from env.wind import SmoothGustGenerator, WindState
+
+from .config import BicycleSteeringEnvConfig
 
 
-class BicycleBalanceEnv(gym.Env[np.ndarray, int]):
-    """Balance a driven bicycle for 60 m using three reaction-wheel torques.
+class BicycleSteeringEnv(gym.Env[np.ndarray, int]):
+    """Balance an automatically driven bicycle by steering its front wheel.
 
-    The simulation runs at 240 Hz while the agent acts at 20 Hz. Observations
-    contain roll sin/cos, local roll rate, reaction-wheel speed, and forward
-    speed. All physics clients are instance-local, so separate processes can run
-    environments safely in headless DIRECT mode.
+    Actions are ``0`` (do not turn), ``1`` (turn left), and ``2`` (turn right).
+    Left/right actions request a bounded steering velocity; action 0 brakes that
+    velocity and holds the current handlebar angle. The task deliberately does
+    not constrain heading or lateral drift: reaching a 40 m radius around the
+    starting point or remaining upright for 30 seconds is success.
     """
+
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 20}
 
     def __init__(
         self,
-        config: BicycleEnvConfig | None = None,
+        config: BicycleSteeringEnvConfig | None = None,
         render_mode: str | None = None,
     ) -> None:
         super().__init__()
         if render_mode not in (None, "human", "rgb_array"):
             raise ValueError(f"unsupported render_mode: {render_mode}")
-        self.config = config or BicycleEnvConfig()
+        self.config = config or BicycleSteeringEnvConfig()
         self.render_mode = render_mode
         self.action_space = spaces.Discrete(3)
+        # Keep the DQN interface equal to env1. Steering angle replaces the
+        # reaction-wheel speed in the fourth component.
         self.observation_space = spaces.Box(-1.0, 1.0, shape=(5,), dtype=np.float32)
-        mode = p.GUI if render_mode == "human" else p.DIRECT
-        self._client = p.connect(mode)
+        self._client = p.connect(p.GUI if render_mode == "human" else p.DIRECT)
         if self._client < 0:
             raise RuntimeError("failed to connect to PyBullet")
         self._bike_id = -1
@@ -47,12 +51,12 @@ class BicycleBalanceEnv(gym.Env[np.ndarray, int]):
         self._wheel_links: set[int] = set()
         self._elapsed_substeps = 0
         self._episode_steps = 0
-        self._start_x = 0.0
+        self._start_xy = np.zeros(2, dtype=np.float64)
         self._max_progress_m = 0.0
         self._wind = SmoothGustGenerator(self.config.wind)
         self._wind_state = WindState()
-        self._last_action = 1
-        self._reaction_saturated = False
+        self._last_action = 0
+        self._steering_saturated = False
         self._closed = False
 
     def reset(
@@ -61,7 +65,7 @@ class BicycleBalanceEnv(gym.Env[np.ndarray, int]):
         seed: int | None = None,
         options: dict[str, Any] | None = None,
     ) -> tuple[np.ndarray, dict[str, Any]]:
-        """Rebuild deterministic physics and sample seeded initial disturbances."""
+        """Rebuild deterministic physics and sample seeded disturbances."""
         super().reset(seed=seed)
         options = options or {}
         p.resetSimulation(physicsClientId=self._client)
@@ -79,7 +83,6 @@ class BicycleBalanceEnv(gym.Env[np.ndarray, int]):
             baseCollisionShapeIndex=plane_shape,
             physicsClientId=self._client,
         )
-
         roll = float(
             options.get(
                 "initial_roll_rad",
@@ -97,9 +100,8 @@ class BicycleBalanceEnv(gym.Env[np.ndarray, int]):
                 ),
             )
         )
-        urdf_path = files("env").joinpath("assets/bicycle.urdf")
         self._bike_id = p.loadURDF(
-            str(urdf_path),
+            str(files("env2").joinpath("assets/bicycle.urdf")),
             basePosition=(0.0, 0.0, 0.77),
             baseOrientation=p.getQuaternionFromEuler((roll, 0.0, 0.0)),
             flags=p.URDF_USE_INERTIA_FROM_FILE,
@@ -115,26 +117,26 @@ class BicycleBalanceEnv(gym.Env[np.ndarray, int]):
         self._configure_dynamics()
         self._elapsed_substeps = 0
         self._episode_steps = 0
-        self._start_x = p.getBasePositionAndOrientation(
+        position = p.getBasePositionAndOrientation(
             self._bike_id, physicsClientId=self._client
-        )[0][0]
+        )[0]
+        self._start_xy = np.asarray(position[:2], dtype=np.float64)
         self._max_progress_m = 0.0
         self._wind_state = self._wind.reset(self.np_random)
-        self._last_action = 1
-        self._reaction_saturated = False
+        self._last_action = 0
+        self._steering_saturated = False
         self._apply_motors(0.0)
-        observation = self._observation()
-        return observation, self._info("running", False)
+        return self._observation(), self._info("running", False)
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
-        """Apply one discrete torque for 12 physics substeps and score progress."""
+        """Apply one steering command for 12 physics steps and score radius."""
         if not self.action_space.contains(action):
             raise ValueError(f"invalid action: {action}")
         self._last_action = int(action)
-        requested_torque = (int(action) - 1) * self.config.reaction_torque_nm
+        # Positive yaw turns the bicycle's +X heading toward +Y (left).
+        requested_velocity = {0: 0.0, 1: 1.2, 2: -1.2}[int(action)]
         for _ in range(self.config.substeps):
-            torque = self._limited_reaction_torque(requested_torque)
-            self._apply_motors(torque)
+            self._apply_motors(self._limited_steering_velocity(requested_velocity))
             time_s = self._elapsed_substeps / self.config.physics_hz
             self._wind_state = self._wind.value(time_s)
             self._apply_wind(self._wind_state.force_y_n)
@@ -142,33 +144,36 @@ class BicycleBalanceEnv(gym.Env[np.ndarray, int]):
             self._elapsed_substeps += 1
 
         self._episode_steps += 1
-        observation = self._observation()
-        position, _ = p.getBasePositionAndOrientation(
+        position = p.getBasePositionAndOrientation(
             self._bike_id, physicsClientId=self._client
-        )
-        progress = max(0.0, float(position[0] - self._start_x))
+        )[0]
+        progress = float(np.linalg.norm(np.asarray(position[:2]) - self._start_xy))
         capped_progress = min(progress, self.config.goal_distance_m)
         progress_delta = max(0.0, capped_progress - self._max_progress_m)
         self._max_progress_m = max(self._max_progress_m, capped_progress)
         reward = progress_delta * self.config.progress_reward_per_m
 
         fell = self._has_fallen()
-        success = progress >= self.config.goal_distance_m and not fell
+        reached_distance = progress >= self.config.goal_distance_m
+        survived_time_limit = self._episode_steps >= self.config.max_episode_steps
+        # The horizon is a positive task objective in env2, not a Gymnasium
+        # truncation. A fall detected on the final step still takes precedence.
+        success = not fell and (reached_distance or survived_time_limit)
         terminated = fell or success
-        truncated = not terminated and self._episode_steps >= self.config.max_episode_steps
+        truncated = False
         outcome = "running"
+        success_reason = ""
         if success:
             reward += self.config.success_reward
             outcome = "success"
+            success_reason = "distance" if reached_distance else "survival"
         elif fell:
             reward += self.config.fall_penalty
             outcome = "fall"
-        elif truncated:
-            outcome = "timeout"
-        info = self._info(outcome, success)
+        info = self._info(outcome, success, success_reason)
         if self.render_mode == "human":
             self.render()
-        return observation, float(reward), terminated, truncated, info
+        return self._observation(), float(reward), terminated, truncated, info
 
     def render(self) -> np.ndarray | None:
         """Follow the bicycle in GUI mode or return a TinyRenderer RGB frame."""
@@ -216,16 +221,12 @@ class BicycleBalanceEnv(gym.Env[np.ndarray, int]):
         self._closed = True
 
     def _index_joints(self) -> None:
+        """Resolve URDF joint names once and identify legal ground contacts."""
         self._joints.clear()
         for index in range(p.getNumJoints(self._bike_id, physicsClientId=self._client)):
             info = p.getJointInfo(self._bike_id, index, physicsClientId=self._client)
             self._joints[info[1].decode("utf-8")] = index
-        required = {
-            "rear_wheel_joint",
-            "steering_joint",
-            "front_wheel_joint",
-            "reaction_wheel_joint",
-        }
+        required = {"rear_wheel_joint", "steering_joint", "front_wheel_joint"}
         if missing := required.difference(self._joints):
             raise RuntimeError(f"bicycle URDF is missing joints: {sorted(missing)}")
         self._wheel_links = {
@@ -234,6 +235,7 @@ class BicycleBalanceEnv(gym.Env[np.ndarray, int]):
         }
 
     def _configure_dynamics(self) -> None:
+        """Disable default motors and configure wheel/ground friction."""
         for joint in self._joints.values():
             p.setJointMotorControl2(
                 self._bike_id,
@@ -260,7 +262,8 @@ class BicycleBalanceEnv(gym.Env[np.ndarray, int]):
             physicsClientId=self._client,
         )
 
-    def _apply_motors(self, reaction_torque: float) -> None:
+    def _apply_motors(self, steering_velocity: float) -> None:
+        """Maintain forward speed and apply the current steering command."""
         p.setJointMotorControl2(
             self._bike_id,
             self._joints["rear_wheel_joint"],
@@ -279,32 +282,30 @@ class BicycleBalanceEnv(gym.Env[np.ndarray, int]):
         p.setJointMotorControl2(
             self._bike_id,
             self._joints["steering_joint"],
-            p.POSITION_CONTROL,
-            targetPosition=0.0,
+            p.VELOCITY_CONTROL,
+            targetVelocity=steering_velocity,
             force=self.config.steering_force_nm,
             physicsClientId=self._client,
         )
-        p.setJointMotorControl2(
-            self._bike_id,
-            self._joints["reaction_wheel_joint"],
-            p.TORQUE_CONTROL,
-            force=reaction_torque,
-            physicsClientId=self._client,
-        )
 
-    def _limited_reaction_torque(self, requested: float) -> float:
-        speed = p.getJointState(
-            self._bike_id,
-            self._joints["reaction_wheel_joint"],
-            physicsClientId=self._client,
-        )[1]
-        further_into_saturation = (speed >= self.config.reaction_max_speed_rad_s and requested > 0) or (
-            speed <= -self.config.reaction_max_speed_rad_s and requested < 0
+    def _limited_steering_velocity(self, requested: float) -> float:
+        """Enforce the task's tighter software steering-angle limit."""
+        angle = float(
+            p.getJointState(
+                self._bike_id,
+                self._joints["steering_joint"],
+                physicsClientId=self._client,
+            )[0]
         )
-        self._reaction_saturated = abs(speed) >= self.config.reaction_max_speed_rad_s
-        return 0.0 if further_into_saturation else requested
+        further_left = angle >= self.config.steering_max_angle_rad and requested > 0
+        further_right = angle <= -self.config.steering_max_angle_rad and requested < 0
+        self._steering_saturated = (
+            abs(angle) >= self.config.steering_max_angle_rad - 1e-3
+        )
+        return 0.0 if further_left or further_right else requested
 
     def _apply_wind(self, force_y_n: float) -> None:
+        """Apply global cross-wind above the center of mass to create roll."""
         if force_y_n == 0.0:
             return
         position, orientation = p.getBasePositionAndOrientation(
@@ -327,6 +328,7 @@ class BicycleBalanceEnv(gym.Env[np.ndarray, int]):
         )
 
     def _observation(self) -> np.ndarray:
+        """Return normalized roll, roll rate, steering angle, and speed."""
         _, orientation = p.getBasePositionAndOrientation(
             self._bike_id, physicsClientId=self._client
         )
@@ -334,32 +336,38 @@ class BicycleBalanceEnv(gym.Env[np.ndarray, int]):
         linear_world, angular_world = p.getBaseVelocity(
             self._bike_id, physicsClientId=self._client
         )
-        rotation = np.asarray(p.getMatrixFromQuaternion(orientation), dtype=np.float64).reshape(3, 3)
+        rotation = np.asarray(
+            p.getMatrixFromQuaternion(orientation), dtype=np.float64
+        ).reshape(3, 3)
         linear_local = rotation.T @ np.asarray(linear_world)
         angular_local = rotation.T @ np.asarray(angular_world)
-        reaction_speed = p.getJointState(
+        steering_angle = p.getJointState(
             self._bike_id,
-            self._joints["reaction_wheel_joint"],
+            self._joints["steering_joint"],
             physicsClientId=self._client,
-        )[1]
+        )[0]
         return np.asarray(
             [
                 math.sin(roll),
                 math.cos(roll),
                 np.clip(angular_local[0] / 10.0, -1.0, 1.0),
-                np.clip(reaction_speed / self.config.reaction_max_speed_rad_s, -1.0, 1.0),
+                np.clip(
+                    steering_angle / self.config.steering_max_angle_rad, -1.0, 1.0
+                ),
                 np.clip(linear_local[0] / 4.0, -1.0, 1.0),
             ],
             dtype=np.float32,
         )
 
     def _roll(self) -> float:
+        """Return frame roll in radians."""
         orientation = p.getBasePositionAndOrientation(
             self._bike_id, physicsClientId=self._client
         )[1]
         return float(p.getEulerFromQuaternion(orientation)[0])
 
     def _has_fallen(self) -> bool:
+        """Detect excessive roll or any non-wheel ground contact."""
         if abs(self._roll()) >= self.config.fall_roll_rad:
             return True
         contacts = p.getContactPoints(
@@ -369,30 +377,39 @@ class BicycleBalanceEnv(gym.Env[np.ndarray, int]):
         )
         return any(contact[3] not in self._wheel_links for contact in contacts)
 
-    def _info(self, outcome: str, success: bool) -> dict[str, Any]:
+    def _info(
+        self, outcome: str, success: bool, success_reason: str = ""
+    ) -> dict[str, Any]:
+        """Build stable business and physics diagnostics for DQN logging."""
         position, orientation = p.getBasePositionAndOrientation(
             self._bike_id, physicsClientId=self._client
         )
         linear_world, _ = p.getBaseVelocity(self._bike_id, physicsClientId=self._client)
-        rotation = np.asarray(p.getMatrixFromQuaternion(orientation), dtype=np.float64).reshape(3, 3)
+        rotation = np.asarray(
+            p.getMatrixFromQuaternion(orientation), dtype=np.float64
+        ).reshape(3, 3)
         forward_speed = float((rotation.T @ np.asarray(linear_world))[0])
-        reaction_speed = float(
-            p.getJointState(
-                self._bike_id,
-                self._joints["reaction_wheel_joint"],
-                physicsClientId=self._client,
-            )[1]
-        )
+        steering_angle, steering_velocity = p.getJointState(
+            self._bike_id,
+            self._joints["steering_joint"],
+            physicsClientId=self._client,
+        )[:2]
         return {
             "outcome": outcome,
             "success": bool(success),
+            "success_reason": success_reason,
             "progress_m": float(self._max_progress_m),
+            "distance_from_start_m": float(
+                np.linalg.norm(np.asarray(position[:2]) - self._start_xy)
+            ),
             "roll_rad": self._roll(),
+            "heading_rad": float(p.getEulerFromQuaternion(orientation)[2]),
             "forward_speed_mps": forward_speed,
-            "lateral_drift_m": float(position[1]),
-            "reaction_wheel_speed_rad_s": reaction_speed,
-            "reaction_wheel_saturated": self._reaction_saturated,
-            "control_saturated": self._reaction_saturated,
+            "lateral_drift_m": float(position[1] - self._start_xy[1]),
+            "steering_angle_rad": float(steering_angle),
+            "steering_velocity_rad_s": float(steering_velocity),
+            "steering_saturated": self._steering_saturated,
+            "control_saturated": self._steering_saturated,
             "wind_force_y_n": self._wind_state.force_y_n,
             "wind_peak_force_n": self._wind_state.peak_force_n,
             "wind_direction": self._wind_state.direction,

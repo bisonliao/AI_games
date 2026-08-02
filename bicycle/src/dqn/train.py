@@ -58,7 +58,7 @@ class TrainingMetrics:
             env_steps,
         )
         self.writer.add_scalar(
-            "control/reaction_wheel_saturation_fraction",
+            "control/actuator_saturation_fraction",
             metric.saturation_fraction,
             env_steps,
         )
@@ -120,6 +120,12 @@ def train(args: argparse.Namespace) -> None:
     if args.resume is not None:
         resume_state = load_checkpoint(args.resume, map_location=device)
         config = DQNConfig.from_dict(resume_state["config"])
+        saved_env_id = int(resume_state.get("env_id", 1))
+        if saved_env_id != args.env_id:
+            print(
+                f"warning: checkpoint was saved for env_id={saved_env_id}, "
+                f"but training requested env_id={args.env_id}"
+            )
     else:
         config = replace(
             DQNConfig(),
@@ -130,7 +136,7 @@ def train(args: argparse.Namespace) -> None:
             evaluation_interval_steps=args.evaluation_interval_steps,
             checkpoint_interval=args.checkpoint_interval,
         )
-    run_dir = args.run_dir or create_run_dir(args.runs_root)
+    run_dir = args.run_dir or create_run_dir(args.runs_root, env_id=args.env_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"run_dir={run_dir}")
     (run_dir / "config.json").write_text(
@@ -141,6 +147,7 @@ def train(args: argparse.Namespace) -> None:
                 "envs_per_actor": args.envs_per_actor,
                 "seed": args.seed,
                 "device": str(device),
+                "env_id": args.env_id,
             },
             indent=2,
         ),
@@ -191,6 +198,7 @@ def train(args: argparse.Namespace) -> None:
                 metric_queue,
                 weight_queues[actor_id],
                 stop_event,
+                args.env_id,
             ),
         )
         for actor_id in range(args.actors)
@@ -204,6 +212,7 @@ def train(args: argparse.Namespace) -> None:
             evaluation_results,
             stop_event,
             config.evaluation_episodes,
+            args.env_id,
         ),
     )
     # Start consumers before publishing the initial NumPy policy snapshot.
@@ -217,6 +226,7 @@ def train(args: argparse.Namespace) -> None:
     writer = SummaryWriter(log_dir=str(run_dir / "tensorboard"), flush_secs=20)
     metrics = TrainingMetrics(writer)
     writer.add_text("run/config", json.dumps(asdict(config), indent=2), env_steps)
+    writer.add_text("run/environment", f"env_id={args.env_id}", env_steps)
     for actor_id in range(args.actors):
         writer.add_scalar(
             f"actors/epsilon_{actor_id}", actor_epsilon(actor_id, args.actors), env_steps
@@ -296,6 +306,7 @@ def train(args: argparse.Namespace) -> None:
                         env_steps,
                         rng,
                         best_success_rate=best_success_rate,
+                        env_id=args.env_id,
                     )
                     if args.save_replay and learner.updates % (
                         config.checkpoint_interval * 10
@@ -308,6 +319,7 @@ def train(args: argparse.Namespace) -> None:
                             rng,
                             replay=replay,
                             best_success_rate=best_success_rate,
+                            env_id=args.env_id,
                         )
                     next_checkpoint_update += config.checkpoint_interval
 
@@ -328,6 +340,7 @@ def train(args: argparse.Namespace) -> None:
                     env_steps,
                     rng,
                     best_success_rate=best_success_rate,
+                    env_id=args.env_id,
                 )
 
             now = time.perf_counter()
@@ -378,6 +391,7 @@ def train(args: argparse.Namespace) -> None:
             rng,
             replay=replay if args.save_replay else None,
             best_success_rate=best_success_rate,
+            env_id=args.env_id,
         )
         writer.flush()
         writer.close()
@@ -403,6 +417,7 @@ def create_run_dir(
     runs_root: Path,
     *,
     algorithm: str = "distributed-dqn",
+    env_id: int = 1,
     now: datetime | None = None,
     pid: int | None = None,
 ) -> Path:
@@ -413,7 +428,7 @@ def create_run_dir(
     """
     timestamp = (now or datetime.now()).strftime("%Y%m%d-%H%M%S")
     process_id = os.getpid() if pid is None else pid
-    base = runs_root / f"{timestamp}_{algorithm}_pid{process_id}"
+    base = runs_root / f"{timestamp}_{algorithm}_env{env_id}_pid{process_id}"
     candidate = base
     suffix = 1
     while candidate.exists():
@@ -486,7 +501,7 @@ def _safe_qsize(source: Any) -> int | None:
 def build_parser() -> argparse.ArgumentParser:
     """Build the training CLI with units and effective defaults documented."""
     parser = argparse.ArgumentParser(
-        description="Train distributed Double/Dueling DQN on BicycleBalance-v0",
+        description="Train distributed Double/Dueling DQN on a bicycle task",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -494,7 +509,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "exact output directory; when omitted, generate "
-            "YYYYMMDD-HHMMSS_distributed-dqn_pidPID under --runs-root"
+            "YYYYMMDD-HHMMSS_distributed-dqn_envN_pidPID under --runs-root"
         ),
     )
     parser.add_argument(
@@ -502,6 +517,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("runs"),
         help="parent directory for automatically named run histories",
+    )
+    parser.add_argument(
+        "--env_id",
+        "--env-id",
+        dest="env_id",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="environment task: 1=reaction wheel, 2=front steering",
     )
     parser.add_argument(
         "--device",

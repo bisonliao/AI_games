@@ -1,3 +1,5 @@
+"""TensorBoard business success-rate tag emission test."""
+
 from pathlib import Path
 
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator

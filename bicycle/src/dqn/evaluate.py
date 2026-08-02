@@ -13,10 +13,9 @@ from typing import Any
 import numpy as np
 import torch
 
-from env import BicycleBalanceEnv
-
 from .checkpoint import load_checkpoint, online_state_from_checkpoint
 from .config import DQNConfig
+from .environments import make_evaluation_environment
 from .network import DuelingQNetwork, load_numpy_state_dict
 
 
@@ -39,6 +38,7 @@ def evaluate_network(
     episodes: int = 100,
     seed_start: int = 100_000,
     display: bool = False,
+    env_id: int = 1,
 ) -> EvaluationResult:
     """Evaluate a greedy CPU policy on a deterministic sequence of seeds.
 
@@ -47,7 +47,7 @@ def evaluate_network(
     20 Hz control rate so a human can inspect behavior.
     """
     network.cpu().eval()
-    env = BicycleBalanceEnv(render_mode="human" if display else None)
+    env = make_evaluation_environment(env_id, display)
     outcomes: list[str] = []
     returns: list[float] = []
     distances: list[float] = []
@@ -102,6 +102,7 @@ def evaluator_process(
     result_queue: Any,
     stop_event: Any,
     episodes: int,
+    env_id: int = 1,
 ) -> None:
     """Serve evaluation requests without blocking learner optimization.
 
@@ -122,7 +123,10 @@ def evaluator_process(
         if env_steps is None:
             return
         load_numpy_state_dict(network, state)
-        result = replace(evaluate_network(network, episodes=episodes), env_steps=int(env_steps))
+        result = replace(
+            evaluate_network(network, episodes=episodes, env_id=env_id),
+            env_steps=int(env_steps),
+        )
         result_queue.put(result)
 
 
@@ -131,6 +135,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Evaluate a bicycle DQN checkpoint",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--env_id",
+        "--env-id",
+        dest="env_id",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="environment task: 1=reaction wheel, 2=front steering",
     )
     parser.add_argument(
         "--checkpoint",
@@ -168,7 +181,15 @@ def main() -> None:
         config.observation_dim, config.action_dim, config.hidden_dim
     )
     network.load_state_dict(online_state_from_checkpoint(state))
-    result = evaluate_network(network, args.episodes, args.seed_start, args.display)
+    saved_env_id = int(state.get("env_id", 1))
+    if saved_env_id != args.env_id:
+        print(
+            f"warning: checkpoint was saved for env_id={saved_env_id}, "
+            f"but evaluation requested env_id={args.env_id}"
+        )
+    result = evaluate_network(
+        network, args.episodes, args.seed_start, args.display, args.env_id
+    )
     print(
         f"success_rate={result.success_rate:.3f} fall_rate={result.fall_rate:.3f} "
         f"timeout_rate={result.timeout_rate:.3f} mean_return={result.mean_return:.3f} "

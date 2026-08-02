@@ -1,3 +1,5 @@
+"""Uniform replay sampling, overwrite, reproducibility, and restore tests."""
+
 import numpy as np
 
 from dqn.nstep import NStepTransition

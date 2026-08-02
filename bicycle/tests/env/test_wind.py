@@ -1,3 +1,5 @@
+"""Seeded smooth-gust timing, bounds, and envelope tests."""
+
 import numpy as np
 
 from env import WindConfig

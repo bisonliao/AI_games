@@ -1,3 +1,5 @@
+"""N-step return and termination-versus-truncation semantics tests."""
+
 import numpy as np
 
 from dqn.nstep import NStepAccumulator, StepTransition
@@ -31,4 +33,3 @@ def test_termination_disables_bootstrap_but_truncation_keeps_it():
     truncated = NStepAccumulator(3, 0.9)
     trunc_result = truncated.add(transition(0, truncated=True))[0]
     assert trunc_result.discount == 0.9
-
