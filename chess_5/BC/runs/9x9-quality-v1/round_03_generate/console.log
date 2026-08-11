@@ -165,3 +165,43 @@ shard-00149.npz: games=16 samples=1017 cache=474/1017 seconds=70.1 q/s=7.7
 shard-00158.npz: games=16 samples=1296 cache=699/1296 seconds=74.5 q/s=8.0
 shard-00146.npz: games=16 samples=1158 cache=447/1158 seconds=77.7 q/s=9.1
 coverage: games=2560 new=43286/50000 win=907/0 block=6420/0 fork=15006/0
+shard-00166.npz: games=16 samples=964 cache=611/964 seconds=55.1 q/s=6.4
+shard-00172.npz: games=16 samples=936 cache=563/936 seconds=57.4 q/s=6.5
+shard-00170.npz: games=16 samples=1093 cache=685/1093 seconds=60.6 q/s=6.7
+shard-00168.npz: games=16 samples=936 cache=534/936 seconds=62.8 q/s=6.4
+shard-00161.npz: games=16 samples=888 cache=482/888 seconds=63.4 q/s=6.4
+shard-00160.npz: games=16 samples=1100 cache=616/1100 seconds=68.1 q/s=7.1
+shard-00167.npz: games=16 samples=1059 cache=553/1059 seconds=69.4 q/s=7.3
+shard-00162.npz: games=16 samples=900 cache=424/900 seconds=69.6 q/s=6.8
+shard-00175.npz: games=16 samples=963 cache=461/963 seconds=72.1 q/s=7.0
+shard-00171.npz: games=16 samples=1053 cache=539/1053 seconds=74.8 q/s=6.9
+shard-00174.npz: games=16 samples=1170 cache=632/1170 seconds=75.4 q/s=7.1
+shard-00163.npz: games=16 samples=1172 cache=578/1172 seconds=77.5 q/s=7.7
+shard-00165.npz: games=16 samples=1090 cache=511/1090 seconds=77.8 q/s=7.4
+shard-00169.npz: games=16 samples=1065 cache=475/1065 seconds=78.9 q/s=7.5
+shard-00173.npz: games=16 samples=1084 cache=450/1084 seconds=81.0 q/s=7.8
+shard-00164.npz: games=16 samples=1238 cache=526/1238 seconds=83.3 q/s=8.5
+coverage: games=2816 new=47020/50000 win=984/0 block=7067/0 fork=16529/0
+shard-00184.npz: games=16 samples=816 cache=566/816 seconds=38.3 q/s=6.5
+shard-00180.npz: games=16 samples=1013 cache=644/1013 seconds=49.9 q/s=7.4
+shard-00187.npz: games=16 samples=906 cache=534/906 seconds=52.7 q/s=7.1
+shard-00191.npz: games=16 samples=1009 cache=613/1009 seconds=56.3 q/s=7.0
+shard-00190.npz: games=16 samples=1032 cache=634/1032 seconds=56.7 q/s=7.0
+shard-00186.npz: games=16 samples=1001 cache=592/1001 seconds=59.2 q/s=6.9
+shard-00183.npz: games=16 samples=992 cache=576/992 seconds=60.0 q/s=6.9
+shard-00176.npz: games=16 samples=900 cache=470/900 seconds=60.2 q/s=7.1
+shard-00177.npz: games=16 samples=1090 cache=689/1090 seconds=60.4 q/s=6.6
+shard-00182.npz: games=16 samples=867 cache=413/867 seconds=64.4 q/s=7.1
+shard-00181.npz: games=16 samples=1034 cache=567/1034 seconds=65.6 q/s=7.1
+shard-00179.npz: games=16 samples=1064 cache=536/1064 seconds=69.5 q/s=7.6
+shard-00178.npz: games=16 samples=1014 cache=482/1014 seconds=70.1 q/s=7.6
+shard-00185.npz: games=16 samples=1007 cache=449/1007 seconds=71.7 q/s=7.8
+shard-00189.npz: games=16 samples=1078 cache=496/1078 seconds=72.3 q/s=8.1
+shard-00188.npz: games=16 samples=1103 cache=524/1103 seconds=73.0 q/s=7.9
+coverage: games=3072 new=50375/50000 win=1073/0 block=7678/0 fork=18014/0
+!!!!!!!!!!!!!!!! 数据多样性量化结果 !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 有效轨迹比例：20.51%（越高越好） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 最大单一轨迹占比：4.69%（越低越好） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 独特状态比例：31.14%（越高越好） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据质量结论：可接受，多样性良好 !!!!!!!!!!!!!!!!
+complete: samples=192208 cache_hit_rate=0.535 expert_queries=89295

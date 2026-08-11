@@ -1,0 +1,58 @@
+!!!!!!!!!!!!!!!! 数据多样性检查开始 !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据集：round_00_bootstrap !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 有效轨迹比例：24.71%（越高越好，表示真正不同的对局分支） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 最大单一轨迹占比：5.70%（越低越好，表示是否被一种对局垄断） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 独特状态比例：43.36%（越高越好，表示不同棋盘局面的覆盖程度） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据质量结论：可接受，多样性良好 !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据集：round_01_dagger !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 有效轨迹比例：19.50%（越高越好，表示真正不同的对局分支） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 最大单一轨迹占比：4.62%（越低越好，表示是否被一种对局垄断） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 独特状态比例：32.10%（越高越好，表示不同棋盘局面的覆盖程度） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据质量结论：可接受，多样性良好 !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据集：round_02_dagger !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 有效轨迹比例：21.22%（越高越好，表示真正不同的对局分支） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 最大单一轨迹占比：4.26%（越低越好，表示是否被一种对局垄断） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 独特状态比例：32.87%（越高越好，表示不同棋盘局面的覆盖程度） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据质量结论：可接受，多样性良好 !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据集：round_03_dagger !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 有效轨迹比例：20.51%（越高越好，表示真正不同的对局分支） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 最大单一轨迹占比：4.69%（越低越好，表示是否被一种对局垄断） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 独特状态比例：31.14%（越高越好，表示不同棋盘局面的覆盖程度） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据质量结论：可接受，多样性良好 !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据集：round_04_dagger !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 有效轨迹比例：18.74%（越高越好，表示真正不同的对局分支） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 最大单一轨迹占比：4.21%（越低越好，表示是否被一种对局垄断） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 独特状态比例：30.55%（越高越好，表示不同棋盘局面的覆盖程度） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据质量结论：可接受，多样性良好 !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据多样性检查结束 !!!!!!!!!!!!!!!!
+epoch=1 train_loss=0.4233 val_loss=0.6133 val_acc=0.838 legal=1.000 samples/s=7383
+epoch=2 train_loss=0.4197 val_loss=0.6049 val_acc=0.832 legal=1.000 samples/s=7304
+epoch=3 train_loss=0.4168 val_loss=0.5904 val_acc=0.852 legal=1.000 samples/s=7235
+epoch=4 train_loss=0.4140 val_loss=0.5905 val_acc=0.854 legal=1.000 samples/s=7330
+epoch=5 train_loss=0.4120 val_loss=0.5798 val_acc=0.845 legal=1.000 samples/s=7190
+epoch=6 train_loss=0.4091 val_loss=0.5826 val_acc=0.858 legal=1.000 samples/s=7306
+epoch=7 train_loss=0.4074 val_loss=0.5862 val_acc=0.854 legal=1.000 samples/s=7260
+epoch=8 train_loss=0.4040 val_loss=0.5854 val_acc=0.844 legal=1.000 samples/s=7188
+epoch=9 train_loss=0.4026 val_loss=0.5856 val_acc=0.854 legal=1.000 samples/s=7310
+epoch=10 train_loss=0.3870 val_loss=0.5709 val_acc=0.865 legal=1.000 samples/s=7171
+epoch=11 train_loss=0.3822 val_loss=0.5721 val_acc=0.862 legal=1.000 samples/s=7300
+epoch=12 train_loss=0.3793 val_loss=0.5674 val_acc=0.868 legal=1.000 samples/s=7270
+epoch=13 train_loss=0.3788 val_loss=0.5735 val_acc=0.862 legal=1.000 samples/s=7194
+epoch=14 train_loss=0.3760 val_loss=0.5718 val_acc=0.868 legal=1.000 samples/s=7302
+epoch=15 train_loss=0.3750 val_loss=0.5706 val_acc=0.861 legal=1.000 samples/s=7178
+epoch=16 train_loss=0.3730 val_loss=0.5739 val_acc=0.861 legal=1.000 samples/s=7310
+epoch=17 train_loss=0.3677 val_loss=0.5634 val_acc=0.863 legal=1.000 samples/s=7275
+epoch=18 train_loss=0.3650 val_loss=0.5663 val_acc=0.865 legal=1.000 samples/s=7199
+epoch=19 train_loss=0.3636 val_loss=0.5667 val_acc=0.860 legal=1.000 samples/s=7315
+epoch=20 train_loss=0.3628 val_loss=0.5612 val_acc=0.871 legal=1.000 samples/s=7183
+epoch=21 train_loss=0.3626 val_loss=0.5642 val_acc=0.868 legal=1.000 samples/s=7295
+epoch=22 train_loss=0.3614 val_loss=0.5667 val_acc=0.858 legal=1.000 samples/s=7278
+epoch=23 train_loss=0.3617 val_loss=0.5643 val_acc=0.872 legal=1.000 samples/s=7113
+epoch=24 train_loss=0.3604 val_loss=0.5665 val_acc=0.865 legal=1.000 samples/s=7032
+epoch=25 train_loss=0.3571 val_loss=0.5612 val_acc=0.864 legal=1.000 samples/s=6803
+epoch=26 train_loss=0.3572 val_loss=0.5608 val_acc=0.864 legal=1.000 samples/s=6975
+epoch=27 train_loss=0.3549 val_loss=0.5619 val_acc=0.865 legal=1.000 samples/s=6934
+epoch=28 train_loss=0.3546 val_loss=0.5628 val_acc=0.868 legal=1.000 samples/s=7066
+epoch=29 train_loss=0.3552 val_loss=0.5591 val_acc=0.873 legal=1.000 samples/s=7135
+epoch=30 train_loss=0.3545 val_loss=0.5607 val_acc=0.870 legal=1.000 samples/s=7046
+early stopping after 30 epochs
