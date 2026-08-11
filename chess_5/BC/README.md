@@ -1,397 +1,630 @@
-# 五子棋行为克隆（BC）
+# 用行为克隆训练 9×9 五子棋 Agent
 
-`BC/` 是一套独立于 `DQN/` 的离线模仿学习流水线。核心思想可以直接理解为一个监督学习问题：
+这套代码要做的事情，可以先用一句话概括：
 
-> 给定当前棋盘和当前行棋方，预测启发式专家会落在哪个位置。
+> 让启发式专家观察很多棋盘并给出建议，然后用普通的监督学习，训练一个神经网络模仿这些建议。
 
-启发式机器人只在“生成数据”和“评测”时运行。GPU 训练只读取已经落盘的数据，不会调用启发式搜索，因此 9×9 下较慢的专家不会拖慢每个训练 batch。
+这里不使用强化学习。训练时没有奖励、Q 值、TD target 或策略梯度，主要损失仍然是你熟悉的交叉熵。
 
-## 1. 一条训练数据是什么
+不过，它也不只是最简单的“收集一批专家棋谱，然后训练一次”。代码还会反复让当前 Agent 自己下棋，把它容易走到、容易犯错的局面交给专家重新标注。这部分就是 DAgger。
 
-每个样本包含：
+## 1. 最基本的行为克隆
 
-- `board`：落子前的棋盘，`int8[H,W]`，其中黑棋为 `1`、白棋为 `-1`、空位为 `0`；
-- `player`：当前行棋方，取值为 `1` 或 `-1`；
-- `action`：启发式专家在该局面选择的位置；
-- `game_id`：样本属于哪一局棋，用于按完整棋局划分训练集和验证集。
-
-合法动作 mask 不需要保存，因为所有 `board == 0` 的位置就是合法动作。数据按 worker 写入压缩的 `shard-*.npz`，数据版本的参数和 shard 列表记录在 `metadata.json` 中。
-
-训练前，棋盘会转换为当前行棋方视角的三个输入通道：
+对于一个棋盘状态，我们让启发式专家选出它认为最好的动作：
 
 ```text
-通道 0：当前行棋方的棋子
-通道 1：对方的棋子
-通道 2：空位
+棋盘状态 s ──启发式专家──> 动作 a
 ```
 
-因此同一个网络可以同时学习执黑和执白，不需要分别训练两个模型。
-
-## 2. 数据如何产生
-
-### 2.1 初始专家数据：`--mode expert`
-
-启发式机器人同时控制黑棋和白棋。每次落子前保存当前状态，并把专家的落子作为监督标签：
+把它保存成一个监督学习样本：
 
 ```text
-局面 s ──启发式专家──> 动作 a
-  └──────── 保存 (s, a) ────────┘
+输入：棋盘状态 s
+标签：专家动作 a
 ```
 
-这样得到的都是专家自己会访问到的局面，适合训练第一版 BC 模型。
+神经网络为棋盘上的 81 个位置分别输出一个 logit，然后用交叉熵让专家动作对应的 logit 尽可能大。
 
-`generate.py` 使用多个 CPU 进程并行下完整棋局。每个进程直接写自己的 shard，避免把每一步通过进程队列传回主进程。
+已经有棋子的格子会被 mask 掉，所以 Agent 只能从空位中选择动作。
 
-### 2.2 专家查询缓存
+## 2. 为什么只训练一次通常不够
 
-启发式搜索是数据生成阶段最昂贵的操作，尤其是在 9×9 中盘。`cache.py` 和 `symmetry.py` 会：
-
-1. 将一个棋盘的 8 种旋转/镜像形式映射到同一个 canonical key；
-2. 用 SQLite 持久化该 key 对应的专家动作；
-3. 再遇到相同或对称局面时直接复用结果，并把动作坐标变换回原棋盘。
-
-每个 canonical 状态只执行一次完整启发式搜索，缓存最多 4 个按优先级排列的合理候选。除一步必杀/必堵外，前 6 次己方落子使用 rank-softmax 采样并逐步退火，随后转为 greedy。rank-softmax 使用动作名次而不是原始评分幅值，避免评分尺度使采样退化为近似 greedy。可用 `--expert-top-k`、`--expert-temperature` 和 `--expert-stochastic-moves` 调整。
-
-缓存会校验棋盘尺寸、专家参数、随机种子等配置，防止 5×5、9×9 或不同专家配置之间错误复用。
-
-### 2.3 数据版本与中断恢复
-
-- shard 先写临时文件，完成后再原子重命名；
-- 产数中断后，可以使用完全相同的参数重新执行命令；已有完整 shard 会被跳过；
-- 当 `metadata.json` 的状态变为 `complete` 后，该目录被视为不可变数据版本；
-- 每轮聚合必须写入新的目录，checkpoint 会记录自己使用过的数据版本。
-
-### 2.4 数据多样性监控
-
-产数结束后，`diversity.py` 会扫描一次所有 shard。它不会再次调用专家，也不进入训练 batch 的热路径。扫描结果写入数据目录的 `diversity.json`、`metadata.json`，同时进入当前产数步骤的 TensorBoard。
-
-保留三项互补的核心指标：
-
-- `canonical_effective_trajectory_ratio`：先把旋转/镜像等价的完整轨迹合并，再根据轨迹频率的熵计算“有效轨迹数 ÷ 总局数”。越接近 `1`，说明每局提供的信息越独立；接近 `0` 表示大量棋局集中在少数轨迹上。这是总体多样性的主指标。
-- `dominant_canonical_trajectory_fraction`：出现次数最多的 canonical 轨迹占全部棋局的比例。越低越好；如果接近 `1`，说明几乎一直在重复同一盘棋。
-- `canonical_state_unique_ratio`：消除旋转/镜像后，独特棋盘状态数除以总样本数。它补充衡量局面覆盖范围；固定中心开局等合理重复会使该指标低于 `1`。
-
-例如：
+假设训练数据全部来自“专家对专家”：
 
 ```text
-canonical_effective_trajectory_ratio = 0.08
-dominant_canonical_trajectory_fraction = 0.42
-canonical_state_unique_ratio = 0.31
+专家正确落子
+  ↓
+进入专家熟悉的局面
+  ↓
+专家继续正确落子
 ```
 
-这表示数据虽然可能有很多对局，但有效轨迹只相当于总局数的约 8%，且一种轨迹占了 42%，需要警惕专家自博弈分支不足。pipeline 会按下文的硬阈值拒绝灾难性重复数据，较严格的告警线则只提示观察；仍建议根据 5×5 正式数据持续校准正常区间。
-
-每次 `train.py` 启动后、第一轮 epoch 开始前，还会重新读取本轮所有输入数据版本的多样性报告。标准输出用连续感叹号突出显示，例如：
+训练完成后，Agent 不可能百分之百复制专家。只要某一步走错，后面就可能发生：
 
 ```text
-!!!!!!!!!!!!!!!! 数据多样性检查开始 !!!!!!!!!!!!!!!!
-!!!!!!!!!!!!!!!! 数据集：01_expert !!!!!!!!!!!!!!!!
-!!!!!!!!!!!!!!!! 有效轨迹比例：23.03%（越高越好，表示真正不同的对局分支） !!!!!!!!!!!!!!!!
-!!!!!!!!!!!!!!!! 最大单一轨迹占比：31.00%（越低越好，表示是否被一种对局垄断） !!!!!!!!!!!!!!!!
-!!!!!!!!!!!!!!!! 独特状态比例：20.80%（越高越好，表示不同棋盘局面的覆盖程度） !!!!!!!!!!!!!!!!
-!!!!!!!!!!!!!!!! 数据质量结论：可接受，但多样性仍有警告，需要关注 !!!!!!!!!!!!!!!!
-!!!!!!!!!!!!!!!! 数据多样性检查结束 !!!!!!!!!!!!!!!!
+Agent 走错一步
+  ↓
+进入训练数据中很少出现的局面
+  ↓
+Agent 更不知道该怎么走
+  ↓
+继续犯错
 ```
 
-v2 混合训练会分别显示基础专家集和聚合集，避免只看到合并后的训练 loss 而忽略某个输入数据版本已经退化。对应指标也会写入训练步骤的 `DataDiversity/dataset_<序号>_<名称>/*` TensorBoard tags，包括三项多样性指标和 `quality_gate_passed`。
+这种“训练时看到的局面”和“实际部署时遇到的局面”不一致，就是行为克隆常说的分布偏移或带外局面问题。
 
-## 3. 数据如何用于训练
+简单增加更多“专家对专家”棋谱不一定能解决它，因为新增棋谱仍然集中在专家自己的活动范围内。
 
-`dataset.py` 读取 shard，并按完整 `game_id` 划分训练集和验证集。这样同一局中的相邻状态不会一部分进入训练集、一部分进入验证集。
+## 3. 当前代码怎样使用 DAgger
 
-训练样本会在线随机应用 8 种旋转/镜像变换，棋盘和动作坐标一起变换。数据文件不会预存 8 份副本，但每个专家查询可以在训练中覆盖所有对称形式。
+DAgger 的核心不是换一种损失函数，而是改变数据的来源。
 
-`network.py` 定义全卷积残差策略网络：
+代码会让当前 Agent 真正控制棋子：
 
 ```text
-[B, 3, H, W]
-      │
-卷积层 + 残差块
-      │
-每个格子的 action logit
-      │
-[B, H × W]
+当前状态 s
+  ├── Agent 选择实际动作 a_agent，用它推进棋局
+  └── 专家给出建议动作 a_expert，作为监督标签保存
 ```
 
-网络没有依赖固定棋盘面积的全连接输出层，所以同一套结构支持 5×5 和 9×9；但两个尺寸应分别生成数据、分别训练 checkpoint。
-
-`train.py` 的训练过程就是标准分类监督学习：
-
-1. 网络为每个格子输出一个 logit；
-2. 已经有棋子的格子被 mask 为极小值；
-3. 使用专家动作作为类别标签，计算 cross-entropy；
-4. 使用 AdamW、梯度裁剪和学习率调度更新网络；
-5. 根据验证集 loss early stopping，并保存 `best.pt` 和 `latest.pt`。
-
-日志中的主要指标是：
-
-- `loss`：专家动作的交叉熵；
-- `accuracy`：预测动作与这一次专家标签完全一致的比例；
-- `legal_rate`：预测动作是否合法，正常情况下必须为 `1.0`；
-- `samples/s`：训练吞吐量。
-
-由于专家同分动作可能不唯一，`accuracy` 不必达到 100%。最终是否成功应以对战结果为准。
-
-## 4. 为什么纯 BC 会产生分布偏移
-
-第一版数据来自“专家 vs 专家”，模型只见过专家会到达的局面。但部署时模型不可能每一步都完全复制专家：
+因此，一个 DAgger 样本可能是：
 
 ```text
-专家数据：专家动作 → 专家熟悉的下一局面 → 专家动作
-实际对局：模型失误 → 训练集中少见的局面 → 更容易继续失误
+Agent 实际走了：左上角
+专家认为应该走：中央附近
+
+棋盘下一步按“左上角”继续发展，
+但训练标签保存“中央附近”。
 ```
 
-一个小错误会改变后续棋盘分布，错误可能沿整局累积。这通常称为 covariate shift，也就是这里要处理的局外/分布偏移。
+这样生成的后续局面来自 Agent 自己的行为分布。即使 Agent 已经犯错，专家仍然会告诉它：“走到这个局面以后，应该怎样补救。”
 
-## 5. 离线数据聚合如何解决分布偏移
-
-本项目使用 DAgger 风格的分轮离线聚合，而不是在 GPU 训练过程中实时调用专家。
-
-执行 `generate.py --mode aggregate --checkpoint ...` 时：
-
-1. 加载一个冻结的 BC checkpoint；
-2. BC 和启发式专家对局，BC 轮流被安排执黑和执白；
-3. BC 行棋时，真正落到棋盘上的是 BC 自己的动作，因此后续状态来自 BC 的实际访问分布；
-4. 对每一个访问到的状态都询问专家“这个状态下你会怎么走”；
-5. 数据中保存的是专家动作，而不是 BC 动作；
-6. 聚合结束后关闭专家进程，再用基础数据和聚合数据共同训练新模型。
-
-聚合时 BC 也在前 6 次己方落子使用网络合法动作排名的 top-4 rank-softmax。检测到一步必杀或必堵时只关闭采样并切换网络 greedy，规则不会替 BC 落子，因此网络的真实战术错误仍会形成局外状态并得到专家标签。
-
-最关键的一步可以表示为：
+完成一轮数据收集后，用新旧数据一起训练下一版 Agent，然后再让新版 Agent 下棋、重新收集数据。
 
 ```text
-状态 s ──BC──> 实际动作 a_bc ──> 决定下一状态
-   │
-   └──启发式专家──> 标签 a_expert ──> 保存 (s, a_expert)
+初始数据 → Agent 0
+              ↓
+       Agent 0 访问的局面 → Agent 1
+                                ↓
+                         Agent 1 访问的局面 → Agent 2
 ```
 
-这样模型会学到：“即使我已经走到了自己容易犯错的局面，专家会怎样纠正。”这正是聚合数据相对专家自博弈数据的价值。
+当前 pipeline 最多进行 6 轮 DAgger。如果连续两轮都达到验收标准，就提前停止。
 
-基础专家数据始终保留，防止模型只学习异常局面。后续每轮聚合数据可用 `--aggregate-max-samples` 限制采样量，避免它淹没基础数据。
+## 4. 为什么直接训练 9×9
 
-## 6. 完整 pipeline
+以前的实验主要使用 5×5。实际结果中，Agent 和专家经常把 25 个格子全部走完，所有对局都是和棋。
+
+这会产生一个问题：即使 Agent 的落子逻辑很差，只要最后仍然和棋，从胜负上就很难区分它和专家的差距。
+
+所以当前质量优先 pipeline 固定使用 9×9。9×9 的局面空间更大，也更容易用对战结果区分棋力。
+
+## 5. 第一步：Bootstrap 初始数据
+
+第一版 Agent 还不存在，因此先生成 bootstrap 数据。
+
+代码不是只让专家确定性地重复同一盘棋，而是混合三种下法。
+
+### 5.1 专家受控采样自博弈，占 50%
+
+专家通常会给出几个较好的候选动作，然后在开局阶段从这些候选中采样。
+
+这仍然是比较高质量的棋，但不会每局都完全一样。
+
+### 5.2 扰动开局，占 25%
+
+棋局开始后的 2～10 手故意选择一些局部合法动作，然后再交给专家继续下。
+
+这些动作不一定是专家最喜欢的动作，目的是让专家展示如何处理不同的开局形状。
+
+### 5.3 带少量随机动作的专家，占 25%
+
+在非战术局面中，有 15% 概率选择棋子附近的随机合法动作，其余时候仍按专家策略下。
+
+如果当前有明确的必胜、必堵等战术，不进行这种随机扰动。
+
+### 5.4 Bootstrap 什么时候停止
+
+默认至少生成 2,000 局，并持续检查真正新增的棋盘状态：
+
+- 目标：至少 100,000 个新的 canonical 状态；
+- 最多：8,000 局；
+- 还必须收集足够的 win、block 和 fork 战术样本。
+
+这里的 canonical 状态，是把旋转和镜像后等价的棋盘视为同一个状态。例如，一个左上角棋形旋转到右下角，不会被错误地计算成全新的棋形。
+
+如果达到 8,000 局仍然没有足够的新状态或战术样本，数据会标记为 `coverage_stalled`，pipeline 会停止并报错，而不是拿覆盖不足的数据继续训练。
+
+## 6. 后续每轮 DAgger 怎样下棋
+
+从第一版 Agent 开始，每轮数据由四种对局组成。
+
+### 6.1 当前 Agent 对专家，占 40%
+
+当前 Agent 一局执黑、下一局执白，与专家对战。
+
+它可以直接学习自己面对专家时会进入的局面。
+
+### 6.2 当前 Agent 自博弈，占 30%
+
+当前 Agent 同时控制黑白双方。
+
+这样可以暴露双方都不按专家路线走时产生的连续错误。
+
+### 6.3 当前 Agent 对历史 Agent，占 20%
+
+从以前轮次的 checkpoint 中随机选择一个作为对手。
+
+这样当前 Agent 不会只适应某一个固定版本的策略。
+
+### 6.4 带少量随机动作的当前 Agent，占 10%
+
+在非战术局面中，以 10% 概率选择附近的随机合法动作。
+
+它的作用是主动制造一些当前 Agent 平时不容易进入，但仍然合理、合法的局面。
+
+### 6.5 每轮什么时候停止
+
+每轮：
+
+- 至少生成 1,000 局；
+- 目标是新增 50,000 个以前没有的 canonical 状态；
+- 最多生成 4,000 局。
+
+所有实际访问到的状态都会由同一个冻结专家重新标注。
+
+## 7. 专家为什么给出 top-4，而不是只给一个动作
+
+一个五子棋局面经常不只有一个合理动作。
+
+例如专家可能认为候选动作的优先级是：
 
 ```text
-启发式专家自博弈
-        │
-        ▼
-初始数据 expert-v1 ──> 训练 BC-v1 ──> 双执子评测
-                           │
-                    未达到目标
-                           │
-                           ▼
-              BC-v1 与专家对局并补专家标签
-                           │
-                           ▼
-                  聚合数据 aggregate-v2
-                           │
-          expert-v1 + aggregate-v2
-                           │
-                           ▼
-                       训练 BC-v2
-                           │
-                 评测；必要时继续下一轮
+位置 40：最好
+位置 39：次好
+位置 41：也可以
+位置 31：第四选择
 ```
 
-建议先在 5×5 完整跑通，再使用相同流程训练独立的 9×9 数据和模型。
+如果每次只随机选其中一个作为硬标签，同一个棋盘可能一会儿标成 40，一会儿标成 39。对监督学习来说，这相当于标签互相冲突。
 
-### 一条命令运行完整 pipeline
-
-`run_pipeline.sh` 会依次执行六个步骤，并在 v2 训练后执行最终评测。直接执行时会自动生成带时间戳的 run name：
-
-脚本直接使用当前 shell 中的 `python`，不会自行调用 conda。请先在脚本外激活训练服务器上的 Python 环境：
-
-```bash
-conda activate mygames  # 环境名以当前服务器为准
-```
-
-```bash
-bash BC/run_pipeline.sh
-```
-
-更推荐显式指定 run name。这样进程中断后，可以用同一条命令恢复：
-
-```bash
-bash BC/run_pipeline.sh my-5x5-run
-```
-
-脚本具有以下行为：
-
-- 任一步骤失败都会立即停止，不会带着残缺数据继续下一步；
-- 已完成的数据生成、评测和训练步骤会被跳过；
-- 训练中断时，同一个 run name 会从对应的 `latest.pt` 继续；
-- 每一步的控制台输出保存在该步骤 TensorBoard 目录下的 `console.log`；
-- 数据、checkpoint、评测结果、日志和 pipeline 状态都按 run name 隔离。
-
-常用参数通过环境变量调整。例如先跑一个较小的 5×5 实验：
-
-```bash
-BOARD_SIZE=5 \
-EXPERT_GAMES=1000 \
-AGGREGATE_GAMES=500 \
-EPOCHS=30 \
-bash BC/run_pipeline.sh 5x5-small
-```
-
-脚本支持的主要环境变量如下：
-
-- `BOARD_SIZE`：棋盘尺寸，默认 `5`；
-- `EXPERT_GAMES`：初始专家自博弈局数，默认 `10000`；
-- `AGGREGATE_GAMES`：离线聚合局数，默认 `5000`；
-- `GEN_WORKERS`：产数进程数，默认 `16`；
-- `EVAL_GAMES`：每种执子颜色的评测局数，默认 `200`；
-- `EVAL_WORKERS`：评测进程数，默认 `8`；
-- `EPOCHS`、`BATCH_SIZE`、`TRAIN_WORKERS`、`DEVICE`：训练 epoch、batch 大小、DataLoader 进程数和设备；
-- `EXPERT_TOP_K`、`EXPERT_TEMPERATURE`、`EXPERT_STOCHASTIC_MOVES`：专家 top-k、初始温度和采样步数，默认分别为 `4`、`1.5`、`6`；
-- `BC_TOP_K`、`BC_TEMPERATURE`、`BC_STOCHASTIC_MOVES`：聚合时 BC 的对应参数；
-- `CACHE_LABELS_PER_STATE`：旧配置兼容别名，仅在未设置 `EXPERT_TOP_K` 时生效；
-- `MAX_CANDIDATES`：启发式浅层搜索 shortlist 上限；
-- `ARTIFACT_ROOT`：全部输出的根目录，默认 `BC/`；
-
-### TensorBoard 日志组织
-
-六个步骤共享同一个顶层 run name，每个步骤拥有带序号和名称的子 run：
+当前实现会保存专家确定性的 top-4 排名：
 
 ```text
-BC/runs/<run-name>/
-├── 01_generate_expert/
-├── 02_train_bc_v1/
-├── 03_eval_bc_v1/
-├── 04_generate_aggregate/
-├── 05_train_bc_v2/
-└── 06_eval_bc_v2/
+candidate_actions = [40, 39, 41, 31]
+actions = 40  # 兼容旧格式的 top-1 标签
 ```
 
-一次监控整个 pipeline：
+训练损失为：
+
+```text
+总损失 = 0.7 × top-1 交叉熵
+       + 0.3 × top-4 软标签交叉熵
+```
+
+可以把它理解成：
+
+- 主要鼓励网络选择专家认为最好的动作；
+- 如果网络选择了专家排名第二或第三的合理动作，也不要像完全错误的动作那样重罚。
+
+遇到一步必胜或必须封堵时，专家只给出明确的战术动作，不使用模糊的 top-4 标签。
+
+## 8. 哪些样本会被重点学习
+
+并不是所有错误都同样严重。
+
+当前实现使用以下 loss 权重：
+
+| 样本类型 | 权重 | 含义 |
+|---|---:|---|
+| 一步必胜、必须封堵 | 4 | 这种错误通常直接决定胜负 |
+| 制造双杀、阻止双杀 | 2 | 重要战术局面 |
+| 普通位置判断 | 1 | 一般棋形选择 |
+
+此外，空棋盘和常见开局会在数据中重复很多次。代码会统计 canonical 状态出现频率，对高频状态进行 inverse-sqrt 降权。
+
+直观理解是：
+
+```text
+出现 1 次的状态：正常权重
+出现很多次的相同状态：每条样本权重变小
+```
+
+这样可以避免大量重复开局淹没真正稀有的中盘和带外局面。
+
+## 9. 新旧数据怎样混合
+
+后续训练不会只使用最新一轮数据，也不会让最早的专家数据占据全部 batch。
+
+目标比例为：
+
+- bootstrap：30%；
+- 最近两轮 DAgger：每轮 25%，合计 50%；
+- 更早的 DAgger 数据：合计 20%。
+
+同时尽量保持：
+
+- 黑棋样本和白棋样本各 50%；
+- 前 0～15 手约占 30%；
+- 第 16～35 手约占 45%；
+- 第 36 手以后约占 25%。
+
+如果某一类样本数量不足，剩余比例会分配给其他类别。
+
+## 10. 每一轮是继续训练还是重新训练
+
+Round 0 没有旧模型，因此从随机初始化开始训练。
+
+后续轮次会加载上一轮的 `best.pt` 作为初始网络，这叫 warm-start：
+
+```text
+上一轮 best.pt
+      ↓ 加载模型权重
+新一轮模型
+      ↓ 使用新旧数据继续监督训练
+新的 best.pt
+```
+
+只继承网络权重，不继承 optimizer 和学习率调度器。这样既保留上一轮已经学会的棋形，又让新一轮训练有干净的优化状态。
+
+默认网络为 128 个 hidden channels、8 个残差块：
+
+- Round 0 学习率：`3e-4`；
+- 后续轮次学习率：`1e-4`；
+- batch size：256；
+- 最多 100 epoch；
+- 连续 10 个 epoch 没有更好的 checkpoint 时停止。
+
+## 11. 为什么不能只看验证集准确率
+
+普通验证集准确率回答的是：
+
+> 对于和训练数据比较相似的单个状态，Agent 有多少次选择了专家 top-1？
+
+它不能完整回答：
+
+> Agent 连续下完整盘棋时，早期错误会不会积累？
+
+所以当前实现会在 bootstrap 后建立一个固定 challenge bank，并且以后不能把这些状态加入训练集。
+
+Challenge bank 包含：
+
+- 20,000 个扰动开局产生的带外状态；
+- 2,000 个一步必胜状态；
+- 2,000 个必须封堵状态；
+- 1,000 个 fork 或 block-fork 状态；
+- 500 条合法对局前缀。
+
+每轮还会在本轮 Agent 真正访问的 DAgger 数据上进行 rollout audit。
+
+## 12. 怎样判断“达到专家水平”
+
+必须连续两轮同时通过以下门槛：
+
+| 指标 | 要求 | 它在检查什么 |
+|---|---:|---|
+| 非法动作 | 0 | 基本正确性 |
+| OOD top-1 一致率 | ≥85% | 带外局面首选动作模仿程度 |
+| OOD top-4 一致率 | ≥97% | 是否至少选择了专家认可的动作 |
+| 必胜/必堵正确率 | ≥99.5% | 关键战术不能犯错 |
+| fork top-4 | ≥98% | 双杀相关战术 |
+| 当前 rollout top-4 | ≥95% | 当前 Agent 自己访问的局面 |
+| 对专家 score rate | 黑白均 ≥45% | 实际对战水平 |
+| score 95% 区间下界 | ≥40% | 避免少量对局造成偶然高分 |
+| 决胜局比例 | ≥20% | 避免全部和棋造成假通过 |
+
+对战评测不会总是从空棋盘开始，而是先重放 challenge bank 中的 500 条合法前缀，再让 Agent 和确定性的 top-1 专家继续下完。
+
+每条前缀都会交换 Agent 的黑白身份。
+
+## 13. “冻结专家”具体是什么意思
+
+你可以把当前专家理解为一份普通的、手写的启发式程序。它不会学习，也不会因为 DAgger 进行了新一轮就自动改变。
+
+在当前 pipeline 中，从 Bootstrap 到最后一轮 DAgger，调用的始终都是同一个 `HeuristicAgent`：
+
+```text
+同一个棋盘 + 同一个执棋方
+          ↓
+heuristic-v1
+          ↓
+相同的候选动作及排名
+```
+
+因此，“冻结”不是说程序原本会自行变化，需要在运行时把它锁住；它是一条贯穿整个实验的开发约定：**一旦开始生成这次实验的数据，就不再修改专家的决策含义。**
+
+### 什么情况属于没有冻结
+
+例如训练到第三轮时，开发者发现专家棋力还可以提高，于是直接修改了以下任意内容：
+
+- 调整棋形评分权重；
+- 改变“必胜、必堵、双杀、普通评分”的判断顺序；
+- 增加一层搜索；
+- 改变同分动作的排序规则；
+- 修改 `max_candidates` 或 top-k 的含义。
+
+这时，旧数据由旧专家标注，新数据由新专家标注。同一个棋盘就可能出现两套不同答案：
+
+```text
+旧专家：40 > 39 > 41 > 31
+新专家：39 > 40 > 31 > 41
+```
+
+如果仍把它们当成同一批监督数据混合训练，标签就可能互相冲突；评测时也说不清 Agent 到底应该模仿哪个版本。这就是“专家没有冻结”。
+
+### 当前代码怎样表示这项约定
+
+当前专家被明确命名为 `heuristic-v1`。数据集和 checkpoint 会保存版本、`max_candidates`、top-k 及由这些配置生成的 identity hash。训练时发现身份不一致，就拒绝混用。
+
+需要注意：这个 hash 用来识别声明的版本和配置，并不会自动扫描专家全部源代码。因此，如果确实修改了专家的决策逻辑，也必须把版本升级为 `heuristic-v2`，并重新生成与它配套的数据和 challenge bank。相关黄金局面测试则负责发现“代码变了但输出不该变”的意外回归。
+
+允许修改的是不影响答案的性能实现。例如把重复计算改成缓存，只要对黄金局面的 top-k 排名、战术原因都完全一致，它仍然属于 `heuristic-v1`。当前缓存优化就是这种情况：它只让标注更快，不改变专家认为哪一步更好。
+
+简而言之：
+
+> 当前专家自始至终确实是一致的；“冻结”是在强调我们有意保证并检查这种一致性，而不是说专家本身也在训练。
+
+## 14. 运行完整训练
+
+先激活环境：
 
 ```bash
-tensorboard --logdir BC/runs/<run-name>
+conda activate mygames
 ```
 
-TensorBoard 会把六个子目录显示为带步骤名的 run，但它们都归属于同一个顶层实验目录。产数步骤记录上述三项 `Diversity/*` 指标，以及样本量、缓存命中率、专家查询吞吐和写盘耗时；训练步骤按 epoch 记录 loss、accuracy、合法动作率、吞吐和学习率；评测步骤记录黑白双方的胜负和、得分率、决定局比例、平均局长和非法动作数。
-
-对局数不少于 100 时，pipeline 会拒绝满足任一条件的数据：有效轨迹比例低于 1%、最大轨迹占比高于 50%、状态唯一比例低于 0.1%。被拒绝的数据写入 `status: rejected` 后立即停止，不会进入训练。建议先以 `EXPERT_GAMES=1000` 做 5×5 pilot。
-
-### 第一步：生成 5×5 初始专家数据
+开始一个正式 run：
 
 ```bash
-conda run -n mygames python BC/generate.py \
-  --output BC/data/5x5-expert-v1 --mode expert --board-size 5 \
-  --games 10000 --workers 16 --seed 0
+bash BC/run_pipeline.sh 9x9-quality-v1
 ```
 
-### 第二步：训练第一版 BC
+等价命令：
 
 ```bash
-conda run -n mygames python BC/train.py \
-  --data-dir BC/data/5x5-expert-v1 \
-  --run-name 5x5-bc-v1 --board-size 5
+python BC/pipeline.py --run-name 9x9-quality-v1
 ```
 
-### 第三步：分别执黑、执白评测
+查看参数：
 
 ```bash
-conda run -n mygames python BC/eval.py \
-  --checkpoint BC/checkpoints/5x5-bc-v1/best.pt \
-  --board-size 5 --games-per-color 200 --workers 8 --seed 10000
+python BC/pipeline.py --help
 ```
 
-评测输出胜、负、和、原始胜率、得分率 `win + 0.5 × draw`、决定局比例、95% 置信区间、平均局长和非法动作数。只有黑白双方得分率均在 45%–55% 且决定局比例至少 20% 时才通过；100% 和棋不会再被判定成功。
+默认使用 16 个数据生成进程，并要求 CUDA 可用。正式训练预计需要数天。
 
-### 第四步：生成一轮聚合数据
+可以通过环境变量调整常用配置：
 
 ```bash
-conda run -n mygames python BC/generate.py \
-  --output BC/data/5x5-aggregate-v2 --mode aggregate --board-size 5 \
-  --checkpoint BC/checkpoints/5x5-bc-v1/best.pt \
-  --games 5000 --workers 16 --seed 0
+GEN_WORKERS=16 \
+EVAL_WORKERS=16 \
+TRAIN_WORKERS=4 \
+EPOCHS=100 \
+BATCH_SIZE=256 \
+bash BC/run_pipeline.sh 9x9-quality-v1
 ```
 
-### 第五步：混合基础数据与聚合数据训练
+## 15. 中断后怎样恢复
+
+使用相同的 run name 重新执行即可：
 
 ```bash
-conda run -n mygames python BC/train.py \
-  --data-dir BC/data/5x5-expert-v1 BC/data/5x5-aggregate-v2 \
-  --aggregate-max-samples 100000 \
-  --run-name 5x5-bc-v2 --board-size 5
+bash BC/run_pipeline.sh 9x9-quality-v1
 ```
 
-pipeline 会在第六步自动评测 `5x5-bc-v2/best.pt`。如果仍未达到目标，就用 BC-v2 生成 `aggregate-v3`，训练时同时传入基础数据和需要保留的各轮聚合数据。
+Pipeline 会：
 
-## 7. 目录职责
+- 跳过已经完整生成的数据集；
+- 如果某轮存在 `latest.pt`，从该 checkpoint 恢复；
+- 已完成的复合评测不会重复运行；
+- 从 `pipeline_state` 中读取当前状态。
 
-- `generate.py`：专家自博弈与 BC–专家聚合产数；
-- `cache.py`：持久化专家查询缓存；
-- `symmetry.py`：棋盘 canonicalization、旋转/镜像与动作坐标变换；
-- `diversity.py`：产数后计算 canonical 轨迹和状态多样性；
-- `dataset.py`：读取 shard、整局切分、三通道编码和在线增强；
-- `network.py`：全卷积残差策略网络；
-- `agent.py`：checkpoint 加载、批量推理和合法动作 mask；
-- `train.py`：监督训练、验证、early stopping 和 checkpoint；
-- `eval.py`：分别执黑、执白对战启发式专家。
-- `sampling.py`：专家、BC、play 和 eval 共用的 rank-softmax 与战术检测；
-- `run_pipeline.sh`：串联六个步骤、组织统一日志、质量门禁和中断恢复。
+数据集完成后被视为不可变。如果要修改生成参数，应使用新的 run name，而不是覆盖旧数据。
 
-## 8. 对弈与独立评测
+## 16. 产物放在哪里
 
-`BC/` 自带启发式机器人和 checkpoint 解析，不会引用 `DQN/` 下的实现。`play.py` 和 `eval.py` 只共享 `BC/` 自己的网络、agent 和专家代码，以及项目公共的 `env/` 棋盘环境。
+```text
+BC/
+├── data/<run>/
+│   ├── round_00_bootstrap/
+│   ├── round_01_dagger/
+│   ├── round_02_dagger/
+│   └── challenge_v1.npz
+├── checkpoints/<run>/
+│   ├── round_00/best.pt
+│   ├── round_01/best.pt
+│   └── ...
+├── evaluations/<run>/
+│   ├── round_00.json
+│   └── ...
+├── runs/<run>/              # TensorBoard 和 console.log
+└── pipeline_state/<run>/state.json
+```
 
-### 人类对战 BC
+主要观察内容：
 
-默认从指定 pipeline run 中选择序号最大的阶段（通常是 `05_bc_v2/best.pt`）：
+- `data/.../metadata.json`：样本数量、来源、覆盖率和专家版本；
+- `data/.../diversity.json`：棋盘状态与轨迹多样性；
+- `checkpoints/.../best.pt`：本轮最佳模型；
+- `evaluations/...json`：复合验收结果；
+- `pipeline_state/.../state.json`：当前轮次、连续通过次数和最终状态。
+
+TensorBoard：
 
 ```bash
-python BC/play.py --run-name 5x5-production --board-size 5
+tensorboard --logdir BC/runs/9x9-quality-v1
 ```
 
-也可以固定阶段、checkpoint 类型或直接路径：
+## 17. 训练过程中重点看什么
+
+### 17.1 TensorBoard 中最重要的三条曲线
+
+在每个 `round_XX_train` run 中，优先观察以下三条 `Challenge/*` 曲线：
+
+| TensorBoard 曲线 | 目标 | 含义 |
+|---|---:|---|
+| `Challenge/tactical_accuracy` | ≥99.5% | 一步必胜和必须封堵局面的 top-1 正确率 |
+| `Challenge/ood_accuracy` | ≥85% | 固定挑战集中带外局面的专家 top-1 一致率 |
+| `Challenge/ood_top4_accuracy` | ≥97% | 带外局面中，Agent 是否至少选择了专家认可的 top-4 动作 |
+
+它们比 `Train/loss` 或普通的 `Validation/accuracy` 更能反映 DAgger 是否真的提升了 Agent 在自身行为分布上的表现。
+
+训练代码选择 `best.pt` 时使用以下字典序：
+
+```text
+战术正确率是否达到 99.5%
+          ↓
+Challenge OOD top-1
+          ↓
+Challenge OOD top-4
+          ↓
+Challenge loss
+```
+
+因此，`latest.pt` 只是最近一个 epoch 的恢复点，并不一定比 `best.pt` 更强。某一条曲线的单独最高点也不一定对应 `best.pt`，因为 checkpoint 是按上面的组合顺序选出的。
+
+`Train/loss`、`Validation/loss` 和学习率仍然值得观察，它们主要用于判断是否收敛、是否过拟合以及学习率是否下降，不应代替上面三条 challenge 曲线。
+
+### 17.2 TensorBoard 不是完整的棋力验收
+
+TensorBoard 中的训练曲线只评估单个棋盘状态。每轮训练结束后，还必须查看：
+
+```text
+BC/evaluations/<run>/round_XX.json
+```
+
+这个文件还包含：
+
+- `rollout_audit.top4_accuracy`：本轮 Agent 实际访问局面的 top-4 一致率；
+- `matches.colors.black/white.score_rate`：Agent 分别执黑、执白时对专家的得分率；
+- `score_rate_ci95`：得分率的 95% 置信区间；
+- `decisive_game_rate`：非和棋比例；
+- `passed`：本轮是否通过第 12 节定义的完整复合门槛。
+
+最终是否达到目标应以这个 JSON 的复合评测为准，不能仅根据 loss 下降或某一条 TensorBoard 曲线上升作判断。
+
+以仓库现有的 `9x9-quality-v1/round_01.json` 为例：战术正确率为 96.39%，OOD top-1 为 75.27%，OOD top-4 为 95.92%；Agent 对专家执黑得分率为 55.9%，执白得分率为 39.1%，所以该轮的 `passed` 为 `false`。这个例子也说明，单看执黑表现或 rollout 指标可能高估整体棋力，必须同时检查固定挑战集和黑白双方的对局结果。
+
+## 18. 训练过程中怎样体验 checkpoint
+
+`play.py` 可以在 pipeline 继续运行时加载已经保存的 checkpoint。为了避免和训练争抢 GPU，阶段性体验时建议使用 CPU。
+
+例如，体验第一轮 DAgger 的最佳模型：
 
 ```bash
-python BC/play.py --run-name 5x5-production --stage 02_bc_v1 \
-  --checkpoint-name latest.pt --board-size 5
-
-python BC/play.py \
-  --checkpoint BC/checkpoints/5x5-production/05_bc_v2/best.pt \
-  --board-size 5 --bc-policy greedy
+conda run -n mygames python BC/play.py \
+  --run-name 9x9-quality-v1 \
+  --stage round_01 \
+  --checkpoint-name best.pt \
+  --board-size 9 \
+  --device cpu \
+  --bc-policy greedy
 ```
 
-人类固定执黑，BC 执白。BC 默认在前几步从网络 logits 排名前列的合法动作中受控采样；`--bc-policy greedy` 用于确定性复现。也可以直接与 BC 内置的启发式专家对弈：
+比较 DAgger 前后的体验时，分别启动对应轮次：
 
 ```bash
-python BC/play.py --opponent heuristic --board-size 5
+# Bootstrap 模型
+conda run -n mygames python BC/play.py \
+  --run-name 9x9-quality-v1 \
+  --stage round_00 \
+  --checkpoint-name best.pt \
+  --board-size 9 \
+  --device cpu \
+  --bc-policy greedy
+
+# 第一轮 DAgger 模型
+conda run -n mygames python BC/play.py \
+  --run-name 9x9-quality-v1 \
+  --stage round_01 \
+  --checkpoint-name best.pt \
+  --board-size 9 \
+  --device cpu \
+  --bc-policy greedy
 ```
 
-### 单 checkpoint 对启发式专家
+当新一轮正在训练且已经生成 `latest.pt` 时，可以体验当前 epoch：
 
 ```bash
-python BC/eval.py \
-  --checkpoint BC/checkpoints/5x5-production/05_bc_v2/best.pt \
-  --board-size 5 --games 200 --workers 8
+conda run -n mygames python BC/play.py \
+  --run-name 9x9-quality-v1 \
+  --stage round_02 \
+  --checkpoint-name latest.pt \
+  --board-size 9 \
+  --device cpu \
+  --bc-policy greedy
 ```
 
-### 评测一个 run 的所有阶段
+选择 checkpoint 时遵循以下原则：
 
-默认寻找该 run 下所有 `best.pt`，因此会依次评测 `02_bc_v1`、`05_bc_v2` 等阶段：
+- 阶段性验收和跨轮比较使用 `best.pt`；
+- 只想感受当前训练进度时使用 `latest.pt`；
+- 显式指定 `--stage`，避免新一轮 checkpoint 出现后默认解析结果发生变化；
+- checkpoint 使用临时文件加原子替换保存，训练期间读取已完成的文件不会读到半写状态；
+- `play.py` 启动时只加载一次 checkpoint，不会自动热更新。想体验更新后的 epoch，需要退出并重新启动。
+
+`--bc-policy greedy` 每一步都选择最高 logit 动作，与正式 challenge 对局的 argmax 策略一致，适合严谨比较不同 checkpoint。若想体验更有变化的开局，可以使用：
 
 ```bash
-python BC/eval.py --run-name 5x5-production \
-  --checkpoint-kind best --board-size 5 --games 200
+conda run -n mygames python BC/play.py \
+  --run-name 9x9-quality-v1 \
+  --stage round_01 \
+  --checkpoint-name best.pt \
+  --board-size 9 \
+  --device cpu \
+  --bc-policy controlled \
+  --play-seed 0
 ```
 
-`--checkpoint-kind` 还支持 `latest` 和 `all`。
+`controlled` 默认只在 Agent 的前 6 手从 top-4 中受控采样；遇到一步必胜或必须封堵时会强制使用 greedy 动作。固定 `--play-seed` 可以让采样过程可复现。
 
-### 两个 BC checkpoint 直接对弈
+当前 `play.py` 固定人类执黑、Agent 执白。因此它适合直观感受 Agent 的白棋防守与应对能力，但不能代替同时交换黑白身份的正式评测。Agent 执黑和执白的完整结果仍应查看 `evaluations/<run>/round_XX.json`。
 
-以下命令会交换执子，各评测 `--games` 局：
+## 19. 各文件负责什么
+
+| 文件 | 作用 |
+|---|---|
+| `heuristic_agent.py` | 启发式专家的具体棋力逻辑 |
+| `oracle.py` | 固定专家版本、原因和数据编码 |
+| `generate.py` | Bootstrap 和 DAgger 对局、专家标注 |
+| `cache.py` | 专家查询缓存和跨轮合并 |
+| `dataset.py` | 读取数据、旋转镜像增强、过滤 challenge |
+| `train.py` | top-1/top-4 监督训练和 checkpoint |
+| `challenge.py` | 建立固定测试集并执行复合验收 |
+| `diversity.py` | 统计状态、轨迹、阶段和来源多样性 |
+| `pipeline.py` | 串联多轮训练并负责恢复和停止 |
+| `eval.py` | 传统的空棋盘对专家评测 |
+| `play.py` | 人类与 BC Agent 对弈 |
+
+## 20. 常见疑问
+
+### DAgger 是不是强化学习？
+
+不是。DAgger 改变的是训练数据从哪里来，网络更新仍然使用监督学习和交叉熵。
+
+### Agent 实际走错的动作会不会成为标签？
+
+不会。错误动作只负责把棋局带到 Agent 容易访问的状态，监督标签始终来自专家。
+
+### 为什么还要保留 bootstrap 数据？
+
+只训练最新的异常局面可能让 Agent 忘记正常专家棋形。保留 bootstrap 可以防止这种遗忘。
+
+### top-4 会不会让 Agent 学得不坚定？
+
+top-1 仍占损失的 70%。top-4 只是告诉网络：第二、第三候选比完全错误的动作更合理。必胜和必堵仍然使用明确硬标签。
+
+### 为什么不一直生成更多随机局面？
+
+完全随机的棋盘可能很不自然。当前实现只生成按照规则一步步走出来的合法局面，并优先在已有棋子附近进行扰动。
+
+### 旧的 5×5 数据还能用吗？
+
+旧格式仍可读取，但新的质量优先 pipeline 固定为 9×9，不会把旧 5×5 数据混入 9×9 训练。
+
+## 21. 运行测试
 
 ```bash
-python BC/eval.py --checkpoint-a A.pt --checkpoint-b B.pt \
-  --board-size 5 --games 200 --workers 8
+python -m pytest -q
 ```
 
-新增文件职责：
-
-- `heuristic_agent.py`：BC 本地启发式专家；
-- `checkpoints.py`：解析 pipeline run、阶段和 checkpoint；
-- `play.py`：人类对战 BC 或启发式专家。
+普通测试会检查专家输出、top-k loss、数据格式、cache、challenge 隔离和 pipeline 参数。完整的 9×9 多轮训练属于长时间任务，不会在单元测试中自动运行。

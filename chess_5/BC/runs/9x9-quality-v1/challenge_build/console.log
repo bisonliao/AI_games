@@ -1,0 +1,18 @@
+{
+  "format_version": 1,
+  "source_data": "/home/bison/mygames/chess_5/BC/data/9x9-quality-v1/round_00_bootstrap",
+  "samples": 23401,
+  "ood_states": 20000,
+  "tactical_counts": {
+    "win": 2000,
+    "block": 2000,
+    "fork": 1000
+  },
+  "prefixes": 500,
+  "oracle": {
+    "max_candidates": 12,
+    "sha256": "067ae1f3b30436556e34552d7388a25bf8ce8618a97662790c6e1c21baf903bc",
+    "top_k": 4,
+    "version": "heuristic-v1"
+  }
+}

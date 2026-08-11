@@ -18,7 +18,7 @@ from BC.checkpoints import resolve_checkpoint
 from BC.heuristic_agent import HeuristicAgent
 from BC.sampling import (has_immediate_win_or_block, ranked_legal_actions,
                          rank_softmax_action)
-from env import GomokuEnv
+from gomoku_env import GomokuEnv
 
 
 DEFAULT_CHECKPOINT_ROOT = Path(__file__).resolve().parent / "checkpoints"

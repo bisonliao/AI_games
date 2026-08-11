@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -18,16 +19,65 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from BC.agent import BCAgent
-from BC.cache import ExpertCache
+from BC.cache import ExpertCache, merge_caches
 from BC.diversity import analyze_shards, assess_diversity, canonical_trajectory_hash
+from BC.oracle import (DATA_FORMAT_VERSION, DEFAULT_ORACLE_TOP_K, REASON_TO_ID,
+                       SOURCE_TO_ID, encode_decision, oracle_identity)
 from BC.sampling import has_immediate_win_or_block, ranked_legal_actions, rank_softmax_action
-from env import GomokuEnv
+from BC.symmetry import canonicalize
+from gomoku_env import GomokuEnv
 
 
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
     os.replace(temporary, path)
+
+
+def _local_random_action(board: np.ndarray, action_mask: np.ndarray,
+                         rng: np.random.Generator) -> int:
+    size = board.shape[0]
+    legal = np.flatnonzero(np.asarray(action_mask, dtype=bool).reshape(-1))
+    occupied = np.argwhere(board != 0)
+    if occupied.size == 0:
+        margin = max(0, (size - 5) // 2)
+        central = [int(action) for action in legal
+                   if margin <= int(action) // size < size - margin
+                   and margin <= int(action) % size < size - margin]
+        legal = np.asarray(central or legal.tolist(), dtype=np.int64)
+    else:
+        nearby = []
+        for action in legal:
+            row, col = divmod(int(action), size)
+            if np.min(np.max(np.abs(occupied - np.asarray([row, col])), axis=1)) <= 2:
+                nearby.append(int(action))
+        if nearby:
+            legal = np.asarray(nearby, dtype=np.int64)
+    return int(rng.choice(legal))
+
+
+def _policy_action(policy: BCAgent, board: np.ndarray, player: int,
+                   action_mask: np.ndarray, rng: np.random.Generator,
+                   task: dict[str, Any]) -> int:
+    logits = policy.action_logits(board, [player])[0]
+    ranked = ranked_legal_actions(logits, action_mask)
+    move_index = int(np.count_nonzero(board == player))
+    return rank_softmax_action(
+        ranked, move_index, rng, top_k=int(task.get("bc_top_k", 4)),
+        temperature=float(task.get("bc_temperature", 1.0)),
+        stochastic_moves=int(task.get("bc_stochastic_moves", 8)),
+        force_greedy=has_immediate_win_or_block(board, player, action_mask),
+    )
+
+
+def _behavior_source(mode: str, worker: int, local_game: int) -> str:
+    slot = (worker * 997 + local_game) % (4 if mode in ("expert", "bootstrap") else 10)
+    if mode in ("expert", "bootstrap"):
+        return ("expert_selfplay" if slot < 2 else
+                "perturbed_opening" if slot == 2 else "epsilon_expert")
+    return ("policy_expert" if slot < 4 else
+            "policy_selfplay" if slot < 7 else
+            "policy_history" if slot < 9 else "epsilon_policy")
 
 
 def _worker(task: dict[str, Any]) -> dict[str, Any]:
@@ -38,49 +88,114 @@ def _worker(task: dict[str, Any]) -> dict[str, Any]:
     output = Path(task["output"]); shard = output / f"shard-{worker:05d}.npz"
     if shard.exists():
         with np.load(shard) as old:
-            if "trajectory_groups" not in old:
+            if "trajectory_groups" not in old or (
+                    int(task.get("data_format_version", DATA_FORMAT_VERSION)) >= 3
+                    and "candidate_actions" not in old):
                 raise ValueError(f"old-format partial shard cannot be resumed: {shard}")
             return {"shard": shard.name, "samples": int(len(old["actions"])),
                     "games": int(task["games"]), "hits": 0, "misses": 0,
                     "expert_queries": 0, "seconds": 0.0, "resumed": True}
 
+    mode = str(task["mode"])
+    is_dagger = mode in ("aggregate", "dagger")
     policy = None
-    if task["mode"] == "aggregate":
+    if is_dagger:
         policy = BCAgent(board_size, device="cpu")
         policy.load_checkpoint(Path(task["checkpoint"])); policy.net.eval()
+    history_paths = [Path(path) for path in task.get("history_checkpoints", [])]
+    history_agents: dict[Path, BCAgent] = {}
     policy_rng = np.random.default_rng(seed + 424_242)
     boards: list[np.ndarray] = []; players: list[int] = []; actions: list[int] = []
     game_ids: list[int] = []; trajectory_groups: list[bytes] = []
+    candidate_actions: list[np.ndarray] = []; candidate_counts: list[int] = []
+    tacticals: list[bool] = []; reasons: list[int] = []; plies: list[int] = []
+    sources: list[int] = []; rounds: list[int] = []; behavior_actions: list[int] = []
+    canonical_keys: list[bytes] = []
     cache_path = Path(task["cache_dir"]) / f"cache-{worker:03d}.sqlite3"
     started = time.perf_counter()
     with ExpertCache(cache_path, board_size, int(task["max_candidates"]), seed,
                      top_k=int(task.get("expert_top_k", 4)),
                      temperature=float(task.get("expert_temperature", 1.5)),
-                     stochastic_moves=int(task.get("expert_stochastic_moves", 6))) as expert:
+                     stochastic_moves=int(task.get("expert_stochastic_moves", 6)),
+                     shared_path=(Path(task["shared_cache"])
+                                  if task.get("shared_cache") else None)) as expert:
         for local_game in range(int(task["games"])):
             game_id = (worker << 32) | local_game
             env = GomokuEnv(board_size=board_size, starting_player="black",
                             illegal_action_mode="raise")
             obs, _ = env.reset(seed=seed + local_game)
             learner_player = 1 if (worker + local_game) % 2 == 0 else -1
+            source = str(task.get("behavior_source") or
+                         _behavior_source(mode, worker, local_game))
+            random_prefix = int(policy_rng.integers(2, 11)) if source == "perturbed_opening" else 0
+            history = None
+            if source == "policy_history" and history_paths:
+                history_path = history_paths[int(policy_rng.integers(len(history_paths)))]
+                history = history_agents.get(history_path)
+                if history is None:
+                    history = BCAgent(board_size, device="cpu")
+                    history.load_checkpoint(history_path); history.net.eval()
+                    history_agents[history_path] = history
             start = len(boards); done = False
             while not done:
                 board = obs["board"].copy(); player = int(obs["current_player"][0])
-                expert_action = expert.label(board, player)
-                boards.append(board); players.append(player); actions.append(expert_action)
-                game_ids.append(game_id); actual_action = expert_action
-                if policy is not None and player == learner_player:
-                    logits = policy.action_logits(board, [player])[0]
-                    ranked = ranked_legal_actions(logits, obs["action_mask"])
-                    move_index = int(np.count_nonzero(board == player))
+                decision = expert.decision(board, player)
+                encoded, candidate_count, reason, tactical = encode_decision(
+                    decision, DEFAULT_ORACLE_TOP_K
+                )
+                expert_action = int(decision.actions[0])
+                actual_action = expert_action
+                move_index = int(np.count_nonzero(board == player))
+                if source == "perturbed_opening" and int(np.count_nonzero(board)) < random_prefix:
+                    actual_action = _local_random_action(board, obs["action_mask"], policy_rng)
+                elif source == "epsilon_expert":
+                    if not tactical and policy_rng.random() < 0.15:
+                        actual_action = _local_random_action(board, obs["action_mask"], policy_rng)
+                    else:
+                        actual_action = rank_softmax_action(
+                            decision.actions, move_index, policy_rng,
+                            top_k=int(task.get("expert_top_k", 4)),
+                            temperature=float(task.get("expert_temperature", 1.5)),
+                            stochastic_moves=int(task.get("expert_stochastic_moves", 6)),
+                            force_greedy=tactical,
+                        )
+                elif source == "expert_selfplay":
                     actual_action = rank_softmax_action(
-                        ranked, move_index, policy_rng,
-                        top_k=int(task.get("bc_top_k", 4)),
-                        temperature=float(task.get("bc_temperature", 1.0)),
-                        stochastic_moves=int(task.get("bc_stochastic_moves", 6)),
-                        force_greedy=has_immediate_win_or_block(
-                            board, player, obs["action_mask"]),
+                        decision.actions, move_index, policy_rng,
+                        top_k=int(task.get("expert_top_k", 4)),
+                        temperature=float(task.get("expert_temperature", 1.5)),
+                        stochastic_moves=int(task.get("expert_stochastic_moves", 6)),
+                        force_greedy=tactical,
                     )
+                elif source == "policy_expert":
+                    if player == learner_player:
+                        actual_action = _policy_action(
+                            policy, board, player, obs["action_mask"], policy_rng, task
+                        )
+                elif source == "policy_selfplay":
+                    actual_action = _policy_action(
+                        policy, board, player, obs["action_mask"], policy_rng, task
+                    )
+                elif source == "policy_history":
+                    actor = policy if player == learner_player or history is None else history
+                    actual_action = _policy_action(
+                        actor, board, player, obs["action_mask"], policy_rng, task
+                    )
+                elif source == "epsilon_policy":
+                    if not tactical and policy_rng.random() < 0.10:
+                        actual_action = _local_random_action(board, obs["action_mask"], policy_rng)
+                    else:
+                        actual_action = _policy_action(
+                            policy, board, player, obs["action_mask"], policy_rng, task
+                        )
+                boards.append(board); players.append(player); actions.append(expert_action)
+                candidate_actions.append(encoded); candidate_counts.append(candidate_count)
+                tacticals.append(tactical); reasons.append(reason)
+                plies.append(int(np.count_nonzero(board))); sources.append(SOURCE_TO_ID[source])
+                rounds.append(int(task.get("dagger_round", 0)))
+                behavior_actions.append(actual_action)
+                canonical_keys.append(canonicalize(board, player)[0])
+                game_ids.append(game_id)
                 obs, _, terminated, truncated, _ = env.step(actual_action)
                 done = terminated or truncated
             env.close()
@@ -93,6 +208,15 @@ def _worker(task: dict[str, Any]) -> dict[str, Any]:
     arrays = {"boards": np.asarray(boards, dtype=np.int8),
               "players": np.asarray(players, dtype=np.int8),
               "actions": np.asarray(actions, dtype=np.int16),
+              "candidate_actions": np.asarray(candidate_actions, dtype=np.int16),
+              "candidate_counts": np.asarray(candidate_counts, dtype=np.int8),
+              "tactical": np.asarray(tacticals, dtype=np.bool_),
+              "reasons": np.asarray(reasons, dtype=np.int8),
+              "plies": np.asarray(plies, dtype=np.int16),
+              "sources": np.asarray(sources, dtype=np.int8),
+              "rounds": np.asarray(rounds, dtype=np.int8),
+              "behavior_actions": np.asarray(behavior_actions, dtype=np.int16),
+              "canonical_keys": np.asarray(canonical_keys, dtype="S32"),
               "games": np.asarray(game_ids, dtype=np.int64),
               "trajectory_groups": np.asarray(trajectory_groups, dtype="S32")}
     temporary = shard.with_suffix(".tmp.npz"); write_started = time.perf_counter()
@@ -110,10 +234,18 @@ def _worker(task: dict[str, Any]) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate offline Gomoku expert labels.")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--mode", choices=("expert", "aggregate"), default="expert")
+    parser.add_argument("--mode", choices=("expert", "aggregate", "bootstrap", "dagger"),
+                        default="expert")
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--board-size", type=int, default=5)
     parser.add_argument("--games", type=int, default=10_000)
+    parser.add_argument("--min-games", type=int, default=0)
+    parser.add_argument("--max-games", type=int, default=0)
+    parser.add_argument("--target-new-states", type=int, default=0)
+    parser.add_argument("--target-win-states", type=int, default=0)
+    parser.add_argument("--target-block-states", type=int, default=0)
+    parser.add_argument("--target-fork-states", type=int, default=0)
+    parser.add_argument("--batch-games", type=int, default=250)
     parser.add_argument("--workers", type=int, default=min(16, max(1, (os.cpu_count() or 2) - 2)))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-candidates", type=int, default=12)
@@ -124,7 +256,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expert-stochastic-moves", type=int, default=6)
     parser.add_argument("--bc-top-k", type=int, default=4)
     parser.add_argument("--bc-temperature", type=float, default=1.0)
-    parser.add_argument("--bc-stochastic-moves", type=int, default=6)
+    parser.add_argument("--bc-stochastic-moves", type=int, default=8)
+    parser.add_argument("--dagger-round", type=int, default=0)
+    parser.add_argument("--history-checkpoint", type=Path, action="append", default=[])
+    parser.add_argument("--previous-data-dir", type=Path, action="append", default=[])
+    parser.add_argument("--shared-cache", type=Path, default=None)
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--tb-dir", type=Path, default=None)
     parser.add_argument("--quality-gate", action="store_true")
@@ -136,14 +272,67 @@ def parse_args() -> argparse.Namespace:
 
 
 def _identity(args: argparse.Namespace, workers: int) -> dict[str, Any]:
-    return {"format_version": 2, "mode": args.mode, "board_size": args.board_size,
+    return {"format_version": DATA_FORMAT_VERSION, "mode": args.mode,
+            "board_size": args.board_size,
             "seed": args.seed, "games": args.games, "workers": workers,
+            "min_games": args.min_games, "max_games": args.max_games,
+            "target_new_states": args.target_new_states,
+            "target_win_states": args.target_win_states,
+            "target_block_states": args.target_block_states,
+            "target_fork_states": args.target_fork_states,
+            "batch_games": args.batch_games, "dagger_round": args.dagger_round,
             "max_candidates": args.max_candidates, "expert_top_k": args.expert_top_k,
             "expert_temperature": args.expert_temperature,
             "expert_stochastic_moves": args.expert_stochastic_moves,
             "bc_top_k": args.bc_top_k, "bc_temperature": args.bc_temperature,
             "bc_stochastic_moves": args.bc_stochastic_moves,
-            "checkpoint": str(args.checkpoint.resolve()) if args.checkpoint else None}
+            "checkpoint": str(args.checkpoint.resolve()) if args.checkpoint else None,
+            "history_checkpoints": [str(path.resolve()) for path in args.history_checkpoint],
+            "previous_data_dirs": [str(path.resolve()) for path in args.previous_data_dir],
+            "oracle": oracle_identity(max_candidates=args.max_candidates,
+                                      top_k=args.expert_top_k)}
+
+
+def _load_canonical_keys(data_dirs: list[Path]) -> set[bytes]:
+    keys: set[bytes] = set()
+    for root in data_dirs:
+        metadata = json.loads((Path(root) / "metadata.json").read_text())
+        for name in metadata.get("shards", []):
+            with np.load(Path(root) / name) as data:
+                if "canonical_keys" in data:
+                    plies = data["plies"] if "plies" in data else \
+                        np.count_nonzero(data["boards"], axis=(1, 2))
+                    keys.update(bytes(key) for key in data["canonical_keys"][plies >= 2])
+    return keys
+
+
+def _shard_new_keys(paths: list[Path], previous: set[bytes]) -> set[bytes]:
+    keys: set[bytes] = set()
+    for path in paths:
+        with np.load(path) as data:
+            plies = data["plies"] if "plies" in data else \
+                np.count_nonzero(data["boards"], axis=(1, 2))
+            keys.update(bytes(key) for key in data["canonical_keys"][plies >= 2]
+                        if bytes(key) not in previous)
+    return keys
+
+
+def _shard_coverage(paths: list[Path], previous: set[bytes]) -> dict[str, int]:
+    new_keys: set[bytes] = set()
+    counts = {"win": 0, "block": 0, "fork": 0}
+    for path in paths:
+        with np.load(path) as data:
+            plies = data["plies"]
+            new_keys.update(bytes(key) for key in data["canonical_keys"][plies >= 2]
+                            if bytes(key) not in previous)
+            reasons = np.asarray(data["reasons"])
+            counts["win"] += int(np.count_nonzero(reasons == REASON_TO_ID["win"]))
+            counts["block"] += int(np.count_nonzero(reasons == REASON_TO_ID["block"]))
+            counts["fork"] += int(np.count_nonzero(
+                (reasons == REASON_TO_ID["own_fork"])
+                | (reasons == REASON_TO_ID["block_fork"])
+            ))
+    return {"new_canonical_states": len(new_keys), **counts}
 
 
 def _write_tensorboard(args: argparse.Namespace, metadata: dict[str, Any], diversity: dict[str, Any],
@@ -157,11 +346,27 @@ def _write_tensorboard(args: argparse.Namespace, metadata: dict[str, Any], diver
     writer.add_scalar("Data/games", args.games, 0); writer.add_scalar("Data/samples", metadata["samples"], 0)
     writer.add_scalar("Data/cache_hit_rate", metadata["cache_hit_rate"], 0)
     writer.add_scalar("Data/expert_queries", metadata["expert_queries"], 0)
+    writer.add_scalar("Data/new_canonical_states", metadata.get("new_canonical_states", 0), 0)
     for tag, key in (("canonical_effective_trajectory_ratio", "canonical_effective_trajectory_ratio"),
                      ("dominant_canonical_trajectory_fraction", "dominant_canonical_trajectory_fraction"),
                      ("canonical_state_unique_ratio", "canonical_state_unique_ratio")):
         writer.add_scalar(f"Diversity/{tag}", diversity[key], 0)
     writer.add_scalar("Diversity/quality_gate_passed", float(quality["passed"]), 0)
+    writer.add_scalar("Diversity/canonical_state_duplicate_fraction",
+                      diversity.get("canonical_state_duplicate_fraction", 0), 0)
+    writer.add_scalar("Diversity/maximum_state_visit_fraction",
+                      diversity.get("maximum_state_visit_fraction", 0), 0)
+    writer.add_scalar("Diversity/top1_action_entropy",
+                      diversity.get("top1_action_entropy", 0), 0)
+    for phase, values in diversity.get("phase_coverage", {}).items():
+        for metric in ("samples", "canonical_unique_count", "canonical_effective_count",
+                       "canonical_entropy"):
+            writer.add_scalar(f"PhaseCoverage/{phase}/{metric}", values[metric], 0)
+    for group, values in (("Sources", diversity.get("source_counts", {})),
+                          ("Reasons", diversity.get("reason_counts", {})),
+                          ("Players", diversity.get("player_counts", {}))):
+        for name, value in values.items():
+            writer.add_scalar(f"{group}/{name}", value, 0)
     writer.add_text("Diversity/details", json.dumps({**diversity, "quality": quality},
                                                      ensure_ascii=False, indent=2), 0)
     for index, result in enumerate(results):
@@ -173,11 +378,12 @@ def _write_tensorboard(args: argparse.Namespace, metadata: dict[str, Any], diver
 
 def main() -> None:
     args = parse_args()
-    if not 5 <= args.board_size <= 9 or args.games < 1 or args.workers < 1:
+    if (not 5 <= args.board_size <= 9 or args.games < 1 or args.workers < 1
+            or args.batch_games < 1):
         raise ValueError("board size must be 5..9 and games/workers positive")
     if min(args.expert_top_k, args.bc_top_k) < 1 or min(args.expert_temperature, args.bc_temperature) < 0:
         raise ValueError("top-k must be positive and temperatures non-negative")
-    if args.mode == "aggregate" and args.checkpoint is None:
+    if args.mode in ("aggregate", "dagger") and args.checkpoint is None:
         raise ValueError("--checkpoint is required in aggregate mode")
     args.output.mkdir(parents=True, exist_ok=True); metadata_path = args.output / "metadata.json"
     workers = min(args.workers, args.games); identity = _identity(args, workers)
@@ -191,19 +397,63 @@ def main() -> None:
     metadata: dict[str, Any] = {**identity, "status": "running", "shards": [],
                                 "created_at": time.time()}
     atomic_json(metadata_path, metadata)
-    counts = [args.games // workers + (i < args.games % workers) for i in range(workers)]
-    tasks = [dict(vars(args), worker=i, games=counts[i], output=str(args.output),
-                  cache_dir=str(cache_dir)) for i in range(workers)]
+    previous_keys = _load_canonical_keys(args.previous_data_dir)
+    adaptive = args.target_new_states > 0
+    min_games = (args.min_games or (2_000 if args.mode == "bootstrap" else 1_000)) \
+        if adaptive else 0
+    max_games = args.max_games or args.games
+    total_goal = max_games if adaptive else args.games
+    if adaptive and min_games > total_goal:
+        raise ValueError("--min-games cannot exceed the generation game limit")
     results: list[dict[str, Any]] = []
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_worker, task) for task in tasks]
-        for future in as_completed(futures):
-            result = future.result(); results.append(result)
-            print(f"{result['shard']}: games={result['games']} samples={result['samples']} "
-                  f"cache={result['hits']}/{result['hits'] + result['misses']} "
-                  f"seconds={result['seconds']:.1f} q/s={result.get('queries_per_second', 0):.1f}", flush=True)
+        generated_games = 0; task_index = 0
+        while generated_games < total_goal:
+            wave = []
+            for _ in range(workers):
+                if generated_games >= total_goal:
+                    break
+                adaptive_task_games = max(1, math.ceil(args.batch_games / workers))
+                count = (min(adaptive_task_games, total_goal - generated_games)
+                         if adaptive else
+                         args.games // workers + (task_index < args.games % workers))
+                if count <= 0:
+                    break
+                task = dict(vars(args), worker=task_index, games=count,
+                            output=str(args.output), cache_dir=str(cache_dir),
+                            history_checkpoints=[str(path) for path in args.history_checkpoint],
+                            shared_cache=str(args.shared_cache) if args.shared_cache else None,
+                            data_format_version=DATA_FORMAT_VERSION)
+                wave.append(pool.submit(_worker, task))
+                generated_games += count; task_index += 1
+                if not adaptive and task_index >= workers:
+                    break
+            for future in as_completed(wave):
+                result = future.result(); results.append(result)
+                print(f"{result['shard']}: games={result['games']} samples={result['samples']} "
+                      f"cache={result['hits']}/{result['hits'] + result['misses']} "
+                      f"seconds={result['seconds']:.1f} q/s={result.get('queries_per_second', 0):.1f}", flush=True)
+            if adaptive and generated_games >= min_games:
+                paths = [args.output / item["shard"] for item in results]
+                coverage = _shard_coverage(paths, previous_keys)
+                print(f"coverage: games={generated_games} "
+                      f"new={coverage['new_canonical_states']}/{args.target_new_states} "
+                      f"win={coverage['win']}/{args.target_win_states} "
+                      f"block={coverage['block']}/{args.target_block_states} "
+                      f"fork={coverage['fork']}/{args.target_fork_states}", flush=True)
+                if (coverage["new_canonical_states"] >= args.target_new_states
+                        and coverage["win"] >= args.target_win_states
+                        and coverage["block"] >= args.target_block_states
+                        and coverage["fork"] >= args.target_fork_states):
+                    break
+            if not adaptive:
+                break
     results.sort(key=lambda item: item["shard"])
     shards = [args.output / result["shard"] for result in results]
+    coverage = _shard_coverage(shards, previous_keys)
+    new_state_count = coverage["new_canonical_states"]
+    shared_output = args.output / "cache" / "shared.sqlite3"
+    merge_caches(shared_output, sorted(cache_dir.glob("cache-*.sqlite3")))
     diversity = analyze_shards(shards)
     quality = assess_diversity(diversity, hard_min_games=args.quality_min_games,
                                min_effective_ratio=args.min_effective_trajectory_ratio,
@@ -235,9 +485,20 @@ def main() -> None:
     hits = sum(r["hits"] for r in results); misses = sum(r["misses"] for r in results)
     metadata.update({"status": "complete" if quality["passed"] or not args.quality_gate else "rejected",
                      "shards": [r["shard"] for r in results],
+                     "generated_games": sum(r["games"] for r in results),
                      "samples": sum(r["samples"] for r in results), "cache_hits": hits,
                      "cache_misses": misses, "cache_hit_rate": hits / max(1, hits + misses),
                      "expert_queries": sum(r["expert_queries"] for r in results),
+                     "new_canonical_states": new_state_count,
+                     "coverage_counts": coverage,
+                     "coverage_stalled": bool(
+                         args.target_new_states and (
+                             new_state_count < args.target_new_states
+                             or coverage["win"] < args.target_win_states
+                             or coverage["block"] < args.target_block_states
+                             or coverage["fork"] < args.target_fork_states
+                         )),
+                     "shared_cache": str(shared_output.relative_to(args.output)),
                      "diversity_file": "diversity.json", "diversity": diversity,
                      "quality": quality, "worker_results": results, "completed_at": time.time()})
     atomic_json(metadata_path, metadata); _write_tensorboard(args, metadata, diversity, quality, results)

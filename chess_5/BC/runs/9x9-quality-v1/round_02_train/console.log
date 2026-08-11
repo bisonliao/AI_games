@@ -1,0 +1,50 @@
+!!!!!!!!!!!!!!!! 数据多样性检查开始 !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据集：round_00_bootstrap !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 有效轨迹比例：24.71%（越高越好，表示真正不同的对局分支） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 最大单一轨迹占比：5.70%（越低越好，表示是否被一种对局垄断） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 独特状态比例：43.36%（越高越好，表示不同棋盘局面的覆盖程度） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据质量结论：可接受，多样性良好 !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据集：round_01_dagger !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 有效轨迹比例：19.50%（越高越好，表示真正不同的对局分支） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 最大单一轨迹占比：4.62%（越低越好，表示是否被一种对局垄断） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 独特状态比例：32.10%（越高越好，表示不同棋盘局面的覆盖程度） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据质量结论：可接受，多样性良好 !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据集：round_02_dagger !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 有效轨迹比例：21.22%（越高越好，表示真正不同的对局分支） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 最大单一轨迹占比：4.26%（越低越好，表示是否被一种对局垄断） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 独特状态比例：32.87%（越高越好，表示不同棋盘局面的覆盖程度） !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据质量结论：可接受，多样性良好 !!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!! 数据多样性检查结束 !!!!!!!!!!!!!!!!
+epoch=1 train_loss=0.4763 val_loss=0.6754 val_acc=0.791 legal=1.000 samples/s=7150
+epoch=2 train_loss=0.4690 val_loss=0.6677 val_acc=0.809 legal=1.000 samples/s=7277
+epoch=3 train_loss=0.4625 val_loss=0.6692 val_acc=0.797 legal=1.000 samples/s=7196
+epoch=4 train_loss=0.4572 val_loss=0.6668 val_acc=0.798 legal=1.000 samples/s=7155
+epoch=5 train_loss=0.4527 val_loss=0.6708 val_acc=0.809 legal=1.000 samples/s=7118
+epoch=6 train_loss=0.4481 val_loss=0.6653 val_acc=0.804 legal=1.000 samples/s=7217
+epoch=7 train_loss=0.4415 val_loss=0.6571 val_acc=0.808 legal=1.000 samples/s=7195
+epoch=8 train_loss=0.4398 val_loss=0.6720 val_acc=0.799 legal=1.000 samples/s=7108
+epoch=9 train_loss=0.4362 val_loss=0.6545 val_acc=0.802 legal=1.000 samples/s=7126
+epoch=10 train_loss=0.4328 val_loss=0.6507 val_acc=0.814 legal=1.000 samples/s=7045
+epoch=11 train_loss=0.4318 val_loss=0.6474 val_acc=0.807 legal=1.000 samples/s=6936
+epoch=12 train_loss=0.4269 val_loss=0.6551 val_acc=0.808 legal=1.000 samples/s=6835
+epoch=13 train_loss=0.4247 val_loss=0.6557 val_acc=0.812 legal=1.000 samples/s=7003
+epoch=14 train_loss=0.4250 val_loss=0.6405 val_acc=0.815 legal=1.000 samples/s=7004
+epoch=15 train_loss=0.4189 val_loss=0.6388 val_acc=0.814 legal=1.000 samples/s=6740
+epoch=16 train_loss=0.4181 val_loss=0.6518 val_acc=0.808 legal=1.000 samples/s=6636
+epoch=17 train_loss=0.4160 val_loss=0.6508 val_acc=0.813 legal=1.000 samples/s=6569
+epoch=18 train_loss=0.4123 val_loss=0.6464 val_acc=0.820 legal=1.000 samples/s=6966
+epoch=19 train_loss=0.4130 val_loss=0.6391 val_acc=0.828 legal=1.000 samples/s=7179
+epoch=20 train_loss=0.3961 val_loss=0.6341 val_acc=0.820 legal=1.000 samples/s=7104
+epoch=21 train_loss=0.3929 val_loss=0.6280 val_acc=0.821 legal=1.000 samples/s=7018
+epoch=22 train_loss=0.3898 val_loss=0.6282 val_acc=0.833 legal=1.000 samples/s=7131
+epoch=23 train_loss=0.3869 val_loss=0.6294 val_acc=0.823 legal=1.000 samples/s=7161
+epoch=24 train_loss=0.3866 val_loss=0.6245 val_acc=0.831 legal=1.000 samples/s=7127
+epoch=25 train_loss=0.3844 val_loss=0.6298 val_acc=0.832 legal=1.000 samples/s=7009
+epoch=26 train_loss=0.3827 val_loss=0.6254 val_acc=0.829 legal=1.000 samples/s=7146
+epoch=27 train_loss=0.3813 val_loss=0.6229 val_acc=0.831 legal=1.000 samples/s=6864
+epoch=28 train_loss=0.3806 val_loss=0.6275 val_acc=0.828 legal=1.000 samples/s=6813
+epoch=29 train_loss=0.3796 val_loss=0.6246 val_acc=0.831 legal=1.000 samples/s=6703
+epoch=30 train_loss=0.3779 val_loss=0.6245 val_acc=0.824 legal=1.000 samples/s=7102
+epoch=31 train_loss=0.3769 val_loss=0.6256 val_acc=0.828 legal=1.000 samples/s=7186
+epoch=32 train_loss=0.3712 val_loss=0.6203 val_acc=0.834 legal=1.000 samples/s=7126
+early stopping after 32 epochs

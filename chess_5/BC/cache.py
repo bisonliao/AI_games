@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -13,20 +14,27 @@ from .symmetry import canonicalize, inverse_action
 
 
 class ExpertCache:
-    FORMAT_VERSION = 2
+    FORMAT_VERSION = 3
 
     def __init__(self, path: Path, board_size: int, max_candidates: int, seed: int,
                  top_k: int = 4, temperature: float = 1.5,
-                 stochastic_moves: int = 6) -> None:
+                 stochastic_moves: int = 6, shared_path: Path | None = None,
+                 memory_size: int = 4096) -> None:
         self.path = Path(path); self.path.parent.mkdir(parents=True, exist_ok=True)
         self.size = int(board_size); self.top_k = max(1, int(top_k))
         self.temperature = float(temperature); self.stochastic_moves = int(stochastic_moves)
         self.agent = HeuristicAgent(seed=seed, max_candidates=max_candidates)
         self.rng = np.random.default_rng(seed + 991)
+        self.memory_size = max(0, int(memory_size))
+        self.memory: OrderedDict[bytes, tuple[tuple[int, ...], bool, str]] = OrderedDict()
         self.db = sqlite3.connect(self.path)
+        self.shared_db = None
+        if shared_path is not None and Path(shared_path).is_file():
+            uri = f"file:{Path(shared_path).resolve()}?mode=ro"
+            self.shared_db = sqlite3.connect(uri, uri=True)
         self.db.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
         expected = {"format_version": str(self.FORMAT_VERSION), "board_size": str(board_size),
-                    "max_candidates": str(max_candidates), "seed": str(seed),
+                    "max_candidates": str(max_candidates),
                     "top_k": str(self.top_k), "temperature": str(self.temperature),
                     "stochastic_moves": str(self.stochastic_moves)}
         actual = dict(self.db.execute("SELECT name, value FROM metadata"))
@@ -42,9 +50,22 @@ class ExpertCache:
 
     def decision(self, board: np.ndarray, player: int) -> ExpertDecision:
         key, canonical, transform = canonicalize(np.asarray(board, dtype=np.int8), player)
-        row = self.db.execute("SELECT tactical, reason FROM decisions WHERE key = ?", (key,)).fetchone()
-        candidates = self.db.execute(
-            "SELECT action FROM candidates WHERE key = ? ORDER BY rank", (key,)).fetchall()
+        cached = self.memory.get(key)
+        if cached is not None:
+            self.memory.move_to_end(key)
+            actions, tactical, reason = cached
+            self.hits += 1
+            transformed = tuple(inverse_action(action, self.size, transform) for action in actions)
+            return ExpertDecision(transformed, tactical, reason)
+        row, candidates = self._database_decision(self.db, key)
+        if (row is None or not candidates) and self.shared_db is not None:
+            row, candidates = self._database_decision(self.shared_db, key)
+            if row is not None and candidates:
+                self.db.execute("INSERT OR IGNORE INTO decisions VALUES (?, ?, ?)",
+                                (key, int(row[0]), str(row[1])))
+                self.db.executemany("INSERT OR IGNORE INTO candidates VALUES (?, ?, ?)",
+                                    [(key, rank, int(item[0]))
+                                     for rank, item in enumerate(candidates)])
         if row is None or not candidates:
             mask = canonical.reshape(-1) == 0
             canonical_decision = self.agent.ranked_decision(canonical, player, mask, self.top_k)
@@ -60,8 +81,23 @@ class ExpertCache:
         else:
             actions = tuple(int(item[0]) for item in candidates)
             tactical = bool(row[0]); reason = str(row[1]); self.hits += 1
+        if self.memory_size:
+            self.memory[key] = (tuple(actions), bool(tactical), str(reason))
+            self.memory.move_to_end(key)
+            while len(self.memory) > self.memory_size:
+                self.memory.popitem(last=False)
         transformed = tuple(inverse_action(action, self.size, transform) for action in actions)
         return ExpertDecision(transformed, tactical, reason)
+
+    @staticmethod
+    def _database_decision(connection: sqlite3.Connection, key: bytes):
+        row = connection.execute(
+            "SELECT tactical, reason FROM decisions WHERE key = ?", (key,)
+        ).fetchone()
+        candidates = connection.execute(
+            "SELECT action FROM candidates WHERE key = ? ORDER BY rank", (key,)
+        ).fetchall()
+        return row, candidates
 
     def label(self, board: np.ndarray, player: int) -> int:
         decision = self.decision(board, player)
@@ -73,9 +109,46 @@ class ExpertCache:
 
     def close(self) -> None:
         self.db.commit(); self.db.close()
+        if self.shared_db is not None:
+            self.shared_db.close()
 
     def __enter__(self) -> "ExpertCache":
         return self
 
     def __exit__(self, *args: object) -> None:
         self.close()
+
+
+def merge_caches(target: Path, sources: list[Path]) -> None:
+    """Merge compatible worker caches into a reusable read-only round cache."""
+    sources = [Path(path) for path in sources if Path(path).is_file()]
+    if not sources:
+        return
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    first = sqlite3.connect(sources[0])
+    metadata = dict(first.execute("SELECT name, value FROM metadata"))
+    first.close()
+    output = sqlite3.connect(target)
+    output.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    output.execute("CREATE TABLE IF NOT EXISTS decisions ("
+                   "key BLOB PRIMARY KEY, tactical INTEGER NOT NULL, reason TEXT NOT NULL)")
+    output.execute("CREATE TABLE IF NOT EXISTS candidates ("
+                   "key BLOB NOT NULL, rank INTEGER NOT NULL, action INTEGER NOT NULL, "
+                   "PRIMARY KEY (key, rank))")
+    existing = dict(output.execute("SELECT name, value FROM metadata"))
+    if existing and existing != metadata:
+        output.close()
+        raise ValueError(f"cache metadata mismatch: {target}")
+    output.executemany("INSERT OR REPLACE INTO metadata VALUES (?, ?)", metadata.items())
+    for source in sources:
+        connection = sqlite3.connect(source)
+        if dict(connection.execute("SELECT name, value FROM metadata")) != metadata:
+            connection.close(); output.close()
+            raise ValueError(f"cache metadata mismatch: {source}")
+        output.executemany("INSERT OR IGNORE INTO decisions VALUES (?, ?, ?)",
+                           connection.execute("SELECT key, tactical, reason FROM decisions"))
+        output.executemany("INSERT OR IGNORE INTO candidates VALUES (?, ?, ?)",
+                           connection.execute("SELECT key, rank, action FROM candidates"))
+        connection.close()
+    output.commit(); output.close()

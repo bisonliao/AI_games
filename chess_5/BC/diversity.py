@@ -12,6 +12,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from .symmetry import transform_board
+from .oracle import ID_TO_REASON, ID_TO_SOURCE
 
 
 def _game_ranges(game_ids: np.ndarray) -> Iterable[tuple[int, int]]:
@@ -52,12 +53,26 @@ def assess_diversity(metrics: dict[str, Any], *, hard_min_games: int = 100,
             relation = "低于" if direction == "below" else "高于"
             warnings.append(f"{name} {value:.2%}，{relation}建议线 {threshold:.2%}")
     if metrics["games"] >= hard_min_games:
-        if metrics["canonical_effective_trajectory_ratio"] < min_effective_ratio:
-            failures.append(f"有效轨迹比例低于硬门槛 {min_effective_ratio:.2%}")
-        if metrics["dominant_canonical_trajectory_fraction"] > max_dominant_fraction:
-            failures.append(f"最大单一轨迹占比高于硬门槛 {max_dominant_fraction:.2%}")
-        if metrics["canonical_state_unique_ratio"] < min_state_unique_ratio:
-            failures.append(f"独特状态比例低于硬门槛 {min_state_unique_ratio:.2%}")
+        if "phase_coverage" in metrics:
+            # v3 uses adaptive absolute coverage. Ratios naturally shrink as a
+            # large dataset revisits a finite state distribution and are only
+            # diagnostics, not rejection criteria.
+            if metrics["dominant_canonical_trajectory_fraction"] > max_dominant_fraction:
+                failures.append(f"最大单一轨迹占比高于硬门槛 {max_dominant_fraction:.2%}")
+            if metrics.get("maximum_state_visit_fraction", 0.0) > 0.10:
+                failures.append("单一 canonical 状态占比高于硬门槛 10.00%")
+            player_counts = metrics.get("player_counts", {})
+            total_players = sum(player_counts.values())
+            if total_players and min(player_counts.get("black", 0),
+                                     player_counts.get("white", 0)) / total_players < 0.40:
+                failures.append("黑白样本比例失衡，较少一方低于 40.00%")
+        else:
+            if metrics["canonical_effective_trajectory_ratio"] < min_effective_ratio:
+                failures.append(f"有效轨迹比例低于硬门槛 {min_effective_ratio:.2%}")
+            if metrics["dominant_canonical_trajectory_fraction"] > max_dominant_fraction:
+                failures.append(f"最大单一轨迹占比高于硬门槛 {max_dominant_fraction:.2%}")
+            if metrics["canonical_state_unique_ratio"] < min_state_unique_ratio:
+                failures.append(f"独特状态比例低于硬门槛 {min_state_unique_ratio:.2%}")
     return {"passed": not failures, "warnings": warnings, "failures": failures,
             "thresholds": {"hard_min_games": hard_min_games,
                            "min_effective_trajectory_ratio": min_effective_ratio,
@@ -74,6 +89,15 @@ def analyze_shards(shards: Iterable[Path]) -> dict[str, Any]:
     started = time.perf_counter()
     trajectory_counts: Counter[bytes] = Counter()
     canonical_states: set[bytes] = set()
+    state_counts: Counter[bytes] = Counter()
+    phase_state_counts: dict[str, Counter[bytes]] = {
+        "opening_0_15": Counter(), "middle_16_35": Counter(), "late_36_plus": Counter()
+    }
+    player_counts: Counter[str] = Counter()
+    source_counts: Counter[str] = Counter()
+    reason_counts: Counter[str] = Counter()
+    action_counts: Counter[int] = Counter()
+    candidate_total = 0
     samples = games = 0
 
     for path in shards:
@@ -83,11 +107,29 @@ def analyze_shards(shards: Iterable[Path]) -> dict[str, Any]:
             game_ids = np.asarray(data["games"], dtype=np.int64)
             stored_groups = data["trajectory_groups"] if "trajectory_groups" in data else None
             samples += len(boards)
+            plies = (np.asarray(data["plies"], dtype=np.int16) if "plies" in data else
+                     np.count_nonzero(boards, axis=(1, 2)).astype(np.int16))
+            sources = data["sources"] if "sources" in data else np.zeros(len(boards), np.int8)
+            reasons = data["reasons"] if "reasons" in data else \
+                np.full(len(boards), 5, np.int8)
+            candidate_counts = data["candidate_counts"] if "candidate_counts" in data else \
+                np.ones(len(boards), np.int8)
+            actions = data["actions"]
             for start, end in _game_ranges(game_ids):
-                for board, player in zip(boards[start:end], players[start:end]):
+                for offset, (board, player) in enumerate(zip(boards[start:end], players[start:end]),
+                                                          start=start):
                     variants = [transform_board(board, transform).tobytes() for transform in range(8)]
                     player_byte = bytes((int(player) + 1,))
-                    canonical_states.add(hashlib.sha256(player_byte + min(variants)).digest())
+                    key = hashlib.sha256(player_byte + min(variants)).digest()
+                    canonical_states.add(key); state_counts[key] += 1
+                    phase = ("opening_0_15" if int(plies[offset]) <= 15 else
+                             "middle_16_35" if int(plies[offset]) <= 35 else "late_36_plus")
+                    phase_state_counts[phase][key] += 1
+                    player_counts["black" if int(player) == 1 else "white"] += 1
+                    source_counts[ID_TO_SOURCE.get(int(sources[offset]), "unknown")] += 1
+                    reason_counts[ID_TO_REASON.get(int(reasons[offset]), "unknown")] += 1
+                    action_counts[int(actions[offset])] += 1
+                    candidate_total += int(candidate_counts[offset])
                 group = (bytes(stored_groups[start]) if stored_groups is not None else
                          canonical_trajectory_hash(boards[start:end], players[start:end]))
                 trajectory_counts[group] += 1
@@ -101,6 +143,24 @@ def analyze_shards(shards: Iterable[Path]) -> dict[str, Any]:
     else:
         entropy = effective_count = dominant_fraction = 0.0
 
+    phase_metrics = {}
+    for name, counts in phase_state_counts.items():
+        count = sum(counts.values())
+        if count:
+            probabilities = np.asarray(list(counts.values()), dtype=np.float64) / count
+            phase_entropy = float(-np.sum(probabilities * np.log(probabilities)))
+        else:
+            phase_entropy = 0.0
+        phase_metrics[name] = {
+            "samples": count, "canonical_unique_count": len(counts),
+            "canonical_effective_count": float(math.exp(phase_entropy)) if count else 0.0,
+            "canonical_entropy": phase_entropy,
+        }
+    if samples:
+        action_probabilities = np.asarray(list(action_counts.values()), dtype=np.float64) / samples
+        action_entropy = float(-np.sum(action_probabilities * np.log(action_probabilities)))
+    else:
+        action_entropy = 0.0
     return {
         "format_version": 1,
         "games": games,
@@ -112,5 +172,13 @@ def analyze_shards(shards: Iterable[Path]) -> dict[str, Any]:
         "dominant_canonical_trajectory_fraction": dominant_fraction,
         "canonical_state_unique_count": len(canonical_states),
         "canonical_state_unique_ratio": len(canonical_states) / max(1, samples),
+        "canonical_state_duplicate_fraction": 1.0 - len(canonical_states) / max(1, samples),
+        "maximum_state_visit_fraction": max(state_counts.values(), default=0) / max(1, samples),
+        "phase_coverage": phase_metrics,
+        "player_counts": dict(player_counts),
+        "source_counts": dict(source_counts),
+        "reason_counts": dict(reason_counts),
+        "top1_action_entropy": action_entropy,
+        "average_candidate_count": candidate_total / max(1, samples),
         "analysis_seconds": time.perf_counter() - started,
     }

@@ -1,0 +1,49 @@
+{
+  "checkpoint": "/home/bison/mygames/chess_5/BC/checkpoints/9x9-quality-v1/round_00/best.pt",
+  "challenge_bank": "/home/bison/mygames/chess_5/BC/data/9x9-quality-v1/challenge_v1.npz",
+  "agreement": {
+    "samples": 23401,
+    "illegal_actions": 0,
+    "top1_accuracy": 0.7533438741934105,
+    "top4_accuracy": 0.942737489850861,
+    "ood_top1_accuracy": 0.7359614834588617,
+    "ood_top4_accuracy": 0.9461340451901993,
+    "ood_samples": 20978,
+    "win_block_accuracy": 0.8774779078098878,
+    "fork_top4_accuracy": 0.9957709824333116,
+    "win_block_samples": 4187,
+    "fork_samples": 3074
+  },
+  "rollout_audit": null,
+  "matches": {
+    "colors": {
+      "black": {
+        "wins": 169,
+        "losses": 65,
+        "draws": 266,
+        "games": 500,
+        "score_rate": 0.604,
+        "score_rate_ci95": [
+          0.5754091307855455,
+          0.6325908692144545
+        ],
+        "decisive_game_rate": 0.468
+      },
+      "white": {
+        "wins": 38,
+        "losses": 155,
+        "draws": 307,
+        "games": 500,
+        "score_rate": 0.383,
+        "score_rate_ci95": [
+          0.35775113659969987,
+          0.40824886340030014
+        ],
+        "decisive_game_rate": 0.386
+      }
+    },
+    "moves": 53901,
+    "illegal_actions": 0
+  },
+  "passed": false
+}

@@ -1,0 +1,9 @@
+{
+  "run_name": "9x9-quality-v1",
+  "board_size": 9,
+  "completed_round": 2,
+  "consecutive_passes": 0,
+  "status": "running",
+  "last_checkpoint": "/home/bison/mygames/chess_5/BC/checkpoints/9x9-quality-v1/round_02/best.pt",
+  "last_evaluation": "/home/bison/mygames/chess_5/BC/evaluations/9x9-quality-v1/round_02.json"
+}

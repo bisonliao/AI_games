@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Iterable, List, Sequence, Tuple
 
 import numpy as np
@@ -21,6 +22,7 @@ class HeuristicAgent:
     def __init__(self, seed: int = 0, max_candidates: int = 12) -> None:
         self.rng = np.random.default_rng(seed)
         self.max_candidates = max(1, int(max_candidates))
+        self._position_cache: dict[tuple[bytes, int], float] = {}
 
     def select_actions(self, boards: np.ndarray, current_players: np.ndarray,
                        action_masks: np.ndarray, epsilon: float = 0.0) -> np.ndarray:
@@ -37,6 +39,7 @@ class HeuristicAgent:
 
     def ranked_decision(self, board: np.ndarray, player: int, mask: np.ndarray,
                         top_k: int = 4) -> ExpertDecision:
+        self._position_cache.clear()
         size = board.shape[0]
         if board.shape != (size, size):
             raise ValueError("Gomoku board must be square")
@@ -174,41 +177,66 @@ class HeuristicAgent:
         return False
 
     def _position_score(self, board: np.ndarray, player: int) -> float:
-        return self._pattern_score(board, player) - 1.12 * self._pattern_score(board, -player)
+        key = (board.tobytes(), int(player))
+        cached = self._position_cache.get(key)
+        if cached is None:
+            cached = self._pattern_score(board, player) - 1.12 * self._pattern_score(board, -player)
+            self._position_cache[key] = cached
+        return cached
 
     def _pattern_score(self, board: np.ndarray, player: int) -> float:
-        weights = (0.0, 1.0, 8.0, 60.0, 600.0, 1_000_000.0)
         score = 0.0
         for line in self._lines(board):
-            for start in range(max(0, len(line) - 4)):
-                window = line[start:start + 5]
-                if not np.any(window == -player):
-                    score += weights[int(np.count_nonzero(window == player))]
-            index = 0
-            while index < len(line):
-                if line[index] != player:
-                    index += 1
-                    continue
-                end = index
-                while end + 1 < len(line) and line[end + 1] == player:
-                    end += 1
-                length = min(5, end - index + 1)
-                open_ends = int(index > 0 and line[index - 1] == 0) + \
-                    int(end + 1 < len(line) and line[end + 1] == 0)
-                if open_ends:
-                    score += weights[length] * (0.35 if open_ends == 1 else 0.8)
-                index = end + 1
+            for contribution in _line_pattern_contributions(line.tobytes(), int(player)):
+                score += contribution
         return score
 
     @staticmethod
     def _lines(board: np.ndarray) -> Iterable[np.ndarray]:
-        size = board.shape[0]
-        for index in range(size):
-            yield board[index, :]
-            yield board[:, index]
-        for offset in range(-(size - 5), size - 4):
-            yield np.diagonal(board, offset=offset)
-            yield np.diagonal(np.fliplr(board), offset=offset)
+        flat = np.asarray(board).reshape(-1)
+        for indices in _line_indices(board.shape[0]):
+            yield flat[indices]
 
     def _choose_tied(self, actions: Sequence[int]) -> int:
         return int(self.rng.choice(np.asarray(actions, dtype=np.int64)))
+
+
+@lru_cache(maxsize=5)
+def _line_indices(size: int) -> tuple[np.ndarray, ...]:
+    """Precompute the exact line order used by the frozen heuristic-v1 oracle."""
+    marker = np.arange(size * size, dtype=np.int16).reshape(size, size)
+    lines: list[np.ndarray] = []
+    for index in range(size):
+        lines.append(marker[index, :].copy())
+        lines.append(marker[:, index].copy())
+    for offset in range(-(size - 5), size - 4):
+        lines.append(np.diagonal(marker, offset=offset).copy())
+        lines.append(np.diagonal(np.fliplr(marker), offset=offset).copy())
+    return tuple(lines)
+
+
+@lru_cache(maxsize=500_000)
+def _line_pattern_contributions(raw: bytes, player: int) -> tuple[float, ...]:
+    """Cache exact ordered contributions without changing floating-point sums."""
+    line = np.frombuffer(raw, dtype=np.int8)
+    weights = (0.0, 1.0, 8.0, 60.0, 600.0, 1_000_000.0)
+    contributions: list[float] = []
+    for start in range(max(0, len(line) - 4)):
+        window = line[start:start + 5]
+        if not np.any(window == -player):
+            contributions.append(weights[int(np.count_nonzero(window == player))])
+    index = 0
+    while index < len(line):
+        if line[index] != player:
+            index += 1
+            continue
+        end = index
+        while end + 1 < len(line) and line[end + 1] == player:
+            end += 1
+        length = min(5, end - index + 1)
+        open_ends = int(index > 0 and line[index - 1] == 0) + \
+            int(end + 1 < len(line) and line[end + 1] == 0)
+        if open_ends:
+            contributions.append(weights[length] * (0.35 if open_ends == 1 else 0.8))
+        index = end + 1
+    return tuple(contributions)
