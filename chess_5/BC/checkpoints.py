@@ -1,4 +1,4 @@
-"""Checkpoint discovery for the BC pipeline directory layout."""
+"""按 BC pipeline 的 run/round 目录结构发现和解析 checkpoint。"""
 
 from __future__ import annotations
 
@@ -7,17 +7,20 @@ from pathlib import Path
 
 
 def validate_name(value: str, label: str) -> str:
+    """只接受单个路径分量，防止 run/stage 参数跳出 checkpoint 根目录。"""
     if not value or value in (".", "..") or Path(value).name != value:
         raise ValueError(f"invalid {label}: {value!r}")
     return value
 
 
 def checkpoint_sort_key(path: Path) -> tuple[int, str, str]:
+    """优先按 round 目录开头的数字排序，再用名称稳定打破平局。"""
     match = re.match(r"(\d+)", path.parent.name)
     return (int(match.group(1)) if match else -1, path.parent.name, path.name)
 
 
 def checkpoints_for_run(root: Path, run_name: str, kind: str = "best") -> list[Path]:
+    """返回一个 run 下按轮次排序的 best、latest 或全部 checkpoint。"""
     run_dir = Path(root).expanduser().resolve() / validate_name(run_name, "run name")
     if not run_dir.is_dir():
         raise FileNotFoundError(f"BC run directory does not exist: {run_dir}")
@@ -31,6 +34,7 @@ def checkpoints_for_run(root: Path, run_name: str, kind: str = "best") -> list[P
 def resolve_checkpoint(root: Path, *, direct: Path | None = None,
                        run_name: str | None = None, stage: str | None = None,
                        checkpoint_name: str = "best.pt") -> Path:
+    """解析直接路径或 run/stage；未指定 stage 时选择数值最大的已有轮次。"""
     if direct is not None:
         candidate = direct.expanduser().resolve()
     else:

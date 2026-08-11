@@ -1,4 +1,9 @@
-"""Persistent symmetry-aware cache of ranked expert decisions."""
+"""可持久化、对称感知的专家候选动作缓存。
+
+同一棋盘的 8 种旋转/镜像先归一化为一个 canonical key，专家只计算一次。
+缓存保存确定性的候选排名和战术原因；随机采样发生在读取之后，因此缓存只提升
+标注速度，不改变 heuristic-v1 对同一状态的答案。
+"""
 
 from __future__ import annotations
 
@@ -14,12 +19,14 @@ from .symmetry import canonicalize, inverse_action
 
 
 class ExpertCache:
+    """两级专家缓存：进程内 LRU -> 本 worker SQLite -> 上一轮共享只读 SQLite。"""
     FORMAT_VERSION = 3
 
     def __init__(self, path: Path, board_size: int, max_candidates: int, seed: int,
                  top_k: int = 4, temperature: float = 1.5,
                  stochastic_moves: int = 6, shared_path: Path | None = None,
                  memory_size: int = 4096) -> None:
+        """打开 worker 缓存，并校验所有影响专家答案的配置完全一致。"""
         self.path = Path(path); self.path.parent.mkdir(parents=True, exist_ok=True)
         self.size = int(board_size); self.top_k = max(1, int(top_k))
         self.temperature = float(temperature); self.stochastic_moves = int(stochastic_moves)
@@ -29,6 +36,7 @@ class ExpertCache:
         self.memory: OrderedDict[bytes, tuple[tuple[int, ...], bool, str]] = OrderedDict()
         self.db = sqlite3.connect(self.path)
         self.shared_db = None
+        # shared cache 只读打开；命中结果会回填当前 worker 数据库，便于本轮最终合并。
         if shared_path is not None and Path(shared_path).is_file():
             uri = f"file:{Path(shared_path).resolve()}?mode=ro"
             self.shared_db = sqlite3.connect(uri, uri=True)
@@ -49,7 +57,10 @@ class ExpertCache:
         self.db.commit(); self.hits = self.misses = self.expert_queries = 0
 
     def decision(self, board: np.ndarray, player: int) -> ExpertDecision:
+        """返回原棋盘坐标系下的专家排名，并维护命中/查询统计。"""
         key, canonical, transform = canonicalize(np.asarray(board, dtype=np.int8), player)
+        # canonicalize 返回原棋盘到规范棋盘的 transform；缓存动作存规范坐标，
+        # 返回调用方前必须 inverse_action 还原。
         cached = self.memory.get(key)
         if cached is not None:
             self.memory.move_to_end(key)
@@ -58,6 +69,7 @@ class ExpertCache:
             transformed = tuple(inverse_action(action, self.size, transform) for action in actions)
             return ExpertDecision(transformed, tactical, reason)
         row, candidates = self._database_decision(self.db, key)
+        # 当前 worker 未命中时先查历史共享库，最后才真正调用启发式专家。
         if (row is None or not candidates) and self.shared_db is not None:
             row, candidates = self._database_decision(self.shared_db, key)
             if row is not None and candidates:
@@ -81,6 +93,7 @@ class ExpertCache:
         else:
             actions = tuple(int(item[0]) for item in candidates)
             tactical = bool(row[0]); reason = str(row[1]); self.hits += 1
+        # 热点状态进入有界 LRU，减少 SQLite 往返；满时淘汰最久未使用项。
         if self.memory_size:
             self.memory[key] = (tuple(actions), bool(tactical), str(reason))
             self.memory.move_to_end(key)
@@ -91,6 +104,7 @@ class ExpertCache:
 
     @staticmethod
     def _database_decision(connection: sqlite3.Connection, key: bytes):
+        """从 SQLite 同时读取决策元信息和按 rank 排序的候选动作。"""
         row = connection.execute(
             "SELECT tactical, reason FROM decisions WHERE key = ?", (key,)
         ).fetchone()
@@ -100,6 +114,7 @@ class ExpertCache:
         return row, candidates
 
     def label(self, board: np.ndarray, player: int) -> int:
+        """兼容旧调用：从缓存排名执行受控采样，战术决策保持 greedy。"""
         decision = self.decision(board, player)
         move_index = int(np.count_nonzero(np.asarray(board) == player))
         return rank_softmax_action(decision.actions, move_index, self.rng, top_k=self.top_k,
@@ -108,6 +123,7 @@ class ExpertCache:
                                    force_greedy=decision.tactical)
 
     def close(self) -> None:
+        """提交当前 worker 新增答案并关闭本地/共享连接。"""
         self.db.commit(); self.db.close()
         if self.shared_db is not None:
             self.shared_db.close()
@@ -120,7 +136,7 @@ class ExpertCache:
 
 
 def merge_caches(target: Path, sources: list[Path]) -> None:
-    """Merge compatible worker caches into a reusable read-only round cache."""
+    """将配置兼容的 worker 缓存合并为下一轮可复用的共享只读缓存。"""
     sources = [Path(path) for path in sources if Path(path).is_file()]
     if not sources:
         return

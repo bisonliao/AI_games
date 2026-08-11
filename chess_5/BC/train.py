@@ -1,4 +1,13 @@
-"""Offline masked-cross-entropy training for Gomoku BC."""
+"""使用离线专家标签训练五子棋行为克隆策略。
+
+训练仍是监督学习而非强化学习：网络对棋盘每个位置输出 logit，已占用位置先被
+mask，再用专家 top-1 与 top-4 排名构造交叉熵。DAgger 只改变状态从哪里来，
+不会改变 loss 的监督性质。
+
+一轮训练同时读取 Bootstrap 与此前所有 DAgger 数据，通过加权采样平衡数据轮次、
+黑白方、对局阶段和重复状态。每个 epoch 保存 latest.pt，并按固定 challenge bank
+上的复合排序更新 best.pt。
+"""
 
 from __future__ import annotations
 
@@ -33,7 +42,7 @@ DIVERSITY_KEYS = (
 
 
 def load_diversity_reports(data_dirs: list[Path]) -> list[dict[str, Any]]:
-    """Load the immutable diversity report for every dataset used by training."""
+    """读取每个不可变数据集的多样性报告，并按当前门槛重新给出结论。"""
     reports: list[dict[str, Any]] = []
     for root in data_dirs:
         root = root.expanduser().resolve()
@@ -55,6 +64,7 @@ def load_diversity_reports(data_dirs: list[Path]) -> list[dict[str, Any]]:
 
 
 def print_diversity_reports(reports: list[dict[str, Any]]) -> None:
+    """训练开始前醒目打印数据质量，便于从 console.log 发现覆盖问题。"""
     marker = "!!!!!!!!!!!!!!!!"
     print(f"{marker} 数据多样性检查开始 {marker}", flush=True)
     for report in reports:
@@ -87,6 +97,7 @@ def print_diversity_reports(reports: list[dict[str, Any]]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    """解析数据版本、网络规模、优化器、恢复和 TensorBoard 参数。"""
     parser = argparse.ArgumentParser(description="Train a Gomoku behavioral-cloning policy.")
     parser.add_argument("--data-dir", type=Path, nargs="+", required=True,
                         help="Immutable dataset versions; first is the base expert dataset.")
@@ -120,8 +131,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def _datasets(args: argparse.Namespace, split: str) -> ConcatDataset:
+    """将 Bootstrap 与历轮 DAgger 数据分别加载后拼成逻辑数据集。"""
     datasets = []
     excluded_keys: set[bytes] = set()
+    # challenge canonical key 永远不能进入训练 split，这是固定评测可信的前提。
     if split == "train" and args.challenge_bank is not None:
         with np.load(args.challenge_bank) as challenge:
             excluded_keys = {bytes(key) for key in challenge["canonical_keys"]}
@@ -138,16 +151,24 @@ def _datasets(args: argparse.Namespace, split: str) -> ConcatDataset:
 
 
 def _training_sampler(dataset: ConcatDataset, seed: int) -> WeightedRandomSampler:
+    """构造分层加权采样器，控制轮次、颜色、阶段和状态频率的联合占比。
+
+    数据轮次目标：只有一轮时全量；两轮各 50%；三轮为 30/35/35；四轮以上
+    Bootstrap 占 30%，最近两轮各 25%，更早 DAgger 合计 20%。在每个数据集内
+    再平衡黑白为 50/50、开中残局为 30/45/25，并降低重复 canonical 状态权重。
+    """
     children = list(dataset.datasets)
     count = len(children)
     all_keys = np.concatenate([np.asarray(child.canonical_keys, dtype="S32")
                                for child in children])
+    # 在所有轮次范围内统计重复频率，避免同一状态跨数据集重复时漏掉降权。
     if len(all_keys):
         _, inverse, canonical_counts = np.unique(all_keys, return_inverse=True,
                                                  return_counts=True)
         global_frequency_weights = 1.0 / np.sqrt(np.minimum(canonical_counts[inverse], 64))
     else:
         global_frequency_weights = np.empty(0, dtype=np.float64)
+    # dataset_shares 的顺序与 pipeline 传入顺序一致：Bootstrap 最早、当前轮最后。
     if count == 1:
         dataset_shares = [1.0]
     elif count == 2:
@@ -170,6 +191,7 @@ def _training_sampler(dataset: ConcatDataset, seed: int) -> WeightedRandomSample
         phase_counts = np.maximum(1, np.bincount(phases, minlength=3))
         frequency_values = global_frequency_weights[offset:offset + len(child)]
         offset += len(child)
+        # 四项权重相乘后只需要相对比例；WeightedRandomSampler 会负责归一化。
         values = np.asarray([
             share / len(child) * (0.5 * len(child) / player_counts[int(player)])
             * (phase_shares[int(phase)] * len(child) / phase_counts[int(phase)])
@@ -187,16 +209,25 @@ def topk_imitation_loss(logits: torch.Tensor, targets: torch.Tensor,
                         candidates: torch.Tensor, candidate_counts: torch.Tensor,
                         reasons: torch.Tensor, frequency_weights: torch.Tensor,
                         *, rank_temperature: float = 1.0) -> torch.Tensor:
+    """计算 top-1 硬标签与专家排名软标签的加权模仿损失。
+
+    总损失为 0.7 * top-1 CE + 0.3 * top-k soft CE。候选按排名指数衰减；
+    必胜/必堵样本乘 4，制造/阻止双杀乘 2，重复状态再乘 frequency weight。
+    """
+    # hard 强制学习专家第一选择，是策略保持明确偏好的主要信号。
     hard = nn.functional.cross_entropy(logits, targets, reduction="none")
     width = candidates.shape[1]
     ranks = torch.arange(width, device=logits.device)[None, :]
     valid = ranks < candidate_counts[:, None]
+    # 把候选排名 0,1,2... 转为概率；padding 位置用 -inf 排除。
     rank_logits = (-ranks.to(logits.dtype) / float(rank_temperature)).masked_fill(~valid, -1e9)
     rank_probabilities = torch.softmax(rank_logits, dim=1) * valid
     safe_candidates = candidates.clamp_min(0)
+    # 将紧凑 top-k 候选散射回棋盘全部动作空间，才能与网络 logits 对齐。
     target_distribution = torch.zeros_like(logits)
     target_distribution.scatter_add_(1, safe_candidates, rank_probabilities)
     soft = -(target_distribution * torch.log_softmax(logits, dim=1)).sum(1)
+    # 关键战术错误通常直接输棋，因此在 batch 聚合前提升它们的梯度贡献。
     tactical_weights = torch.ones_like(hard)
     tactical_weights[(reasons == REASON_TO_ID["win"]) |
                      (reasons == REASON_TO_ID["block"])] = 4.0
@@ -209,6 +240,10 @@ def topk_imitation_loss(logits: torch.Tensor, targets: torch.Tensor,
 def run_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
               optimizer: torch.optim.Optimizer | None, grad_clip: float,
               rank_temperature: float = 1.0) -> dict[str, float]:
+    """运行一次 train 或 eval epoch，并汇总 TensorBoard 使用的指标。
+
+    optimizer 为 None 时关闭梯度并切到 eval；否则执行反向传播和梯度裁剪。
+    """
     training = optimizer is not None
     model.train(training)
     total_loss = total_correct = total_topk = total_legal = total = 0
@@ -224,6 +259,7 @@ def run_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
         sources = batch_data["sources"].to(device)
         frequency_weights = batch_data["frequency_weights"].to(device)
         with torch.set_grad_enabled(training):
+            # 非法位置在 loss 和 argmax 前都置为极小值，模型只能选择空位。
             logits = model(states).masked_fill(~masks, -1e9)
             loss = topk_imitation_loss(
                 logits, targets, candidates, candidate_counts, reasons, frequency_weights,
@@ -241,9 +277,11 @@ def run_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
         valid_candidates = candidates >= 0
         total_topk += int(((predicted[:, None] == candidates) & valid_candidates).any(1).sum())
         total_legal += int(masks.gather(1, predicted[:, None]).sum())
+        # tactical_accuracy 只统计一步必胜/必堵的 top-1；fork 单独在最终 challenge 评测。
         tactical = (reasons == REASON_TO_ID["win"]) | (reasons == REASON_TO_ID["block"])
         tactical_total += int(tactical.sum())
         tactical_correct += int(((predicted == targets) & tactical).sum())
+        # 非纯专家自博弈来源都视为 OOD，重点衡量 Agent 自身分布上的模仿能力。
         ood = sources != SOURCE_TO_ID["expert_selfplay"]
         ood_total += int(ood.sum())
         ood_correct += int(((predicted == targets) & ood).sum())
@@ -260,6 +298,7 @@ def run_epoch(model: nn.Module, loader: DataLoader, device: torch.device,
 def save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimizer,
                     scheduler: Any, args: argparse.Namespace, epoch: int,
                     metrics: dict[str, float]) -> None:
+    """原子保存可完整恢复的 checkpoint，包括模型、优化器、调度器和数据身份。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {"format_version": 2, "board_size": args.board_size,
                   "model_kwargs": {"hidden_channels": args.hidden_channels,
@@ -273,6 +312,7 @@ def save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimiz
 
 
 def main() -> None:
+    """初始化数据与模型，执行 epoch 循环并维护 latest/best checkpoint。"""
     args = parse_args()
     if not 0 < args.val_fraction < 1:
         raise ValueError("--val-fraction must be between 0 and 1")
@@ -280,6 +320,7 @@ def main() -> None:
     if args.device == "auto" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the quality-first BC pipeline; pass --device cpu explicitly for tests")
     device = torch.device("cuda" if args.device == "auto" else args.device)
+    # 普通 train/val 来自相同数据版本但按完整轨迹隔离；challenge 是第三套冻结数据。
     train_data, val_data = _datasets(args, "train"), _datasets(args, "val")
     if len(train_data) == 0 or len(val_data) == 0:
         raise ValueError("train and validation splits must both contain samples")
@@ -299,6 +340,7 @@ def main() -> None:
                                       pin_memory=device.type == "cuda")
     model = GomokuPolicyNet(hidden_channels=args.hidden_channels,
                             num_res_blocks=args.num_res_blocks).to(device)
+    # 所有混合数据必须来自同一冻结专家，否则相同状态可能出现互相冲突的标签。
     metadata_oracles = []
     for root in args.data_dir:
         metadata = json.loads((root / "metadata.json").read_text())
@@ -310,6 +352,8 @@ def main() -> None:
         validate_oracle_identity(actual, args.oracle)
     if args.init_checkpoint is not None and args.resume:
         raise ValueError("--init-checkpoint and --resume are mutually exclusive")
+    # init-checkpoint 用于跨 DAgger 轮 warm-start：只继承网络权重；
+    # resume 用于同一轮中断恢复：模型、optimizer、scheduler 和 epoch 全部恢复。
     if args.init_checkpoint is not None:
         initial = torch.load(args.init_checkpoint, map_location=device, weights_only=False)
         if initial.get("model_kwargs") != {"hidden_channels": args.hidden_channels,
@@ -337,6 +381,7 @@ def main() -> None:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         start_epoch = int(checkpoint["epoch"]) + 1
+        # 恢复 best 的排序状态，否则续训可能用更差模型覆盖原 best.pt。
         if best_path.exists():
             best_checkpoint = torch.load(best_path, map_location="cpu", weights_only=False)
             previous_metrics = best_checkpoint.get("metrics", {})
@@ -379,6 +424,8 @@ def main() -> None:
                                       args.rank_temperature)
             val_metrics = run_epoch(model, val_loader, device, None, args.grad_clip,
                                     args.rank_temperature)
+            # 每个 epoch 同时测普通 val 和冻结 challenge；调度器只依据普通 val loss，
+            # 选模则依据 challenge，避免优化器直接追逐最终验收分数。
             challenge_metrics = (run_epoch(model, challenge_loader, device, None,
                                            args.grad_clip, args.rank_temperature)
                                  if challenge_loader is not None else val_metrics)
@@ -387,7 +434,10 @@ def main() -> None:
                        **{f"val_{k}": v for k, v in val_metrics.items()},
                        **{f"challenge_{k}": v for k, v in challenge_metrics.items()},
                        "lr": optimizer.param_groups[0]["lr"]}
+            # latest 每轮覆盖，服务于中断恢复；best 只在复合排名严格提升时更新。
             save_checkpoint(latest_path, model, optimizer, scheduler, args, epoch, metrics)
+            # 字典序优先保证战术过 99.5% 门槛，再比较 OOD top-1、top-4，
+            # challenge loss 只作为前三项相同时的最后 tie-breaker。
             checkpoint_rank = (int(challenge_metrics["tactical_accuracy"] >= 0.995),
                                challenge_metrics["ood_accuracy"],
                                challenge_metrics["ood_top4_accuracy"],

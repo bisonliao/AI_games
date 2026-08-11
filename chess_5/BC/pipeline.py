@@ -1,4 +1,12 @@
-"""Resumable quality-first 9x9 bootstrap and multi-round DAgger pipeline."""
+"""可恢复的 9x9 BC/DAgger 训练总编排器。
+
+完整流程为：生成 Bootstrap 数据 -> 冻结 challenge bank -> 训练 round_00 ->
+用当前策略收集 DAgger 状态 -> 混合新旧数据 warm-start 下一轮 -> 复合评测。
+连续两轮通过复合门槛后提前结束，否则运行到配置的最大轮数。
+
+本文件不直接实现训练算法，而是以子进程串联 generate.py、train.py 和
+challenge.py。每个阶段都有独立日志，并用已落盘产物判断能否从中断处恢复。
+"""
 
 from __future__ import annotations
 
@@ -15,10 +23,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _env_int(name: str, default: int) -> int:
+    """读取整数环境变量；命令行参数仍可覆盖这里提供的默认值。"""
     return int(os.environ.get(name, default))
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """解析整条 pipeline 的规模、并行度和停止条件。"""
     parser = argparse.ArgumentParser(description="Run quality-first 9x9 BC/DAgger training.")
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--artifact-root", type=Path,
@@ -49,6 +59,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _run(command: list[str], log_path: Path) -> None:
+    """运行一个阶段并保存日志；子进程失败时立即中止后续流水线。"""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     print("RUN", " ".join(command), flush=True)
     with log_path.open("a", encoding="utf-8") as log:
@@ -63,11 +74,13 @@ def _run(command: list[str], log_path: Path) -> None:
 
 
 def _complete_dataset(path: Path) -> bool:
+    """只有 metadata 声明的全部 shard 都存在时，数据集才算完成。"""
     metadata = path / "metadata.json"
     return metadata.is_file() and json.loads(metadata.read_text()).get("status") == "complete"
 
 
 def _coverage_ok(path: Path) -> None:
+    """执行数据覆盖质量门，多样性不足或生成停滞时禁止进入训练。"""
     metadata = json.loads((path / "metadata.json").read_text())
     if metadata.get("coverage_stalled"):
         raise RuntimeError(
@@ -76,6 +89,7 @@ def _coverage_ok(path: Path) -> None:
 
 
 def _atomic_state(path: Path, value: dict) -> None:
+    """原子更新 pipeline 状态，避免中断后留下半个 JSON 文件。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2))
@@ -83,6 +97,7 @@ def _atomic_state(path: Path, value: dict) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    """按轮次执行数据生成、监督训练和固定挑战集评测。"""
     args = parse_args(argv)
     python = sys.executable
     root = args.artifact_root.resolve()
@@ -97,6 +112,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "consecutive_passes": 0, "status": "running",
     }
 
+    # 阶段一：没有神经网络策略时，先用带受控扰动的专家生成初始覆盖。
     bootstrap = data_root / "round_00_bootstrap"
     if not _complete_dataset(bootstrap):
         _run([
@@ -111,6 +127,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         ], run_root / "round_00_generate" / "console.log")
     _coverage_ok(bootstrap)
 
+    # 阶段二：训练前冻结挑战集。train.py 会排除其中的 canonical 状态，
+    # 防止挑战样本泄漏进训练集导致评测虚高。
     if not challenge_bank.is_file():
         _run([
             python, "BC/challenge.py", "build", "--data-dir", str(bootstrap),
@@ -119,6 +137,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             "--prefix-count", str(args.challenge_prefixes),
         ], run_root / "challenge_build" / "console.log")
 
+    # datasets 随轮次增长：每轮训练都会读取 Bootstrap 和历轮 DAgger 数据；
+    # train.py 的 WeightedRandomSampler 再负责控制新旧数据占比。
     datasets = [bootstrap]
     checkpoints: list[Path] = []
     if state.get("status") == "complete":
@@ -128,6 +148,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     for round_index in range(args.rounds + 1):
         label = f"round_{round_index:02d}"
         if round_index:
+            # 阶段三：上一轮 best.pt 负责推进棋局，每个访问状态仍由冻结专家标注。
+            # 历史 checkpoint 作为部分对局的对手，降低对单一策略版本的过拟合。
             data = data_root / f"{label}_dagger"
             previous = checkpoints[-1]
             if not _complete_dataset(data):
@@ -149,6 +171,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 _run(command, run_root / f"{label}_generate" / "console.log")
             _coverage_ok(data); datasets.append(data)
 
+        # 阶段四：round_00 随机初始化；后续轮次只继承上一轮网络权重，
+        # optimizer 和学习率调度器重新初始化，以干净状态适应新增数据。
         stage_root = checkpoint_root / label
         best = stage_root / "best.pt"
         if not best.is_file():
@@ -170,6 +194,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             _run(command, run_root / f"{label}_train" / "console.log")
         checkpoints.append(best)
 
+        # 阶段五：best.pt 要经过固定状态一致率、当前 rollout audit 和交换黑白
+        # 的前缀对局评测。这里只依据完整复合结果决定是否停止。
         evaluation = evaluation_root / f"{label}.json"
         if not evaluation.is_file():
             command = [
@@ -182,6 +208,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 command.extend(("--audit-data", str(datasets[-1])))
             _run(command, run_root / f"{label}_evaluate" / "console.log")
         result = json.loads(evaluation.read_text())
+        # 单轮通过可能来自统计波动，因此要求连续两轮通过；任何失败都会清零。
         consecutive = consecutive + 1 if result.get("passed") else 0
         state.update({"completed_round": round_index, "consecutive_passes": consecutive,
                       "last_checkpoint": str(best), "last_evaluation": str(evaluation)})

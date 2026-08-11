@@ -1,4 +1,9 @@
-"""BC checkpoint evaluation against the local expert or another BC policy."""
+"""传统的空棋盘 BC 对专家/BC 对局评测。
+
+该工具适合快速比较 checkpoint 或兼容旧 5x5 pipeline；当前 9x9 质量优先训练的
+最终门槛由 challenge.py 实现，因为后者还包含固定带外状态、rollout audit 和
+固定前缀对局。不要把这里的 45%-55% 快速检查当成当前 pipeline 的完整验收。
+"""
 
 from __future__ import annotations
 
@@ -28,6 +33,7 @@ DEFAULT_CHECKPOINT_ROOT = Path(__file__).resolve().parent / "checkpoints"
 
 
 def _wilson(successes: int, total: int) -> tuple[float, float]:
+    """计算二项成功率的 Wilson 95% 置信区间。"""
     z = 1.959963984540054
     p = successes / total
     denominator = 1 + z * z / total
@@ -37,6 +43,7 @@ def _wilson(successes: int, total: int) -> tuple[float, float]:
 
 
 def _summarize(counts: dict[str, int], agent_player: int, seconds: float) -> dict[str, Any]:
+    """将胜和负计数整理为得分率、置信区间和决胜局指标。"""
     n = counts["games"]
     mean = (counts["wins"] + 0.5 * counts["draws"]) / n
     variance = ((counts["wins"] * (1 - mean) ** 2 + counts["draws"] * (0.5 - mean) ** 2
@@ -54,11 +61,13 @@ def _summarize(counts: dict[str, int], agent_player: int, seconds: float) -> dic
 
 
 def passes_45_55(result: dict[str, Any], min_decisive_rate: float = 0.20) -> bool:
+    """旧评测门槛：得分接近专家且不能依靠几乎全部和棋通过。"""
     return 0.45 <= result["score_rate"] <= 0.55 and \
         result["decisive_game_rate"] >= min_decisive_rate
 
 
 def _expert_worker(task: dict[str, Any]) -> dict[str, int]:
+    """在空棋盘开局上运行一批 greedy BC 对受控采样专家的对局。"""
     import torch
     torch.set_num_threads(1)
     agent = BCAgent(task["board_size"], device="cpu")
@@ -105,7 +114,7 @@ def evaluate(checkpoint: Path, board_size: int, games: int, seed: int,
              workers: int, max_candidates: int, agent_player: int,
              expert_top_k: int = 4, expert_temperature: float = 1.5,
              expert_stochastic_moves: int = 6) -> dict[str, Any]:
-    """Evaluate one greedy BC policy against the BC-local heuristic expert."""
+    """并行评测一个 greedy BC checkpoint 对本地冻结启发式专家。"""
     if games < 1 or workers < 1 or agent_player not in (1, -1):
         raise ValueError("invalid evaluation games, workers or player")
     workers = min(workers, games)
@@ -124,6 +133,7 @@ def evaluate(checkpoint: Path, board_size: int, games: int, seed: int,
 
 
 def _pair_worker(task: dict[str, Any]) -> dict[str, int]:
+    """运行一批 checkpoint A 与 B 的确定性 greedy 对局。"""
     import torch
     torch.set_num_threads(1)
     a = BCAgent(task["board_size"], device="cpu"); a.load_checkpoint(Path(task["checkpoint_a"]))
@@ -151,6 +161,7 @@ def _pair_worker(task: dict[str, Any]) -> dict[str, int]:
 
 def evaluate_checkpoint_pair(checkpoint_a: Path, checkpoint_b: Path, *, board_size: int,
                              games: int, seed: int, workers: int, a_player: int) -> dict[str, Any]:
+    """并行比较两个 checkpoint；调用方应交换 A 的颜色各运行一次。"""
     if games < 1 or workers < 1 or a_player not in (1, -1):
         raise ValueError("invalid pair evaluation games, workers or player")
     workers = min(workers, games)
@@ -170,6 +181,7 @@ def evaluate_checkpoint_pair(checkpoint_a: Path, checkpoint_b: Path, *, board_si
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """解析单 checkpoint、整个 run 或 checkpoint pair 三种评测模式。"""
     parser = argparse.ArgumentParser(
         description="评测 BC checkpoint：对启发式、整个 run 或两个 BC 模型互评。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -212,6 +224,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _write_tb(directory: Path, output: dict[str, Any]) -> None:
+    """将跨 checkpoint 对局结果写入独立 TensorBoard run。"""
     from torch.utils.tensorboard import SummaryWriter
     writer = SummaryWriter(log_dir=str(directory))
     writer.add_text("Evaluation/result", json.dumps(output, ensure_ascii=False, indent=2), 0)
@@ -230,6 +243,7 @@ def _write_tb(directory: Path, output: dict[str, Any]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """解析 checkpoint、交换颜色执行评测，并输出 JSON/TensorBoard。"""
     args = parse_args(argv)
     if args.checkpoint_a is not None:
         a = resolve_checkpoint(args.checkpoint_root, direct=args.checkpoint_a)
@@ -257,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
         output = {"mode": "heuristic", "board_size": args.board_size,
                   "games_per_color": args.games, "seed": args.seed, "evaluations": evaluations,
                   "passes_45_55": all(item["passes_45_55"] for item in evaluations)}
-        # Preserve the former single-checkpoint top-level result shape used by pipeline consumers.
+        # 保留旧版单 checkpoint 的顶层字段形状，避免已有调用方解析失败。
         if len(evaluations) == 1:
             output.update({"checkpoint": evaluations[0]["checkpoint"],
                            "results": evaluations[0]["results"],

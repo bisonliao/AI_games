@@ -1,4 +1,4 @@
-"""Post-generation diversity metrics for sharded Gomoku datasets."""
+"""在数据生成后统计对称去重的轨迹、状态、阶段和来源多样性。"""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from .oracle import ID_TO_REASON, ID_TO_SOURCE
 
 
 def _game_ranges(game_ids: np.ndarray) -> Iterable[tuple[int, int]]:
-    """Yield contiguous [start, end) ranges; generated games are shard-contiguous."""
+    """按连续 game id 产出每盘棋的 [start, end)；生成器保证同局状态连续。"""
     if len(game_ids) == 0:
         return
     starts = np.r_[0, np.flatnonzero(game_ids[1:] != game_ids[:-1]) + 1]
@@ -25,6 +25,7 @@ def _game_ranges(game_ids: np.ndarray) -> Iterable[tuple[int, int]]:
 
 
 def canonical_trajectory_hash(boards: np.ndarray, players: np.ndarray) -> bytes:
+    """对整条棋局的 8 种全局对称分别 hash，取最小值作为轨迹身份。"""
     hashers = [hashlib.sha256() for _ in range(8)]
     for board, player in zip(boards, players):
         player_byte = bytes((int(player) + 1,))
@@ -38,6 +39,7 @@ def assess_diversity(metrics: dict[str, Any], *, hard_min_games: int = 100,
                      min_effective_ratio: float = 0.01,
                      max_dominant_fraction: float = 0.50,
                      min_state_unique_ratio: float = 0.001) -> dict[str, Any]:
+    """将量化指标分成建议警告和会阻止训练的硬失败。"""
     warnings: list[str] = []
     failures: list[str] = []
     checks = (
@@ -54,9 +56,8 @@ def assess_diversity(metrics: dict[str, Any], *, hard_min_games: int = 100,
             warnings.append(f"{name} {value:.2%}，{relation}建议线 {threshold:.2%}")
     if metrics["games"] >= hard_min_games:
         if "phase_coverage" in metrics:
-            # v3 uses adaptive absolute coverage. Ratios naturally shrink as a
-            # large dataset revisits a finite state distribution and are only
-            # diagnostics, not rejection criteria.
+            # v3 使用自适应的绝对覆盖目标。数据规模增长后会反复访问有限状态分布，
+            # unique ratio 自然下降，因此比例只做诊断，不再直接作为拒绝条件。
             if metrics["dominant_canonical_trajectory_fraction"] > max_dominant_fraction:
                 failures.append(f"最大单一轨迹占比高于硬门槛 {max_dominant_fraction:.2%}")
             if metrics.get("maximum_state_visit_fraction", 0.0) > 0.10:
@@ -81,10 +82,10 @@ def assess_diversity(metrics: dict[str, Any], *, hard_min_games: int = 100,
 
 
 def analyze_shards(shards: Iterable[Path]) -> dict[str, Any]:
-    """Compute three symmetry-aware coverage indicators in one dataset scan.
+    """单次扫描全部 shard，计算对称感知的覆盖与分布指标。
 
-    Every board is transformed eight ways once. The same transformed bytes feed
-    both the complete-trajectory hash and the canonical-state set.
+    每个棋盘的 8 种变换同时用于完整轨迹 hash 和 canonical 状态计数；还按开局、
+    中盘、残局分别统计有效状态数，并审计黑白、行为来源、标签原因和动作熵。
     """
     started = time.perf_counter()
     trajectory_counts: Counter[bytes] = Counter()
@@ -135,6 +136,7 @@ def analyze_shards(shards: Iterable[Path]) -> dict[str, Any]:
                 trajectory_counts[group] += 1
                 games += 1
 
+    # exp(Shannon entropy) 是“有效轨迹数”：大量重复轨迹只贡献接近 1 的有效数量。
     if games:
         probabilities = np.asarray(list(trajectory_counts.values()), dtype=np.float64) / games
         entropy = float(-np.sum(probabilities * np.log(probabilities)))
