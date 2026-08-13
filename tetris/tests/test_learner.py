@@ -46,12 +46,15 @@ def test_learner_catches_up_updates_for_large_ipc_batch():
     learner.optimizer.param_groups[0]["lr"] = 5e-5
     learner.add(_batch(10))
     updates = 0
-    first_stats = learner.update()
-    assert first_stats is not None
-    assert first_stats["lr"] == 5e-5
+    assert learner.update()
     updates += 1
-    while learner.update() is not None:
+    while learner.update():
         updates += 1
     assert updates == 4
     assert learner.gradient_updates == 4
     assert learner._next_update_transition == 12
+    stats = learner.pop_training_stats()
+    assert stats["lr"] == 5e-5
+    assert stats["replay_size"] == 10
+    assert all(np.isfinite(stats[key]) for key in ("loss", "q_mean", "target_mean", "gradient_norm"))
+    assert learner.pop_training_stats() == {}

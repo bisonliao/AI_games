@@ -171,6 +171,8 @@ def train(config, *, device: str = "cuda", total_transitions: int | None = None,
     def flush_tensorboard(*, force: bool = False) -> None:
         nonlocal last_tb_log
         if force or learner.transitions - last_tb_log >= config.tb_log_every:
+            for key, value in learner.pop_training_stats().items():
+                tb.latest(f"train/{key}", value)
             tb.latest(
                 "train/epsilon",
                 _mean_annealed_epsilon(
@@ -305,15 +307,8 @@ def train(config, *, device: str = "cuda", total_transitions: int | None = None,
             # 因此 transition_batch_size 只影响通信效率，不改变每条样本对应的
             # update_every 训练频率。
             while True:
-                stats = learner.update()
-                if stats is None:
+                if not learner.update():
                     break
-                for key, value in stats.items():
-                    tag = f"train/{key}"
-                    if key in {"lr", "replay_size", "throughput"}:
-                        tb.latest(tag, value)
-                    else:
-                        tb.mean(tag, value)
                 if learner.gradient_updates % config.broadcast_every == 0:
                     state = learner.state_dict_cpu()
                     for q in weight_queues:

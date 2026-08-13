@@ -79,8 +79,8 @@ def masked_q_values(q_values: torch.Tensor, action_mask: torch.Tensor | None) ->
         mask = mask.unsqueeze(0)
     if mask.shape != q_values.shape:
         raise ValueError(f"action mask shape {tuple(mask.shape)} != Q shape {tuple(q_values.shape)}")
-    empty_rows = ~mask.any(dim=1)
-    if empty_rows.any():
-        mask = mask.clone()
-        mask[empty_rows, 0] = True
+    # A terminal row can have no legal actions. Select action zero as its
+    # harmless sentinel without synchronizing a CUDA boolean back to Python.
+    mask = mask.clone()
+    mask[:, 0] |= ~mask.any(dim=1)
     return q_values.masked_fill(~mask, torch.finfo(q_values.dtype).min)

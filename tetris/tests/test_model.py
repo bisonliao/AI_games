@@ -35,3 +35,11 @@ def test_placement_network_and_action_mask():
     masked = masked_q_values(output, torch_obs["action_mask"])
     assert output.shape == (2, 40)
     assert masked.argmax(dim=1).tolist() == [3, 17]
+
+
+def test_empty_action_mask_uses_action_zero_as_sentinel():
+    q_values = torch.tensor([[1.0, 4.0, 3.0]])
+    masked = masked_q_values(q_values, torch.zeros_like(q_values, dtype=torch.bool))
+    assert masked.argmax(dim=1).item() == 0
+    assert masked[0, 0] == q_values[0, 0]
+    assert torch.all(masked[0, 1:] == torch.finfo(q_values.dtype).min)

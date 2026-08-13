@@ -28,6 +28,8 @@ class Learner:
         self.replay = ReplayBuffer(config.replay_capacity, seed=seed)
         self.gradient_updates = 0
         self.transitions = 0
+        self._train_metric_sums = torch.zeros(4, device=self.device)
+        self._train_metric_count = 0
         # 更新时钟独立于 IPC 消息边界。收到一个大 batch 后，trainer 会反复调用
         # update()，直到 transitions 追上这个时钟，保持每 update_every 条
         # transition 做一次梯度更新。
@@ -40,11 +42,11 @@ class Learner:
         self.transitions += count
         return count
 
-    def update(self) -> dict[str, float] | None:
+    def update(self) -> bool:
         if len(self.replay) < max(self.config.learning_starts, self.config.batch_size):
-            return None
+            return False
         if self.transitions < self._next_update_transition:
-            return None
+            return False
         batch = self.replay.sample(self.config.batch_size)
         obs = observations_to_torch(batch.obs, self.device)
         next_obs = observations_to_torch(batch.next_obs, self.device)
@@ -63,20 +65,34 @@ class Learner:
         loss = nn.functional.smooth_l1_loss(q, target)
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        grad_norm = float(torch.nn.utils.clip_grad_norm_(self.online.parameters(), self.config.gradient_clip_norm))
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.online.parameters(), self.config.gradient_clip_norm)
         self.optimizer.step()
         self.gradient_updates += 1
+        with torch.no_grad():
+            self._train_metric_sums += torch.stack(
+                (loss.detach(), q.detach().mean(), target.detach().mean(), grad_norm.detach())
+            )
+        self._train_metric_count += 1
         # 关键点：按固定 cadence 前进，而不是把游标直接设为当前 transitions。
         # 后者会让“大 IPC batch”只触发一次更新，降低有效训练频率。
         self._next_update_transition += self.config.update_every
         if self.gradient_updates % self.config.target_update_every == 0:
             self.target.load_state_dict(self.online.state_dict())
+        return True
+
+    def pop_training_stats(self) -> dict[str, float]:
+        """Return interval metrics with a single device-to-host synchronization."""
+        if not self._train_metric_count:
+            return {}
+        means = (self._train_metric_sums / self._train_metric_count).cpu().tolist()
+        self._train_metric_sums.zero_()
+        self._train_metric_count = 0
         elapsed = max(time.perf_counter() - self.started_at, 1e-6)
         return {
-            "loss": float(loss.item()),
-            "q_mean": float(q.mean().item()),
-            "target_mean": float(target.mean().item()),
-            "gradient_norm": grad_norm,
+            "loss": means[0],
+            "q_mean": means[1],
+            "target_mean": means[2],
+            "gradient_norm": means[3],
             "lr": float(self.optimizer.param_groups[0]["lr"]),
             "replay_size": float(len(self.replay)),
             "throughput": float(self.transitions / elapsed),
