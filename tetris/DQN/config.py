@@ -17,11 +17,6 @@ class TrainConfig:
     target_update_every: int = 10_000
     broadcast_every: int = 1_000
     learning_rate: float = 1e-4
-    epsilon_start_min: float = 0.05
-    epsilon_start_max: float = 0.40
-    epsilon_final_min: float = 0.01
-    epsilon_final_max: float = 0.15
-    epsilon_decay_transitions: int = 1_500_000
     gamma: float = 0.99
     gradient_clip_norm: float = 10.0
     num_actors: int = 4
@@ -59,19 +54,3 @@ class TrainConfig:
     def validate(self) -> None:
         if self.piece_placed_reward < 0 or self.line_clear_reward < 0 or self.terminal_penalty < 0:
             raise ValueError("reward magnitudes must be non-negative")
-        epsilon_values = (
-            self.epsilon_start_min,
-            self.epsilon_start_max,
-            self.epsilon_final_min,
-            self.epsilon_final_max,
-        )
-        if not all(0.0 <= value <= 1.0 for value in epsilon_values):
-            raise ValueError("epsilon values must be in [0, 1]")
-        if self.epsilon_start_min > self.epsilon_start_max:
-            raise ValueError("epsilon_start_min must not exceed epsilon_start_max")
-        if self.epsilon_final_min > self.epsilon_final_max:
-            raise ValueError("epsilon_final_min must not exceed epsilon_final_max")
-        if self.epsilon_final_min > self.epsilon_start_min or self.epsilon_final_max > self.epsilon_start_max:
-            raise ValueError("final epsilon range must not exceed the start range")
-        if self.epsilon_decay_transitions <= 0:
-            raise ValueError("epsilon_decay_transitions must be positive")

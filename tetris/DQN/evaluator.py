@@ -55,7 +55,14 @@ def evaluate_checkpoint(
                 episode_lines = 0
                 episode_length = 0
                 if renderer is not None:
-                    renderer.draw(env, last_info, episode=episode + 1, total_episodes=episodes)
+                    renderer.draw(
+                        env,
+                        last_info,
+                        episode=episode + 1,
+                        total_episodes=episodes,
+                        fit_active_piece=True,
+                    )
+                    renderer.tick()
                 for _ in range(max_steps):
                     if renderer is not None:
                         renderer.events()
@@ -67,6 +74,34 @@ def evaluate_checkpoint(
                         torch_obs = observations_to_torch(batched, device)
                         q_values = masked_q_values(model(torch_obs), torch_obs.get("action_mask"))
                         action = int(q_values.argmax(dim=-1).item())
+                    if renderer is not None:
+                        # Placement actions rotate and move at spawn before the environment
+                        # immediately hard-drops. Show both intermediate poses for one frame.
+                        planned_piece = env._planned_piece(action)
+                        if planned_piece is not None:
+                            renderer.draw(
+                                env,
+                                last_info,
+                                episode=episode + 1,
+                                total_episodes=episodes,
+                                active_piece=planned_piece,
+                                fit_active_piece=True,
+                            )
+                            renderer.tick()
+                            dropped_piece = planned_piece
+                            while True:
+                                moved = env.board.try_move(dropped_piece, dy=1)
+                                if moved is None:
+                                    break
+                                dropped_piece = moved
+                            renderer.draw(
+                                env,
+                                last_info,
+                                episode=episode + 1,
+                                total_episodes=episodes,
+                                active_piece=dropped_piece,
+                            )
+                            renderer.tick()
                     obs, reward, terminated, _, last_info = env.step(action)
                     total_return += reward
                     episode_lines += int(last_info.get("lines_cleared", 0))
@@ -80,6 +115,7 @@ def evaluate_checkpoint(
                             episode=episode + 1,
                             total_episodes=episodes,
                             game_over=terminated,
+                            fit_active_piece=True,
                         )
                         renderer.tick()
                     if terminated:

@@ -9,32 +9,10 @@ import time
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 
-from .actor import _annealed_epsilon, actor_process
+from .actor import actor_process
 from .evaluator import evaluator_process
 from .learner import Learner
 from .utils import run_name, seed_everything
-
-
-def _actor_epsilon_values(minimum: float, maximum: float, count: int) -> list[float]:
-    """Return geometrically spaced actor epsilons, using the maximum for one actor."""
-    if count == 1:
-        return [float(maximum)]
-    if minimum == 0.0:
-        return [float(minimum + (maximum - minimum) * i / (count - 1)) for i in range(count)]
-    return [float(minimum * (maximum / minimum) ** (i / (count - 1))) for i in range(count)]
-
-
-def _mean_annealed_epsilon(
-    starts: list[float],
-    finals: list[float],
-    transitions: int,
-    decay_transitions: int,
-) -> float:
-    """Return the mean scheduled epsilon across all actors."""
-    return float(np.mean([
-        _annealed_epsilon(start, final, transitions, decay_transitions)
-        for start, final in zip(starts, finals, strict=True)
-    ]))
 
 
 class _TensorBoardBuffer:
@@ -76,7 +54,6 @@ def train(config, *, device: str = "cuda", total_transitions: int | None = None,
     metric_queue = ctx.Queue(maxsize=config.queue_size * 2)
     weight_queues = [ctx.Queue(maxsize=1) for _ in range(actors_count)]
     stop_event = ctx.Event()
-    global_transitions = ctx.Value("q", 0, lock=False)
     evaluator_stop_event = ctx.Event()
     evaluation_queue = ctx.Queue(maxsize=config.max_pending_evals)
     evaluation_result_queue = ctx.Queue()
@@ -84,16 +61,13 @@ def train(config, *, device: str = "cuda", total_transitions: int | None = None,
     for q in weight_queues:
         q.put(initial)
     actors = []
-    epsilon_starts = _actor_epsilon_values(
-        config.epsilon_start_min,
-        config.epsilon_start_max,
-        actors_count,
-    )
-    epsilon_finals = _actor_epsilon_values(
-        config.epsilon_final_min,
-        config.epsilon_final_max,
-        actors_count,
-    )
+    if actors_count == 1:
+        epsilons = [0.4]
+    else:
+        epsilons = [
+            float(0.05 * (0.4 / 0.05) ** (i / (actors_count - 1)))
+            for i in range(actors_count)
+        ]
     for actor_id in range(actors_count):
         actor_seed = config.seed + actor_id * 1_000_000
         process = ctx.Process(
@@ -102,10 +76,7 @@ def train(config, *, device: str = "cuda", total_transitions: int | None = None,
                 actor_id,
                 env_count,
                 actor_seed,
-                epsilon_starts[actor_id],
-                epsilon_finals[actor_id],
-                config.epsilon_decay_transitions,
-                global_transitions,
+                epsilons[actor_id],
                 transition_queue,
                 metric_queue,
                 weight_queues[actor_id],
@@ -145,7 +116,7 @@ def train(config, *, device: str = "cuda", total_transitions: int | None = None,
     log_dir = Path(config.log_root) / run_id
     writer = SummaryWriter(log_dir=str(log_dir))
     tb = _TensorBoardBuffer(writer)
-    # Report one compact exploration curve: the scheduled mean across actors.
+    # Report one compact exploration curve: the fixed mean across actors.
     # Reading LR from the optimizer keeps that metric correct if scheduling is
     # added later.
     tb.latest("train/lr", learner.optimizer.param_groups[0]["lr"])
@@ -173,15 +144,7 @@ def train(config, *, device: str = "cuda", total_transitions: int | None = None,
         if force or learner.transitions - last_tb_log >= config.tb_log_every:
             for key, value in learner.pop_training_stats().items():
                 tb.latest(f"train/{key}", value)
-            tb.latest(
-                "train/epsilon",
-                _mean_annealed_epsilon(
-                    epsilon_starts,
-                    epsilon_finals,
-                    learner.transitions,
-                    config.epsilon_decay_transitions,
-                ),
-            )
+            tb.latest("train/epsilon", float(np.mean(epsilons)))
             tb.flush(learner.transitions)
             last_tb_log = learner.transitions
 
@@ -301,7 +264,6 @@ def train(config, *, device: str = "cuda", total_transitions: int | None = None,
                 continue
             learner_get_wait_seconds += time.perf_counter() - wait_started
             learner.add(batch)
-            global_transitions.value = learner.transitions
             # 一个 IPC batch 可能包含数百条 transition。这里按 transition
             # cadence 补齐所有到期 update，而不是“收到一条消息只更新一次”。
             # 因此 transition_batch_size 只影响通信效率，不改变每条样本对应的

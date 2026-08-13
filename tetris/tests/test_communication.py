@@ -3,7 +3,7 @@ import threading
 
 import numpy as np
 
-from DQN.actor import _annealed_epsilon, _merge_transition_batches, _put_with_wait, _vector_info_value
+from DQN.actor import _merge_transition_batches, _put_with_wait, _vector_info_value
 from DQN.replay import TransitionBatch
 
 
@@ -66,10 +66,3 @@ def test_actor_reads_same_step_final_info_for_terminated_env():
     }
     assert _vector_info_value(infos, "survival_pieces", 0, terminated=True, default=-1) == 12
     assert _vector_info_value(infos, "survival_pieces", 1, terminated=False, default=-1) == 4
-
-
-def test_epsilon_anneals_linearly_and_stops_at_final_value():
-    assert _annealed_epsilon(0.4, 0.1, 0, 1_000) == 0.4
-    assert np.isclose(_annealed_epsilon(0.4, 0.1, 500, 1_000), 0.25)
-    assert np.isclose(_annealed_epsilon(0.4, 0.1, 1_000, 1_000), 0.1)
-    assert np.isclose(_annealed_epsilon(0.4, 0.1, 2_000, 1_000), 0.1)

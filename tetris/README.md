@@ -45,6 +45,27 @@ python -m DQN.evaluate checkpoints/<run-id>/dddqn_250000.pt \
   --episodes 3 --max-steps 20000 --render --render-fps 10
 ```
 
+## 动作空间设计：Placement 动作是关键
+
+本项目的 DQN 使用专门设计的 **placement 动作**，而不是逐帧控制动作。每个
+transition 直接决定当前方块的旋转状态和目标列（共 40 个动作），环境随后完成
+移动、下落和锁定。这样一条 transition 就对应“放置一个方块”，消行、棋盘变化
+和终局结果能够更直接地归因到这次落点决策。
+
+此前使用 frame-level 动作时，agent 需要经过一长串旋转、左右移动和下落动作才
+得到结果；训练 4000 万步仍完全没有学会消行，主要困难在于动作序列过长、信用
+分配稀疏。改为 placement 动作后，训练约 500 万步已经出现了稳定的消行能力：
+
+```text
+mean_return: 9.35
+mean_survival_pieces: 68
+mean_lines: 14
+```
+
+这组结果说明，对于本任务，动作空间的抽象方式比单纯增加训练步数更关键。当前
+训练和评估使用 placement 环境；原有 frame-level 环境仍保留用于键盘操作和底层
+环境测试。
+
 ## TensorBoard 指标说明
 
 启动训练后，使用下面的命令查看指标：
@@ -78,7 +99,7 @@ run 进行比较。所有标量图的横轴 `Step` 都表示 learner 已接收�
 | `train/q_mean` | mini-batch 中在线网络对实际采样动作给出的 Q 值均值，即对未来折扣回报的当前估计。应结合 `target_mean` 和评估回报观察；持续无界增大可能表示价值过估计或训练不稳定。 |
 | `train/target_mean` | Double DQN 目标 `reward + gamma * (1 - terminated) * next_q` 的均值。它与 `q_mean` 长期严重偏离时，通常会同时表现为 loss 较高。 |
 | `train/gradient_norm` | 梯度裁剪前的总梯度范数；当前上限由 `gradient_clip_norm` 控制。长期远高于上限说明裁剪频繁发生，可能需要检查学习率、奖励尺度或异常样本。 |
-| `train/epsilon` | 所有 actor 当前调度 epsilon 的均值。默认使用 4 个 actor，该均值从 `0.1875` 线性下降到约 `0.0714`，并在 300 万 transition 后保持不变。 |
+| `train/epsilon` | 所有 actor 固定 epsilon 的均值。默认使用 4 个 actor，epsilon 分别为 `0.05、0.10、0.20、0.40`，因此该指标保持为 `0.1875`。 |
 | `train/lr` | optimizer 当前实际使用的学习率。当前配置没有学习率退火，所以曲线应为水平线；若以后接入 scheduler，该曲线会记录退火后的实际值。 |
 | `train/replay_size` | replay buffer 当前保存的 transition 数量；达到 `replay_capacity` 后保持在容量上限，旧样本会被新样本覆盖。 |
 | `train/throughput` | learner 从启动至当前累计接收的 transition 数除以实际经过秒数，单位约为 transition/s。这是全程平均吞吐量，不是单个记录区间的瞬时速度。 |
@@ -172,12 +193,8 @@ magnitudes can be changed in `configs/ddqn_default.toml`.
 default is therefore 5 million placement decisions; old 6-action checkpoints
 are intentionally incompatible with this training and evaluation path.
 
-Actors use geometrically spaced exploration rates. With four actors, epsilon
-starts at `0.05, 0.10, 0.20, 0.40`, then each actor linearly anneals toward the
-range `0.02` to `0.15` over `epsilon_decay_transitions` (default 3 million
-learner transitions). The start range, final range, and decay duration are
-configured by `epsilon_start_min`, `epsilon_start_max`, `epsilon_final_min`,
-`epsilon_final_max`, and `epsilon_decay_transitions`.
+Actors use fixed geometrically spaced exploration rates. With four actors,
+epsilon remains `0.05, 0.10, 0.20, 0.40` throughout training.
 
 Each actor/environment pair receives a distinct deterministic seed. Every
 configured checkpoint interval is saved; checkpoints reaching `eval_every` are

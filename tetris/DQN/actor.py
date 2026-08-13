@@ -111,20 +111,11 @@ def _merge_transition_batches(batches: list[TransitionBatch]) -> TransitionBatch
     )
 
 
-def _annealed_epsilon(start: float, final: float, transitions: int, decay_transitions: int) -> float:
-    """Linearly anneal epsilon against the learner's global transition count."""
-    progress = min(max(int(transitions), 0) / max(int(decay_transitions), 1), 1.0)
-    return float(start + progress * (final - start))
-
-
 def actor_process(
     actor_id: int,
     envs_per_actor: int,
     seed: int,
-    epsilon_start: float,
-    epsilon_final: float,
-    epsilon_decay_transitions: int,
-    global_transitions,
+    epsilon: float,
     transition_queue,
     metric_queue,
     weight_queue,
@@ -207,8 +198,6 @@ def actor_process(
     action_counts = np.zeros(num_actions, dtype=np.int64)
     line_clear_transitions = 0
     terminal_transitions = 0
-    epsilon = float(epsilon_start)
-
     def flush_pending() -> bool:
         """拼接并可靠发送本地累计 batch，返回是否成功入队。
 
@@ -237,12 +226,6 @@ def actor_process(
         return sent
     try:
         while not stop_event.is_set():
-            epsilon = _annealed_epsilon(
-                epsilon_start,
-                epsilon_final,
-                global_transitions.value,
-                epsilon_decay_transitions,
-            )
             # 权重同步是 best-effort：如果 learner 连续广播多次，旧快照可以跳过，
             # 因为 actor 只需要尽快使用一份较新的策略，不需要逐版本执行。
             _latest_weights(weight_queue, model)

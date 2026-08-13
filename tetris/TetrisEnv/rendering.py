@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .pieces import ActivePiece
     from .tetris_env import TetrisEnv
 
 
@@ -74,6 +75,8 @@ class PygameRenderer:
         episode: int | None = None,
         total_episodes: int | None = None,
         game_over: bool = False,
+        active_piece: "ActivePiece | None" = None,
+        fit_active_piece: bool = False,
     ) -> None:
         pygame = self.pygame
         info = info or {}
@@ -85,11 +88,16 @@ class PygameRenderer:
             for x in range(env.board.width):
                 if env.board.grid[y, x]:
                     self._cell(x, y, (104, 115, 124))
-        if env.current is not None:
-            active_color = PIECE_COLORS[env.current.kind]
-            for x, y in env.current.absolute_cells():
-                if 0 <= x < env.board.width and 0 <= y < env.board.height:
-                    self._cell(x, y, active_color)
+        piece = env.current if active_piece is None else active_piece
+        if piece is not None:
+            active_color = PIECE_COLORS[piece.kind]
+            y_offset = 0
+            if fit_active_piece:
+                y_offset = max(0, -min(y for _, y in piece.absolute_cells()))
+            for x, y in piece.absolute_cells():
+                display_y = y + y_offset
+                if 0 <= x < env.board.width and 0 <= display_y < env.board.height:
+                    self._cell(x, display_y, active_color)
 
         grid_color = (43, 48, 52)
         for x in range(env.board.width + 1):
