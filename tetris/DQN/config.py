@@ -10,13 +10,17 @@ class TrainConfig:
     piece_placed_reward: float = 0.01
     line_clear_reward: float = 0.75
     terminal_penalty: float = 1.0
-    replay_capacity: int = 500_000
+    replay_capacity: int = 1_000_000
     batch_size: int = 256
     learning_starts: int = 20_000
     update_every: int = 4
     target_update_every: int = 10_000
     broadcast_every: int = 1_000
     learning_rate: float = 1e-4
+    schedule_trigger_mean_lines: float = 100.0
+    schedule_trigger_mean_survival_pieces: float = 300.0
+    schedule_trigger_patience: int = 2
+    schedule_force_transition: int = 10_000_000
     gamma: float = 0.99
     gradient_clip_norm: float = 10.0
     num_actors: int = 4
@@ -54,3 +58,18 @@ class TrainConfig:
     def validate(self) -> None:
         if self.piece_placed_reward < 0 or self.line_clear_reward < 0 or self.terminal_penalty < 0:
             raise ValueError("reward magnitudes must be non-negative")
+        if self.replay_capacity < 1 or self.batch_size < 1:
+            raise ValueError("replay_capacity and batch_size must be positive")
+        if self.update_every <= 0 or self.learning_rate <= 0:
+            raise ValueError("update_every and learning_rate must be positive")
+        if (
+            self.schedule_trigger_mean_lines < 0
+            or self.schedule_trigger_mean_survival_pieces < 0
+        ):
+            raise ValueError("schedule trigger thresholds must be non-negative")
+        if self.schedule_trigger_patience < 1:
+            raise ValueError("schedule_trigger_patience must be positive")
+        if self.schedule_force_transition < 1:
+            raise ValueError("schedule_force_transition must be positive")
+        if not 0 <= self.gamma < 1:
+            raise ValueError("gamma must be in [0, 1)")

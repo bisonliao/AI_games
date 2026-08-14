@@ -24,6 +24,7 @@ def evaluate_checkpoint(
 ) -> dict[str, float | int | str]:
     payload = torch.load(checkpoint, map_location=device, weights_only=False)
     checkpoint_config = payload.get("config", {})
+    effective_gamma = float(checkpoint_config.get("gamma", 0.99))
     model = DuelingDQN().to(device).eval()
     model.load_state_dict(payload["online"])
     returns: list[float] = []
@@ -40,7 +41,7 @@ def evaluate_checkpoint(
     try:
         for episode in range(episodes):
             env = PlacementTetrisEnv(
-                gamma=float(checkpoint_config.get("gamma", 0.99)),
+                gamma=effective_gamma,
                 piece_placed_reward=float(checkpoint_config.get("piece_placed_reward", 0.01)),
                 line_clear_reward=float(checkpoint_config.get("line_clear_reward", 0.75)),
                 terminal_penalty=float(checkpoint_config.get("terminal_penalty", 1.0)),
@@ -139,6 +140,7 @@ def evaluate_checkpoint(
         "checkpoint": str(checkpoint),
         "env_mode": "placement",
         "transition_step": int(payload.get("transitions", 0)),
+        "gamma": effective_gamma,
         "mean_return": float(np.mean(returns)) if returns else 0.0,
         "mean_survival_pieces": float(np.mean(pieces)) if pieces else 0.0,
         "mean_lines": float(np.mean(lines)) if lines else 0.0,

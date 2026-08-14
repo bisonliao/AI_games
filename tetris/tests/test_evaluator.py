@@ -23,3 +23,38 @@ def test_evaluation_detects_placement_checkpoint(tmp_path: Path):
     result = evaluate_checkpoint(checkpoint, episodes=1, max_steps=2, seed=3, device="cpu")
     assert result["env_mode"] == "placement"
     assert result["mean_length"] == 2
+
+
+def test_evaluation_uses_configured_gamma_from_checkpoint(tmp_path: Path):
+    model = DuelingDQN()
+    checkpoint = tmp_path / "gamma.pt"
+    torch.save(
+        {
+            "online": model.state_dict(),
+            "config": {"gamma": 0.97},
+        },
+        checkpoint,
+    )
+
+    result = evaluate_checkpoint(
+        checkpoint, episodes=1, max_steps=1, seed=3, device="cpu"
+    )
+
+    assert result["gamma"] == 0.97
+
+
+def test_evaluation_ignores_legacy_stability_controls(tmp_path: Path):
+    model = DuelingDQN()
+    checkpoint = tmp_path / "legacy-controls.pt"
+    torch.save(
+        {
+            "online": model.state_dict(),
+            "config": {"gamma": 0.99},
+            "stability_controls": {"gamma": 0.97},
+        },
+        checkpoint,
+    )
+
+    result = evaluate_checkpoint(checkpoint, episodes=1, max_steps=1, seed=3, device="cpu")
+
+    assert result["gamma"] == 0.99

@@ -12,6 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 from .actor import actor_process
 from .evaluator import evaluator_process
 from .learner import Learner
+from .schedule import epsilon_for_schedule
 from .utils import run_name, seed_everything
 
 
@@ -40,7 +41,15 @@ class _TensorBoardBuffer:
         self._latest.clear()
 
 
-def train(config, *, device: str = "cuda", total_transitions: int | None = None, num_actors: int | None = None, envs_per_actor: int | None = None) -> Path:
+def train(
+    config,
+    *,
+    device: str = "cuda",
+    total_transitions: int | None = None,
+    num_actors: int | None = None,
+    envs_per_actor: int | None = None,
+    resume_from: str | Path | None = None,
+) -> Path:
     config.validate()
     seed_everything(config.seed)
     total = int(total_transitions if total_transitions is not None else config.total_transitions)
@@ -49,6 +58,11 @@ def train(config, *, device: str = "cuda", total_transitions: int | None = None,
     if actors_count < 1 or env_count < 1:
         raise ValueError("num_actors and envs_per_actor must both be positive")
     learner = Learner(config, device=device, seed=config.seed)
+    if resume_from is not None:
+        learner.load_checkpoint(
+            resume_from,
+            total_transitions=total,
+        )
     ctx = mp.get_context("spawn")
     transition_queue = ctx.Queue(maxsize=config.queue_size)
     metric_queue = ctx.Queue(maxsize=config.queue_size * 2)
@@ -57,14 +71,18 @@ def train(config, *, device: str = "cuda", total_transitions: int | None = None,
     evaluator_stop_event = ctx.Event()
     evaluation_queue = ctx.Queue(maxsize=config.max_pending_evals)
     evaluation_result_queue = ctx.Queue()
+    # Evaluation results are handled by the learner process. Actors read only
+    # this shared, one-way flag and switch to epsilon 0.05 after capability has
+    # met both configured thresholds for the required number of evaluations.
+    schedule_triggered = ctx.Value("b", int(learner.schedule_triggered))
     initial = learner.state_dict_cpu()
     for q in weight_queues:
         q.put(initial)
     actors = []
     if actors_count == 1:
-        epsilons = [0.4]
+        base_epsilons = [0.4]
     else:
-        epsilons = [
+        base_epsilons = [
             float(0.05 * (0.4 / 0.05) ** (i / (actors_count - 1)))
             for i in range(actors_count)
         ]
@@ -76,7 +94,7 @@ def train(config, *, device: str = "cuda", total_transitions: int | None = None,
                 actor_id,
                 env_count,
                 actor_seed,
-                epsilons[actor_id],
+                base_epsilons[actor_id],
                 transition_queue,
                 metric_queue,
                 weight_queues[actor_id],
@@ -85,10 +103,11 @@ def train(config, *, device: str = "cuda", total_transitions: int | None = None,
                 config.actor_stats_every,
                 config.transition_batch_size,
                 config.transition_batch_max_wait,
-                config.gamma,
+                learner.gamma,
                 config.piece_placed_reward,
                 config.line_clear_reward,
                 config.terminal_penalty,
+                schedule_triggered,
             ),
             daemon=True,
         )
@@ -116,14 +135,24 @@ def train(config, *, device: str = "cuda", total_transitions: int | None = None,
     log_dir = Path(config.log_root) / run_id
     writer = SummaryWriter(log_dir=str(log_dir))
     tb = _TensorBoardBuffer(writer)
-    # Report one compact exploration curve: the fixed mean across actors.
-    # Reading LR from the optimizer keeps that metric correct if scheduling is
-    # added later.
+    # Report the current scheduled exploration and optimizer values.
     tb.latest("train/lr", learner.optimizer.param_groups[0]["lr"])
+    tb.latest("train/gamma", learner.gamma)
+    tb.latest("train/updates_per_transition", learner.updates_per_transition_at())
+    tb.latest("train/replay_warming_up", float(learner.replay_warming_up))
+    tb.latest("train/schedule_triggered", float(learner.schedule_triggered))
+    tb.latest(
+        "train/schedule_forced_by_transition",
+        float(learner.schedule_trigger_source == "transition_limit"),
+    )
+    tb.latest(
+        "train/schedule_qualifying_evals",
+        float(learner.schedule_consecutive_qualifying_evals),
+    )
     # A per-run directory prevents a fresh experiment from overwriting an old
     # checkpoint with the same transition step (including pre-placement models).
     checkpoint_dir = Path(config.checkpoint_root) / run_id
-    last_checkpoint = 0
+    last_checkpoint = learner.transitions
     learner_get_wait_seconds = 0.0
     learner_get_poll_timeouts = 0
     learner_get_empty_polls = 0
@@ -134,7 +163,7 @@ def train(config, *, device: str = "cuda", total_transitions: int | None = None,
     actor_action_counts: dict[int, np.ndarray] = {}
     actor_line_clear_transitions: dict[int, int] = {}
     actor_terminal_transitions: dict[int, int] = {}
-    last_evaluation = 0
+    last_evaluation = learner.transitions
     scheduled_evaluations = 0
     completed_evaluations = 0
     last_tb_log = 0
@@ -144,7 +173,45 @@ def train(config, *, device: str = "cuda", total_transitions: int | None = None,
         if force or learner.transitions - last_tb_log >= config.tb_log_every:
             for key, value in learner.pop_training_stats().items():
                 tb.latest(f"train/{key}", value)
-            tb.latest("train/epsilon", float(np.mean(epsilons)))
+            scheduled_epsilons = [
+                epsilon_for_schedule(
+                    epsilon,
+                    learner.schedule_triggered,
+                )
+                for epsilon in base_epsilons
+            ]
+            tb.latest("train/epsilon", float(np.mean(scheduled_epsilons)))
+            # Report the optimizer's actual LR. During replay warmup the
+            # optimizer is frozen, but the configured schedule is still visible.
+            tb.latest("train/lr", learner.optimizer.param_groups[0]["lr"])
+            tb.latest("train/gamma", learner.gamma)
+            tb.latest("train/replay_size", float(len(learner.replay)))
+            tb.latest(
+                "train/updates_per_transition",
+                learner.updates_per_transition_at(),
+            )
+            tb.latest("train/replay_warming_up", float(learner.replay_warming_up))
+            tb.latest("train/schedule_triggered", float(learner.schedule_triggered))
+            tb.latest(
+                "train/schedule_forced_by_transition",
+                float(learner.schedule_trigger_source == "transition_limit"),
+            )
+            tb.latest(
+                "train/schedule_qualifying_evals",
+                float(learner.schedule_consecutive_qualifying_evals),
+            )
+            tb.latest(
+                "train/schedule_trigger_checkpoint_transition",
+                float(learner.schedule_trigger_checkpoint_transition)
+                if learner.schedule_trigger_checkpoint_transition is not None
+                else -1.0,
+            )
+            tb.latest(
+                "train/schedule_applied_transition",
+                float(learner.schedule_applied_transition)
+                if learner.schedule_applied_transition is not None
+                else -1.0,
+            )
             tb.flush(learner.transitions)
             last_tb_log = learner.transitions
 
@@ -220,6 +287,22 @@ def train(config, *, device: str = "cuda", total_transitions: int | None = None,
                 continue
             for key in ("mean_return", "mean_survival_pieces", "mean_lines", "mean_length", "truncated_episodes"):
                 writer.add_scalar(f"evaluation/{key}", result[key], step)
+            qualified = learner.schedule_evaluation_qualifies(
+                mean_lines=float(result["mean_lines"]),
+                mean_survival_pieces=float(result["mean_survival_pieces"]),
+            )
+            learner.observe_schedule_evaluation(
+                mean_lines=float(result["mean_lines"]),
+                mean_survival_pieces=float(result["mean_survival_pieces"]),
+                checkpoint_transition=step,
+            )
+            schedule_triggered.value = int(learner.schedule_triggered)
+            writer.add_scalar("evaluation/schedule_qualified", float(qualified), step)
+            writer.add_scalar(
+                "evaluation/schedule_triggered",
+                float(learner.schedule_triggered),
+                step,
+            )
 
     def save_checkpoint(path: Path, *, schedule_evaluation: bool) -> None:
         nonlocal scheduled_evaluations
@@ -264,6 +347,8 @@ def train(config, *, device: str = "cuda", total_transitions: int | None = None,
                 continue
             learner_get_wait_seconds += time.perf_counter() - wait_started
             learner.add(batch)
+            if learner.schedule_triggered:
+                schedule_triggered.value = 1
             # 一个 IPC batch 可能包含数百条 transition。这里按 transition
             # cadence 补齐所有到期 update，而不是“收到一条消息只更新一次”。
             # 因此 transition_batch_size 只影响通信效率，不改变每条样本对应的

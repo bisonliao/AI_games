@@ -12,6 +12,7 @@ from TetrisEnv.vector_runner import make_sync_vector_env
 
 from .model import DuelingDQN, masked_q_values, observations_to_torch
 from .replay import TransitionBatch
+from .schedule import epsilon_for_schedule
 
 
 def _latest_weights(weight_queue, model: DuelingDQN) -> None:
@@ -128,6 +129,7 @@ def actor_process(
     piece_placed_reward: float = 0.01,
     line_clear_reward: float = 0.75,
     terminal_penalty: float = 1.0,
+    schedule_triggered=None,
 ) -> None:
     """运行一个 actor 进程中的多个同步 Tetris 环境。
 
@@ -236,7 +238,11 @@ def actor_process(
                 torch_obs = observations_to_torch(obs, "cpu")
                 q_values = masked_q_values(model(torch_obs), torch_obs.get("action_mask"))
                 actions = q_values.argmax(dim=-1).numpy()
-            explore = rng.random(envs_per_actor) < epsilon
+            current_epsilon = epsilon_for_schedule(
+                epsilon,
+                bool(schedule_triggered.value) if schedule_triggered is not None else False,
+            )
+            explore = rng.random(envs_per_actor) < current_epsilon
             for index in np.flatnonzero(explore):
                 legal_actions = np.flatnonzero(np.asarray(obs["action_mask"])[index])
                 actions[index] = int(rng.choice(legal_actions))
