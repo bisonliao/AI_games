@@ -20,10 +20,7 @@ def _learner_config(**overrides):
         update_every=2,
         target_update_every=100,
         learning_rate=1e-4,
-        schedule_trigger_mean_lines=100.0,
-        schedule_trigger_mean_survival_pieces=300.0,
-        schedule_trigger_patience=2,
-        schedule_force_transition=10_000_000,
+        final_epsilon=0.01,
         gamma=0.99,
         gradient_clip_norm=10.0,
     )
@@ -67,10 +64,28 @@ def test_learner_catches_up_updates_for_large_ipc_batch():
     assert learner.gradient_updates == 4
     assert learner._next_update_transition == 12
     stats = learner.pop_training_stats()
-    assert stats["lr"] == 5e-5
+    assert stats["lr"] == pytest.approx(learner.learning_rate_at())
     assert stats["replay_size"] == 10
     assert all(np.isfinite(stats[key]) for key in ("loss", "q_mean", "target_mean", "gradient_norm"))
     assert learner.pop_training_stats() == {}
+
+
+def test_update_count_is_independent_of_ipc_batch_partitioning():
+    config = _learner_config()
+    one_batch = Learner(config, device="cpu", seed=0)
+    one_batch.add(_batch(10))
+    while one_batch.update():
+        pass
+
+    partitioned = Learner(config, device="cpu", seed=0)
+    for size in (2, 2, 2, 2, 2):
+        partitioned.add(_batch(size))
+        while partitioned.update():
+            pass
+
+    assert one_batch.transitions == partitioned.transitions == 10
+    assert one_batch.gradient_updates == partitioned.gradient_updates == 4
+    assert one_batch._next_update_transition == partitioned._next_update_transition == 12
 
 
 def test_double_dqn_selects_online_action_and_evaluates_it_with_target():
@@ -84,71 +99,34 @@ def test_double_dqn_selects_online_action_and_evaluates_it_with_target():
     assert values.tolist() == [20.0, 60.0]
 
 
-def test_schedule_requires_consecutive_capability_evaluations():
+def test_linear_decay_uses_absolute_first_five_million_transitions():
     learner = Learner(
-        _learner_config(update_every=4),
+        _learner_config(),
         device="cpu",
         seed=0,
     )
-    assert learner.learning_rate_at() == pytest.approx(1e-4)
-    assert learner.updates_per_transition_at(1_000_000) == pytest.approx(0.25)
-    assert learner.gamma == pytest.approx(0.99)
-
-    assert not learner.observe_schedule_evaluation(
-        mean_lines=120.0,
-        mean_survival_pieces=350.0,
-        checkpoint_transition=100,
-    )
-    assert learner.schedule_consecutive_qualifying_evals == 1
-    assert not learner.observe_schedule_evaluation(
-        mean_lines=99.0,
-        mean_survival_pieces=500.0,
-        checkpoint_transition=200,
-    )
-    assert learner.schedule_consecutive_qualifying_evals == 0
-    assert not learner.observe_schedule_evaluation(
-        mean_lines=100.0,
-        mean_survival_pieces=300.0,
-        checkpoint_transition=300,
-    )
-    learner.transitions = 375
-    assert learner.observe_schedule_evaluation(
-        mean_lines=101.0,
-        mean_survival_pieces=301.0,
-        checkpoint_transition=350,
-    )
-    assert learner.schedule_triggered
-    assert learner.schedule_trigger_source == "capability"
-    assert learner.schedule_trigger_checkpoint_transition == 350
-    assert learner.schedule_applied_transition == 375
-    assert learner.learning_rate_at() == pytest.approx(1e-5)
-    assert learner.optimizer.param_groups[0]["lr"] == pytest.approx(1e-5)
-
-    # The transition is permanent: later weak evaluations cannot undo it.
-    assert not learner.observe_schedule_evaluation(
-        mean_lines=0.0,
-        mean_survival_pieces=0.0,
-        checkpoint_transition=400,
-    )
-    assert learner.schedule_triggered
-    assert learner.learning_rate_at() == pytest.approx(1e-5)
+    assert learner.decay_progress_at(0) == 0.0
+    assert learner.learning_rate_at(0) == pytest.approx(1e-4)
+    assert learner.decay_progress_at(2_500_000) == 0.5
+    assert learner.learning_rate_at(2_500_000) == pytest.approx(5.5e-5)
+    assert learner.decay_progress_at(5_000_000) == 1.0
+    assert learner.learning_rate_at(5_000_000) == pytest.approx(1e-5)
 
 
-def test_schedule_is_forced_at_transition_limit_without_capability_trigger():
-    learner = Learner(
-        _learner_config(schedule_force_transition=100),
-        device="cpu",
-        seed=0,
-    )
-    learner.transitions = 99
-    learner.add(_batch(2))
+def test_linear_decay_checkpoint_resumes_at_absolute_progress(tmp_path: Path):
+    config = _learner_config(replay_capacity=8)
+    checkpoint = tmp_path / "linear.pt"
+    source = Learner(config, device="cpu", seed=0)
+    source.transitions = 2_500_000
+    source._apply_learning_rate()
+    source.checkpoint(checkpoint)
 
-    assert learner.transitions == 101
-    assert learner.schedule_triggered
-    assert learner.schedule_trigger_source == "transition_limit"
-    assert learner.schedule_trigger_checkpoint_transition is None
-    assert learner.schedule_applied_transition == 101
-    assert learner.optimizer.param_groups[0]["lr"] == pytest.approx(1e-5)
+    restored = Learner(config, device="cpu", seed=1)
+    restored.load_checkpoint(checkpoint, total_transitions=6_000_000)
+
+    assert restored.decay_progress_at() == pytest.approx(0.5)
+    assert restored.learning_rate_at() == pytest.approx(5.5e-5)
+    assert restored.optimizer.param_groups[0]["lr"] == pytest.approx(5.5e-5)
 
 
 def _trained_checkpoint(path: Path, config) -> Learner:
@@ -184,7 +162,9 @@ def test_resume_restores_training_state_and_rebuilds_full_replay(tmp_path: Path)
         assert torch.equal(source_value, restored_value)
     source_optimizer = source.optimizer.state_dict()
     restored_optimizer = restored.optimizer.state_dict()
-    assert restored_optimizer["param_groups"][0]["lr"] == pytest.approx(1e-4)
+    assert restored_optimizer["param_groups"][0]["lr"] == pytest.approx(
+        source.learning_rate_at()
+    )
     for key, value in source_optimizer["param_groups"][0].items():
         if key != "lr":
             assert restored_optimizer["param_groups"][0][key] == value
@@ -208,89 +188,6 @@ def test_resume_restores_training_state_and_rebuilds_full_replay(tmp_path: Path)
     # The cursor advances from the post-warmup step; no historical debt remains.
     assert restored.update() is False
     assert restored.gradient_updates == updates_before + 1
-
-
-def test_checkpoint_restores_capability_schedule_state(tmp_path: Path):
-    config = _learner_config(replay_capacity=8, update_every=4)
-    checkpoint = tmp_path / "pending_schedule.pt"
-    source = Learner(config, device="cpu", seed=0)
-    source.add(_batch(10))
-    assert not source.observe_schedule_evaluation(
-        mean_lines=110.0,
-        mean_survival_pieces=320.0,
-        checkpoint_transition=10,
-    )
-    source.checkpoint(checkpoint)
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    assert "stability_controls" not in payload
-    assert payload["schedule_state"] == {
-        "triggered": False,
-        "trigger_source": None,
-        "consecutive_qualifying_evals": 1,
-        "trigger_checkpoint_transition": None,
-        "applied_transition": None,
-    }
-
-    restored = Learner(config, device="cpu", seed=1)
-    restored.load_checkpoint(
-        checkpoint,
-        total_transitions=100,
-    )
-
-    assert restored.transitions == 10
-    assert not restored.schedule_triggered
-    assert restored.schedule_consecutive_qualifying_evals == 1
-    assert restored.learning_rate_at() == pytest.approx(1e-4)
-    assert restored.observe_schedule_evaluation(
-        mean_lines=100.0,
-        mean_survival_pieces=300.0,
-        checkpoint_transition=10,
-    )
-    assert restored.schedule_triggered
-    assert restored.schedule_trigger_source == "capability"
-    assert restored.schedule_trigger_checkpoint_transition == 10
-    assert restored.schedule_applied_transition == 10
-    assert restored.optimizer.param_groups[0]["lr"] == pytest.approx(1e-5)
-
-    triggered_checkpoint = tmp_path / "triggered_schedule.pt"
-    restored.checkpoint(triggered_checkpoint)
-    triggered_restore = Learner(config, device="cpu", seed=2)
-    triggered_restore.load_checkpoint(triggered_checkpoint, total_transitions=100)
-    assert triggered_restore.schedule_triggered
-    assert triggered_restore.schedule_trigger_source == "capability"
-    assert triggered_restore.schedule_consecutive_qualifying_evals == 2
-    assert triggered_restore.schedule_trigger_checkpoint_transition == 10
-    assert triggered_restore.schedule_applied_transition == 10
-    assert triggered_restore.learning_rate_at() == pytest.approx(1e-5)
-    assert triggered_restore.optimizer.param_groups[0]["lr"] == pytest.approx(1e-5)
-    # Replay warmup temporarily reports zero update rate.
-    triggered_restore._resume_replay_warmup = False
-    assert triggered_restore.updates_per_transition_at() == pytest.approx(0.25)
-    assert triggered_restore.gamma == pytest.approx(0.99)
-
-
-def test_resume_past_force_transition_triggers_old_checkpoint(tmp_path: Path):
-    config = _learner_config(
-        replay_capacity=8,
-        schedule_force_transition=10,
-    )
-    checkpoint = tmp_path / "legacy_untriggered.pt"
-    source = Learner(config, device="cpu", seed=0)
-    # Simulate a checkpoint written before hard-limit support existed.
-    source.transitions = 10
-    source.checkpoint(checkpoint)
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    payload.pop("schedule_state")
-    torch.save(payload, checkpoint)
-
-    restored = Learner(config, device="cpu", seed=1)
-    restored.load_checkpoint(checkpoint, total_transitions=100)
-
-    assert restored.schedule_triggered
-    assert restored.schedule_trigger_source == "transition_limit"
-    assert restored.schedule_trigger_checkpoint_transition is None
-    assert restored.schedule_applied_transition == 10
-    assert restored.optimizer.param_groups[0]["lr"] == pytest.approx(1e-5)
 
 
 def test_resume_rejects_incompatible_reward_configuration(tmp_path: Path):

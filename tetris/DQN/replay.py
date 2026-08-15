@@ -14,6 +14,25 @@ class TransitionBatch:
     terminated: np.ndarray
 
 
+def concatenate_transition_batches(batches: list[TransitionBatch]) -> TransitionBatch:
+    """Concatenate transition batches in the supplied order."""
+    if not batches:
+        raise ValueError("cannot concatenate an empty transition batch list")
+    return TransitionBatch(
+        obs={
+            key: np.concatenate([batch.obs[key] for batch in batches], axis=0)
+            for key in batches[0].obs
+        },
+        actions=np.concatenate([batch.actions for batch in batches], axis=0),
+        rewards=np.concatenate([batch.rewards for batch in batches], axis=0),
+        next_obs={
+            key: np.concatenate([batch.next_obs[key] for batch in batches], axis=0)
+            for key in batches[0].next_obs
+        },
+        terminated=np.concatenate([batch.terminated for batch in batches], axis=0),
+    )
+
+
 class ReplayBuffer:
     def __init__(self, capacity: int, seed: int = 0) -> None:
         self.capacity = int(capacity)
@@ -63,4 +82,3 @@ class ReplayBuffer:
             next_obs={k: v[indices].copy() for k, v in self._next_obs.items()},
             terminated=self._terminated[indices].copy(),
         )
-

@@ -31,28 +31,19 @@ python -m DQN.train --config configs/ddqn_default.toml --device cuda \
 ```
 
 `--total-transitions` is an absolute target, not the number of additional
-transitions. The default run uses a 1,000,000-entry replay buffer. Its schedule
-is driven by checkpoint evaluation rather than a fixed transition count. An
-evaluation qualifies only when both `mean_lines >= 100` and
-`mean_survival_pieces >= 300`; after two consecutive qualifying evaluations,
-all actors permanently switch to epsilon `0.05`, and the optimizer learning
-rate permanently switches to 10% of the configured value (`1e-5` with the
-default config). If capability has not triggered first, the same one-way switch
-is forced when the learner reaches 10 million transitions. These controller
-values are configured by
-`schedule_trigger_mean_lines`, `schedule_trigger_mean_survival_pieces`, and
-`schedule_trigger_patience`, with the hard limit configured by
-`schedule_force_transition`. Before the trigger, the four actors use epsilon
-`0.05、0.10、0.20、0.40`; `update_every` and `gamma` remain unchanged throughout
-training.
+transitions. The default run uses a 1,000,000-entry replay buffer. LR and every
+actor's epsilon are linearly interpolated over the first 5 million absolute
+transitions. With four actors, epsilon changes from `0.05、0.10、0.20、0.40` to
+`0、0.01、0.01、0.01`; LR changes from the configured value to 10% of that value
+(`1e-4 → 1e-5` by default). `final_epsilon` configures the non-greedy actors'
+final epsilon. `update_every` and `gamma` remain unchanged throughout training.
 
 Checkpoints do not contain replay samples. A resumed run therefore restores the
 online/target networks, Adam state, counters, and RNG states, then
 freezes optimization while collecting a fresh `replay_capacity` transitions
-(1,000,000 by default). The capability controller's trigger state, consecutive
-qualification count, and trigger/application transitions are restored from new
-checkpoints; older checkpoints without this state resume as untriggered. A
-resumed job starts a new run directory and never overwrites the source
+(1,000,000 by default). Schedule progress is reconstructed directly from the
+restored absolute transition count. A resumed job starts a new run directory
+and never overwrites the source
 checkpoint. This is a warm restart rather than bit-for-bit continuation.
 
 Play the environment with the keyboard:
@@ -77,6 +68,23 @@ Show the agent while it evaluates:
 python -m DQN.evaluate checkpoints/<run-id>/dddqn_250000.pt \
   --episodes 3 --max-steps 20000 --render --render-fps 10
 ```
+
+## Epsilon/LR 衰减消融结论
+
+三条同配置实验比较了能力达标后立即衰减、前 5M transition 线性衰减和完全不衰减。
+在共同的约 8.53M 观察区间末端，三者 `evaluation/mean_lines` 分别为
+`417.7、1262.6、331.6`；线性衰减实验随后达到 `1836.0`。5M以后，线性衰减实验
+的 `episode/lines` 均值约 `352`、`holes` 均值约 `22.8`，明显优于立即衰减的
+`151.6、30.1`。不衰减虽然曲线波动较小，但训练 episode 能力很低，不属于有效的
+“稳定”。
+
+这说明本任务对衰减时序高度敏感。一个合理解释是：骤降会突然改变 replay 数据分布，
+完全不降又会让高探索数据长期占据 replay；平滑线性衰减在探索多样性和后期策略质量
+之间取得了更好平衡。因此训练代码只保留前 5M transition 线性衰减。由于三次运行
+时长不同且多进程训练并非逐 bit 确定，这一结果是明确的工程选择，而不是跨随机种子
+的统计显著性结论。
+
+
 
 ## 动作空间设计：Placement 动作是关键
 
@@ -161,7 +169,7 @@ tensorboard --logdir runs/dddqn
 run 进行比较。所有标量图的横轴 `Step` 都表示 learner 已接收的 transition
 数量；在 placement 环境中，一条 transition 就是放置一个方块，而不是一次键盘
 输入或画面帧。常规指标每累计 `tb_log_every` 条 transition 刷新一次，默认值为
-`10000`。
+`100000`。
 
 指标名后缀和统计方式需要先区分：
 
@@ -182,16 +190,13 @@ run 进行比较。所有标量图的横轴 `Step` 都表示 learner 已接收�
 | `train/q_mean` | mini-batch 中在线网络对实际采样动作给出的 Q 值均值，即对未来折扣回报的当前估计。应结合 `target_mean` 和评估回报观察；持续无界增大可能表示价值过估计或训练不稳定。 |
 | `train/target_mean` | Double DQN 目标 `reward + gamma * (1 - terminated) * next_q` 的均值。它与 `q_mean` 长期严重偏离时，通常会同时表现为 loss 较高。 |
 | `train/gradient_norm` | 梯度裁剪前的总梯度范数；当前上限由 `gradient_clip_norm` 控制。长期远高于上限说明裁剪频繁发生，可能需要检查学习率、奖励尺度或异常样本。 |
-| `train/epsilon` | 所有 actor 当前 epsilon 的均值。能力触发前，四个 actor 分别为 `0.05、0.10、0.20、0.40`，均值为 `0.1875`；触发后所有 actor 都永久切换为 `0.05`。 |
-| `train/lr` | optimizer 当前实际使用的学习率。默认是 `1e-4`；能力触发后永久切换为配置值的 1/10（默认 `1e-5`）。 |
+| `train/epsilon` | 所有 actor 当前实际 epsilon 的均值。前 5M transition 内从初始 profile 线性下降；默认四 actor 从 `0.05、0.10、0.20、0.40` 变为 `0、0.01、0.01、0.01`。 |
+| `train/actor_0_epsilon` … `train/actor_3_epsilon` | 每个 actor 当前实际使用的 epsilon，用于确认线性衰减和最终一个贪心 actor 的 profile。 |
+| `train/lr` | optimizer 当前实际使用的学习率；前 5M transition 内从配置初值线性下降到初值的 1/10，默认是 `1e-4 → 1e-5`。 |
 | `train/gamma` | 当前 TD target、actor reward shaping 和 checkpoint evaluator 共同使用的有效 gamma；它始终使用配置中的 `gamma`，默认是 `0.99`。 |
-| `train/updates_per_transition` | 当前每条 transition 对应的目标梯度更新次数，始终由配置中的 `update_every` 决定，默认是 `0.25`。断点续训重新填充 replay 时暂为 0。 |
+| `train/updates_per_transition` | 当前每条 transition 对应的目标梯度更新频率，始终由配置中的 `update_every` 决定，默认是 `0.25`。这是配置 cadence，不是已完成 update 的实测计数；断点续训重新填充 replay 时暂为 0。 |
+| `train/gradient_updates_cumulative` | learner 实际完成的 `optimizer.step()` 累计次数。新训练在 `learning_starts` 后应按 `update_every` 稳定增长；CPU/GPU 变慢只应改变墙钟速度，不应减少相同 transition step 下的该计数。断点续训会包含 checkpoint 已有的累计次数，并在 replay 预热期间保持不变。 |
 | `train/replay_warming_up` | 断点续训是否正在重建未保存的 replay；1 表示网络冻结并只采样，0 表示允许优化。新训练始终为 0。 |
-| `train/schedule_triggered` | schedule 是否已经由能力达标或 transition 硬上限触发；0 表示仍使用初始 epsilon/LR，1 表示两个调整已经永久生效。 |
-| `train/schedule_forced_by_transition` | 是否因为到达 `schedule_force_transition` 硬上限而触发；1 表示硬上限触发，0 表示尚未触发或由能力达标触发。应与 `schedule_triggered` 一起读取。 |
-| `train/schedule_qualifying_evals` | 触发前当前连续达标的有效评测次数；任一能力指标低于阈值就清零，触发后保持在触发时的次数。 |
-| `train/schedule_trigger_checkpoint_transition` | 令 schedule 达到所需连续次数的 checkpoint transition；尚未触发或由 transition 硬上限触发时为 `-1`。 |
-| `train/schedule_applied_transition` | learner 实际收到触发结果并应用 epsilon/LR 切换时的 transition；异步评测会让它晚于触发 checkpoint，尚未触发时为 `-1`。 |
 | `train/replay_size` | replay buffer 当前保存的 transition 数量；达到 `replay_capacity` 后保持在容量上限，旧样本会被新样本覆盖。 |
 | `train/throughput` | learner 从启动至当前累计接收的 transition 数除以实际经过秒数，单位约为 transition/s。这是全程平均吞吐量，不是单个记录区间的瞬时速度。 |
 
@@ -219,7 +224,7 @@ run 进行比较。所有标量图的横轴 `Step` 都表示 learner 已接收�
 执行的，曲线上的 Step 使用该 checkpoint 保存时的 transition 数，所以结果即使
 稍后才返回，也会落在正确的训练位置。各 checkpoint 使用同一组互不相同的固定
 环境 seed；每个回合的 7-bag 仍有随机性，但不同 checkpoint 面对相同的随机场景，
-适合作为 schedule 的低噪声 controller set。最终比较模型时仍建议另外更换 seed
+适合作为低噪声的 checkpoint 对比集。最终比较模型时仍建议另外更换 seed
 做离线 holdout 评测。
 
 | 指标 | 含义与解读 |
@@ -229,9 +234,7 @@ run 进行比较。所有标量图的横轴 `Step` 都表示 learner 已接收�
 | `evaluation/mean_lines` | 评估回合平均消行数；比较 checkpoint 策略时应重点关注。 |
 | `evaluation/mean_length` | 评估回合平均 placement 决策数。 |
 | `evaluation/truncated_episodes` | 因达到每回合 `eval_max_steps` 而非自然顶出而停止的回合数。非零表示上述均值中包含被截断的长回合，可适当提高 `eval_max_steps`。 |
-| `evaluation/schedule_qualified` | 本次评测是否同时满足配置的平均消行数和平均存活方块数阈值。只有连续达标才推进到触发。 |
-| `evaluation/schedule_triggered` | 处理完本次评测后 schedule 是否已触发；一旦变为 1 就不会回退。 |
-| `evaluation/schedule_failed` | 值为 1 表示待评估队列已满，该次 checkpoint 未能安排评估；不表示训练或 checkpoint 保存失败。 |
+| `evaluation/queue_full` | 值为 1 表示待评估队列已满，该次 checkpoint 未能安排评估；不表示训练或 checkpoint 保存失败。 |
 | `evaluation/error` | Text 面板中的评估异常信息。出现此项表示对应 checkpoint 的评估失败。 |
 
 ### `action/`：动作选择分布
@@ -254,18 +257,35 @@ run 进行比较。所有标量图的横轴 `Step` 都表示 learner 已接收�
 
 ### `communication/`：多进程采样与 learner 通信
 
-这些累计指标用于判断 actor、transition queue 和 learner 之间是否存在吞吐瓶颈，
-不直接表示策略质量。
+训练使用 gather–learner 流水线。独立 gather 进程通过每个 actor 的结果队列和
+round 命令队列，严格收齐每个 actor 恰好 `transition_batch_size` 条 transition，
+再按固定 actor 顺序合并。完整 round 通过容量为 1 的可靠队列交给 learner；成功
+入队后 gather 立即统一放行下一轮，因此 actor rollout 可以和 learner 对上一轮的
+replay 插入及梯度更新并行。各 actor 的样本贡献仍严格相同，流水线速度由最慢的
+actor 采样阶段与 learner 更新阶段中较慢的一侧决定。
+
+权重不参与 round barrier。learner 为每个 actor 维护容量为 1 的 latest-wins
+mailbox；actor 只在每轮开始时检查并加载当前可见的最新版本，没有新权重就继续使用
+旧版本。因此单个 actor 的一轮内权重一致，但不同 actor 在同一轮可能看到不同版本。
+
+这些指标用于确认 round 均衡性和定位慢 actor，不直接表示策略质量。
 
 | 指标 | 含义与解读 |
 | --- | --- |
-| `communication/actors_transition_put_wait_seconds_cumulative` | 所有 actor 为把 transition batch 放入队列所花时间的累计和。增长斜率明显变大，通常表示队列经常满、learner 消费速度低于 actor 生产速度。 |
+| `communication/synchronous_rounds_cumulative` | 本次 run 已被 learner 完整接收并写入 replay 的同步 round 数。每轮总样本数固定为 `num_actors * transition_batch_size`。 |
+| `communication/actor_N/accepted_transitions_cumulative` | learner 已从 actor N 接受的 transition 累计数。所有 actor 的曲线在每个已完成 round 后应完全重合；这是均衡性的权威指标。 |
+| `communication/actor_N/transitions_sent_cumulative` | actor N 自报的成功发送累计数。它走低优先级指标队列，可能滞后或缺点；判断 replay 实际构成应以前一个 accepted 指标为准。 |
+| `communication/actor_N/round_arrival_seconds` | 最近记录 round 中，从统一放行到 actor N 的 batch 被 gather 取出的耗时。长期明显高于其他 actor 表示它是 straggler。 |
+| `communication/synchronous_round_collection_seconds` | gather 最近记录 round 收齐全部 actor batch 的耗时，通常接近最慢 actor 的 arrival 时间。 |
+| `communication/actors_transition_put_wait_seconds_cumulative` | 所有 actor 为把本轮 batch 放入各自独立结果队列所花时间的累计和。正常同步协议下通常很低；持续增长表示 gather 没有及时取走上一轮结果或进程调度严重拥堵。 |
 | `communication/actors_transition_put_poll_timeout_count_cumulative` | actor 因队列满而等待满一个 `transition_put_poll_timeout` 轮询周期的累计次数。超时后会继续重试，不会因此丢弃 transition。 |
-| `communication/actors_transition_put_message_count_cumulative` | actor 成功发送的 IPC batch 消息累计数。用当前横轴上的 transition 数除以消息数，可粗略估算每条 IPC 消息承载的 transition 数；通常越接近 `transition_batch_size`，通信批处理越充分。 |
-| `communication/learner/transition_get_wait_seconds_cumulative` | learner 所有取队列尝试耗时的累计和，包括成功取得 batch 和空轮询。默认非阻塞配置下主要反映调用开销。 |
-| `communication/learner/transition_get_poll_timeout_count_cumulative` | learner 使用正数 `transition_get_poll_timeout` 时，等待后仍未取得数据的累计次数；默认值为 0 时通常一直为 0。 |
-| `communication/learner/transition_get_empty_seconds_cumulative` | learner 未取到 transition 的队列查询所消耗时间累计值，不包含随后 `learner_idle_sleep` 的睡眠时间。持续快速增长通常表示 actor 供给不足。 |
-| `communication/learner/transition_get_empty_poll_count_cumulative` | learner 查询 transition queue 为空的累计次数。该值受 `learner_idle_sleep` 和轮询配置影响，不宜单独跨配置比较。 |
+| `communication/actors_transition_put_message_count_cumulative` | 所有 actor 成功发送的 round batch 消息累计数；正常情况下约等于 `num_actors * synchronous_rounds_cumulative`。 |
+| `communication/gather/batch_queue_wait_seconds_cumulative` | gather 为把完整大 batch 放入容量为 1 的 learner 队列所等待的累计时间。持续增长表示 learner 更新慢于 actor round 生产速度，也说明流水线背压正在生效。 |
+| `communication/gather/batch_queue_wait_timeout_count_cumulative` | gather 等满一个 `transition_put_poll_timeout` 仍无法提交大 batch 的累计次数；超时只会重试，不会丢训练数据。 |
+| `communication/learner/round_update_seconds` | learner 最近一轮补齐全部到期 mini-batch update 的耗时。与 round collection time 对比可判断流水线由 rollout 还是 update 限制。 |
+| `communication/learner/transition_get_wait_seconds_cumulative` | learner 查询 gather 大 batch 队列所花时间的累计和，不包含 `learner_idle_sleep`。 |
+| `communication/learner/transition_get_empty_seconds_cumulative` | learner 没取得 gather 大 batch 时，队列查询本身所消耗的累计时间，不包含随后睡眠。 |
+| `communication/learner/transition_get_empty_poll_count_cumulative` | gather 大 batch 尚未可用时 learner 的空轮询次数。该值受 `learner_idle_sleep` 影响，不宜单独跨配置比较。 |
 
 实际观察时，可以先用 `evaluation/mean_lines`、`evaluation/mean_return` 和
 `evaluation/mean_survival_pieces` 判断策略是否进步，再结合 `episode/` 与
@@ -281,22 +301,30 @@ bootstrapping. Episodes terminate only when a piece cannot be spawned or locks
 above the visible board.
 
 `total_transitions` now counts placed pieces rather than input frames. The
-default configuration runs for 50 million placement decisions; old 6-action checkpoints
+default configuration runs for 30 million placement decisions; old 6-action checkpoints
 are intentionally incompatible with this training and evaluation path.
 
-Actors use geometrically spaced exploration rates until checkpoint evaluation
-meets both configured capability thresholds for the configured number of
-consecutive results, or until the configured hard transition limit is reached,
-whichever happens first. With four actors, epsilon is
-`0.05, 0.10, 0.20, 0.40` before the one-way trigger and becomes `0.05` for
-every actor afterward. The same trigger also changes the optimizer learning
-rate to 10% of its initial configured value.
+Actors start with geometrically spaced exploration rates. Both epsilon and LR
+are linearly decayed over the first 5 million absolute transitions. With four
+actors, epsilon moves from `0.05, 0.10, 0.20, 0.40` to
+`0, 0.01, 0.01, 0.01`, while LR reaches 10% of its configured initial value.
 
 Each actor/environment pair receives a distinct deterministic seed. Every
 configured checkpoint interval is saved; checkpoints reaching `eval_every` are
 evaluated by a separate CPU process with `eval_max_steps` as a per-episode
 truncation limit.
 
-Transition communication uses separate policies. Actors use `transition_put_poll_timeout` only as a polling interval while waiting for a full queue; the transition is retained and eventually enqueued, so a poll timeout never drops data. The learner defaults to non-blocking `transition_get_poll_timeout = 0`, and when no transition is available it processes metrics/evaluation messages and sleeps for `learner_idle_sleep` before retrying.
+Transition collection uses a gather–learner pipeline. The gather process owns
+the actor round barrier: every actor produces exactly `transition_batch_size`
+transitions, and gather concatenates one batch per actor in stable order. It
+reliably submits the complete round through a queue of size one, then releases
+all actors to collect the next round while the learner inserts and updates from
+the previous one. The batch size must be divisible by `envs_per_actor`; there is
+no wall-clock partial-batch flush.
 
-Each actor also accumulates transitions locally before IPC. `transition_batch_size = 256` means an actor with 8 vector environments usually sends one message every 32 vector steps, with 256 transitions per message, instead of sending one message per vector step. `transition_batch_max_wait = 0.1` provides a latency bound for short runs: a partially filled batch is sent after 100 ms, so small smoke runs cannot wait forever for 256 transitions.
+Replay remains private to the learner, and its transition-based update cursor
+keeps `update_every` independent of IPC timing. Actor weights use separate
+latest-wins one-slot mailboxes and are loaded only at actor round boundaries;
+weight delivery never joins the gather barrier. Training stops only at a complete
+round, so `total_transitions` may be exceeded by less than
+`num_actors * transition_batch_size` transitions.

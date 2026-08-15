@@ -14,7 +14,7 @@ from torch import nn
 
 from .model import DuelingDQN, masked_q_values, observations_to_torch
 from .replay import ReplayBuffer, TransitionBatch
-from .schedule import learning_rate_for_schedule
+from .schedule import decay_progress, learning_rate_for_schedule
 from .utils import cpu_state_dict
 
 
@@ -29,7 +29,12 @@ def double_dqn_next_values(
 
 
 class Learner:
-    def __init__(self, config, device: str = "cuda", seed: int = 0) -> None:
+    def __init__(
+        self,
+        config,
+        device: str = "cuda",
+        seed: int = 0,
+    ) -> None:
         if device.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested but torch.cuda.is_available() is False")
         self.device = torch.device(device)
@@ -42,11 +47,6 @@ class Learner:
         self.replay = ReplayBuffer(config.replay_capacity, seed=seed)
         self.gradient_updates = 0
         self.transitions = 0
-        self._schedule_triggered = False
-        self._schedule_trigger_source: str | None = None
-        self._schedule_consecutive_qualifying_evals = 0
-        self._schedule_trigger_checkpoint_transition: int | None = None
-        self._schedule_applied_transition: int | None = None
         self._train_metric_sums = torch.zeros(4, device=self.device)
         self._train_metric_count = 0
         # 更新时钟独立于 IPC 消息边界。收到一个大 batch 后，trainer 会反复调用
@@ -65,8 +65,6 @@ class Learner:
             "piece_placed_reward",
             "line_clear_reward",
             "terminal_penalty",
-            "schedule_trigger_mean_lines",
-            "schedule_trigger_mean_survival_pieces",
         ):
             if key not in checkpoint_config:
                 continue
@@ -76,21 +74,20 @@ class Learner:
                 raise ValueError(
                     f"checkpoint {key}={saved} is incompatible with current {key}={current}"
                 )
-        key = "schedule_trigger_patience"
-        if key in checkpoint_config and int(checkpoint_config[key]) != int(
-            getattr(self.config, key)
+        saved_final_epsilon = checkpoint_config.get(
+            "final_epsilon",
+            checkpoint_config.get("post_trigger_epsilon"),
+        )
+        if saved_final_epsilon is not None and not math.isclose(
+            float(self.config.final_epsilon),
+            float(saved_final_epsilon),
+            rel_tol=1e-9,
+            abs_tol=1e-12,
         ):
             raise ValueError(
-                f"checkpoint {key}={int(checkpoint_config[key])} is incompatible "
-                f"with current {key}={int(getattr(self.config, key))}"
-            )
-        key = "schedule_force_transition"
-        if key in checkpoint_config and int(checkpoint_config[key]) != int(
-            getattr(self.config, key)
-        ):
-            raise ValueError(
-                f"checkpoint {key}={int(checkpoint_config[key])} is incompatible "
-                f"with current {key}={int(getattr(self.config, key))}"
+                f"checkpoint final_epsilon={float(saved_final_epsilon)} is "
+                f"incompatible with current final_epsilon="
+                f"{float(self.config.final_epsilon)}"
             )
 
     def load_checkpoint(
@@ -119,26 +116,6 @@ class Learner:
         self.transitions = int(payload.get("transitions", 0))
         self._throughput_start_transition = self.transitions
         self.gradient_updates = int(payload.get("gradient_updates", 0))
-        schedule_state = payload.get("schedule_state", {})
-        self._schedule_triggered = bool(schedule_state.get("triggered", False))
-        self._schedule_trigger_source = schedule_state.get("trigger_source")
-        self._schedule_consecutive_qualifying_evals = int(
-            schedule_state.get("consecutive_qualifying_evals", 0)
-        )
-        trigger_transition = schedule_state.get("trigger_checkpoint_transition")
-        self._schedule_trigger_checkpoint_transition = (
-            None if trigger_transition is None else int(trigger_transition)
-        )
-        applied_transition = schedule_state.get("applied_transition")
-        self._schedule_applied_transition = (
-            None if applied_transition is None else int(applied_transition)
-        )
-        if self._schedule_triggered and self._schedule_trigger_source is None:
-            self._schedule_trigger_source = (
-                "capability"
-                if self._schedule_trigger_checkpoint_transition is not None
-                else "unknown"
-            )
         if total_transitions <= self.transitions:
             raise ValueError(
                 f"total_transitions ({total_transitions}) must exceed checkpoint "
@@ -150,10 +127,6 @@ class Learner:
         self._resume_replay_warmup = self._resume_warmup_target > 0
         warmup_end = self.transitions + self._resume_warmup_target
         self._next_update_transition = float(warmup_end)
-        # Old checkpoints may contain the temporary ``stability_controls`` field.
-        # It is intentionally ignored. Old checkpoints have no evaluation-driven
-        # schedule state, so they resume in the untriggered state.
-        self._maybe_force_schedule()
         self._apply_learning_rate()
 
         if "random_state" in payload:
@@ -173,7 +146,9 @@ class Learner:
         self.replay.add_batch(batch)
         count = len(batch.actions)
         self.transitions += count
-        self._maybe_force_schedule()
+        # Linear decay advances with accepted transitions even while replay is
+        # warming up and no optimizer step is performed.
+        self._apply_learning_rate()
         if self._resume_replay_warmup and len(self.replay) >= self._resume_warmup_target:
             self._resume_replay_warmup = False
             # Begin from the actual post-batch step.  Do not make up updates that
@@ -185,92 +160,16 @@ class Learner:
     def replay_warming_up(self) -> bool:
         return self._resume_replay_warmup
 
-    def learning_rate_at(self) -> float:
+    def decay_progress_at(self, transition: int | float | None = None) -> float:
+        if transition is None:
+            transition = self.transitions
+        return decay_progress(transition)
+
+    def learning_rate_at(self, transition: int | float | None = None) -> float:
         return learning_rate_for_schedule(
             self.config.learning_rate,
-            self._schedule_triggered,
+            self.decay_progress_at(transition),
         )
-
-    @property
-    def schedule_triggered(self) -> bool:
-        return self._schedule_triggered
-
-    @property
-    def schedule_trigger_source(self) -> str | None:
-        return self._schedule_trigger_source
-
-    @property
-    def schedule_consecutive_qualifying_evals(self) -> int:
-        return self._schedule_consecutive_qualifying_evals
-
-    @property
-    def schedule_trigger_checkpoint_transition(self) -> int | None:
-        return self._schedule_trigger_checkpoint_transition
-
-    @property
-    def schedule_applied_transition(self) -> int | None:
-        return self._schedule_applied_transition
-
-    def schedule_evaluation_qualifies(
-        self,
-        *,
-        mean_lines: float,
-        mean_survival_pieces: float,
-    ) -> bool:
-        """Return whether one evaluation meets both capability thresholds."""
-        return (
-            float(mean_lines) >= float(self.config.schedule_trigger_mean_lines)
-            and float(mean_survival_pieces)
-            >= float(self.config.schedule_trigger_mean_survival_pieces)
-        )
-
-    def observe_schedule_evaluation(
-        self,
-        *,
-        mean_lines: float,
-        mean_survival_pieces: float,
-        checkpoint_transition: int,
-    ) -> bool:
-        """Advance the controller and return True only on the triggering result."""
-        if self._schedule_triggered:
-            return False
-        if self.schedule_evaluation_qualifies(
-            mean_lines=mean_lines,
-            mean_survival_pieces=mean_survival_pieces,
-        ):
-            self._schedule_consecutive_qualifying_evals += 1
-        else:
-            self._schedule_consecutive_qualifying_evals = 0
-        if (
-            self._schedule_consecutive_qualifying_evals
-            < int(self.config.schedule_trigger_patience)
-        ):
-            return False
-
-        return self._trigger_schedule(
-            source="capability",
-            checkpoint_transition=int(checkpoint_transition),
-        )
-
-    def _maybe_force_schedule(self) -> bool:
-        if self.transitions < int(self.config.schedule_force_transition):
-            return False
-        return self._trigger_schedule(source="transition_limit")
-
-    def _trigger_schedule(
-        self,
-        *,
-        source: str,
-        checkpoint_transition: int | None = None,
-    ) -> bool:
-        if self._schedule_triggered:
-            return False
-        self._schedule_triggered = True
-        self._schedule_trigger_source = source
-        self._schedule_trigger_checkpoint_transition = checkpoint_transition
-        self._schedule_applied_transition = int(self.transitions)
-        self._apply_learning_rate()
-        return True
 
     @property
     def gamma(self) -> float:
@@ -368,13 +267,6 @@ class Learner:
             "transitions": self.transitions,
             "gradient_updates": self.gradient_updates,
             "next_update_transition": self._next_update_transition,
-            "schedule_state": {
-                "triggered": self._schedule_triggered,
-                "trigger_source": self._schedule_trigger_source,
-                "consecutive_qualifying_evals": self._schedule_consecutive_qualifying_evals,
-                "trigger_checkpoint_transition": self._schedule_trigger_checkpoint_transition,
-                "applied_transition": self._schedule_applied_transition,
-            },
             "config": self.config.to_dict(),
             "random_state": random.getstate(),
             "numpy_random_state": np.random.get_state(),

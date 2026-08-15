@@ -17,10 +17,7 @@ class TrainConfig:
     target_update_every: int = 10_000
     broadcast_every: int = 1_000
     learning_rate: float = 1e-4
-    schedule_trigger_mean_lines: float = 100.0
-    schedule_trigger_mean_survival_pieces: float = 300.0
-    schedule_trigger_patience: int = 2
-    schedule_force_transition: int = 10_000_000
+    final_epsilon: float = 0.01
     gamma: float = 0.99
     gradient_clip_norm: float = 10.0
     num_actors: int = 4
@@ -28,11 +25,9 @@ class TrainConfig:
     queue_size: int = 32
     transition_put_poll_timeout: float = 1.0
     transition_batch_size: int = 256
-    transition_batch_max_wait: float = 0.1
-    transition_get_poll_timeout: float = 0.0
     learner_idle_sleep: float = 0.001
     actor_stats_every: int = 10_000
-    tb_log_every: int = 10_000
+    tb_log_every: int = 100_000
     total_transitions: int = 5_000_000
     checkpoint_every: int = 250_000
     eval_every: int = 250_000
@@ -62,14 +57,15 @@ class TrainConfig:
             raise ValueError("replay_capacity and batch_size must be positive")
         if self.update_every <= 0 or self.learning_rate <= 0:
             raise ValueError("update_every and learning_rate must be positive")
-        if (
-            self.schedule_trigger_mean_lines < 0
-            or self.schedule_trigger_mean_survival_pieces < 0
-        ):
-            raise ValueError("schedule trigger thresholds must be non-negative")
-        if self.schedule_trigger_patience < 1:
-            raise ValueError("schedule_trigger_patience must be positive")
-        if self.schedule_force_transition < 1:
-            raise ValueError("schedule_force_transition must be positive")
+        if self.broadcast_every <= 0:
+            raise ValueError("broadcast_every must be positive")
+        if not 0 <= self.final_epsilon <= 1:
+            raise ValueError("final_epsilon must be in [0, 1]")
         if not 0 <= self.gamma < 1:
             raise ValueError("gamma must be in [0, 1)")
+        if self.transition_batch_size < 1:
+            raise ValueError("transition_batch_size must be positive")
+        if self.transition_put_poll_timeout <= 0:
+            raise ValueError("transition_put_poll_timeout must be positive")
+        if self.learner_idle_sleep < 0:
+            raise ValueError("learner_idle_sleep must be non-negative")

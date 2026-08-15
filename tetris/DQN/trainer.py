@@ -9,10 +9,11 @@ import time
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 
-from .actor import actor_process
+from .actor import _put_latest_weight
 from .evaluator import evaluator_process
+from .gather import GatheredRound, gather_process
 from .learner import Learner
-from .schedule import epsilon_for_schedule
+from .schedule import epsilon_for_schedule, final_actor_epsilons
 from .utils import run_name, seed_everything
 
 
@@ -57,6 +58,8 @@ def train(
     env_count = int(envs_per_actor if envs_per_actor is not None else config.envs_per_actor)
     if actors_count < 1 or env_count < 1:
         raise ValueError("num_actors and envs_per_actor must both be positive")
+    if config.transition_batch_size % env_count:
+        raise ValueError("transition_batch_size must be divisible by envs_per_actor")
     learner = Learner(config, device=device, seed=config.seed)
     if resume_from is not None:
         learner.load_checkpoint(
@@ -64,21 +67,20 @@ def train(
             total_transitions=total,
         )
     ctx = mp.get_context("spawn")
-    transition_queue = ctx.Queue(maxsize=config.queue_size)
+    # The gather-to-learner queue is the only reliable training-data boundary.
+    # maxsize=1 bounds staleness while allowing rollout N+1 to overlap updates N.
+    gathered_round_queue = ctx.Queue(maxsize=1)
+    gather_error_queue = ctx.Queue(maxsize=1)
     metric_queue = ctx.Queue(maxsize=config.queue_size * 2)
     weight_queues = [ctx.Queue(maxsize=1) for _ in range(actors_count)]
     stop_event = ctx.Event()
+    shared_decay_progress = ctx.Value("d", learner.decay_progress_at())
     evaluator_stop_event = ctx.Event()
     evaluation_queue = ctx.Queue(maxsize=config.max_pending_evals)
     evaluation_result_queue = ctx.Queue()
-    # Evaluation results are handled by the learner process. Actors read only
-    # this shared, one-way flag and switch to epsilon 0.05 after capability has
-    # met both configured thresholds for the required number of evaluations.
-    schedule_triggered = ctx.Value("b", int(learner.schedule_triggered))
     initial = learner.state_dict_cpu()
-    for q in weight_queues:
-        q.put(initial)
-    actors = []
+    for weight_queue in weight_queues:
+        weight_queue.put((learner.gradient_updates, initial))
     if actors_count == 1:
         base_epsilons = [0.4]
     else:
@@ -86,33 +88,37 @@ def train(
             float(0.05 * (0.4 / 0.05) ** (i / (actors_count - 1)))
             for i in range(actors_count)
         ]
-    for actor_id in range(actors_count):
-        actor_seed = config.seed + actor_id * 1_000_000
-        process = ctx.Process(
-            target=actor_process,
-            args=(
-                actor_id,
-                env_count,
-                actor_seed,
-                base_epsilons[actor_id],
-                transition_queue,
-                metric_queue,
-                weight_queues[actor_id],
-                stop_event,
-                config.transition_put_poll_timeout,
-                config.actor_stats_every,
-                config.transition_batch_size,
-                config.transition_batch_max_wait,
-                learner.gamma,
-                config.piece_placed_reward,
-                config.line_clear_reward,
-                config.terminal_penalty,
-                schedule_triggered,
-            ),
-            daemon=True,
-        )
-        process.start()
-        actors.append(process)
+    final_epsilons = final_actor_epsilons(
+        actors_count,
+        config.final_epsilon,
+    )
+    gather = ctx.Process(
+        target=gather_process,
+        kwargs={
+            "actors_count": actors_count,
+            "env_count": env_count,
+            "base_epsilons": base_epsilons,
+            "final_epsilons": final_epsilons,
+            "seed": config.seed,
+            "weight_queues": weight_queues,
+            "metric_queue": metric_queue,
+            "gathered_round_queue": gathered_round_queue,
+            "error_queue": gather_error_queue,
+            "decay_progress": shared_decay_progress,
+            "stop_event": stop_event,
+            "start_transition": learner.transitions,
+            "total_transitions": total,
+            "transition_batch_size": config.transition_batch_size,
+            "transition_put_poll_timeout": config.transition_put_poll_timeout,
+            "learner_idle_sleep": config.learner_idle_sleep,
+            "actor_stats_every": config.actor_stats_every,
+            "gamma": learner.gamma,
+            "piece_placed_reward": config.piece_placed_reward,
+            "line_clear_reward": config.line_clear_reward,
+            "terminal_penalty": config.terminal_penalty,
+        },
+    )
+    gather.start()
 
     evaluator = ctx.Process(
         target=evaluator_process,
@@ -139,30 +145,27 @@ def train(
     tb.latest("train/lr", learner.optimizer.param_groups[0]["lr"])
     tb.latest("train/gamma", learner.gamma)
     tb.latest("train/updates_per_transition", learner.updates_per_transition_at())
+    tb.latest(
+        "train/gradient_updates_cumulative",
+        float(learner.gradient_updates),
+    )
     tb.latest("train/replay_warming_up", float(learner.replay_warming_up))
-    tb.latest("train/schedule_triggered", float(learner.schedule_triggered))
-    tb.latest(
-        "train/schedule_forced_by_transition",
-        float(learner.schedule_trigger_source == "transition_limit"),
-    )
-    tb.latest(
-        "train/schedule_qualifying_evals",
-        float(learner.schedule_consecutive_qualifying_evals),
-    )
     # A per-run directory prevents a fresh experiment from overwriting an old
     # checkpoint with the same transition step (including pre-placement models).
     checkpoint_dir = Path(config.checkpoint_root) / run_id
     last_checkpoint = learner.transitions
     learner_get_wait_seconds = 0.0
-    learner_get_poll_timeouts = 0
     learner_get_empty_polls = 0
     learner_get_empty_seconds = 0.0
     actor_queue_wait_seconds: dict[int, float] = {}
     actor_queue_wait_timeouts: dict[int, int] = {}
     actor_transition_messages: dict[int, int] = {}
+    actor_transitions_sent: dict[int, int] = {}
     actor_action_counts: dict[int, np.ndarray] = {}
     actor_line_clear_transitions: dict[int, int] = {}
     actor_terminal_transitions: dict[int, int] = {}
+    gather_batch_queue_wait_seconds = 0.0
+    gather_batch_queue_wait_timeouts = 0
     last_evaluation = learner.transitions
     scheduled_evaluations = 0
     completed_evaluations = 0
@@ -173,14 +176,20 @@ def train(
         if force or learner.transitions - last_tb_log >= config.tb_log_every:
             for key, value in learner.pop_training_stats().items():
                 tb.latest(f"train/{key}", value)
-            scheduled_epsilons = [
+            current_epsilons = [
                 epsilon_for_schedule(
-                    epsilon,
-                    learner.schedule_triggered,
+                    base_epsilon,
+                    learner.decay_progress_at(),
+                    final_epsilon,
                 )
-                for epsilon in base_epsilons
+                for base_epsilon, final_epsilon in zip(
+                    base_epsilons,
+                    final_epsilons,
+                )
             ]
-            tb.latest("train/epsilon", float(np.mean(scheduled_epsilons)))
+            tb.latest("train/epsilon", float(np.mean(current_epsilons)))
+            for actor_id, actor_epsilon in enumerate(current_epsilons):
+                tb.latest(f"train/actor_{actor_id}_epsilon", actor_epsilon)
             # Report the optimizer's actual LR. During replay warmup the
             # optimizer is frozen, but the configured schedule is still visible.
             tb.latest("train/lr", learner.optimizer.param_groups[0]["lr"])
@@ -190,42 +199,52 @@ def train(
                 "train/updates_per_transition",
                 learner.updates_per_transition_at(),
             )
+            tb.latest(
+                "train/gradient_updates_cumulative",
+                float(learner.gradient_updates),
+            )
             tb.latest("train/replay_warming_up", float(learner.replay_warming_up))
-            tb.latest("train/schedule_triggered", float(learner.schedule_triggered))
-            tb.latest(
-                "train/schedule_forced_by_transition",
-                float(learner.schedule_trigger_source == "transition_limit"),
-            )
-            tb.latest(
-                "train/schedule_qualifying_evals",
-                float(learner.schedule_consecutive_qualifying_evals),
-            )
-            tb.latest(
-                "train/schedule_trigger_checkpoint_transition",
-                float(learner.schedule_trigger_checkpoint_transition)
-                if learner.schedule_trigger_checkpoint_transition is not None
-                else -1.0,
-            )
-            tb.latest(
-                "train/schedule_applied_transition",
-                float(learner.schedule_applied_transition)
-                if learner.schedule_applied_transition is not None
-                else -1.0,
-            )
             tb.flush(learner.transitions)
             last_tb_log = learner.transitions
 
     def drain_metrics() -> None:
+        nonlocal gather_batch_queue_wait_seconds, gather_batch_queue_wait_timeouts
         while True:
             try:
                 metric = metric_queue.get_nowait()
             except queue.Empty:
                 break
+            if metric.get("kind") == "gather_communication":
+                gather_batch_queue_wait_seconds = float(
+                    metric.get("batch_queue_wait_seconds", 0.0)
+                )
+                gather_batch_queue_wait_timeouts = int(
+                    metric.get("batch_queue_wait_timeouts", 0)
+                )
+                tb.latest(
+                    "communication/gather/batch_queue_wait_seconds_cumulative",
+                    gather_batch_queue_wait_seconds,
+                )
+                tb.latest(
+                    "communication/gather/batch_queue_wait_timeout_count_cumulative",
+                    gather_batch_queue_wait_timeouts,
+                )
+                tb.latest(
+                    "communication/synchronous_round_collection_seconds",
+                    float(metric["round_collection_seconds"]),
+                )
+                for actor_id, arrival in enumerate(metric.get("actor_arrival_seconds", ())):
+                    tb.latest(
+                        f"communication/actor_{actor_id}/round_arrival_seconds",
+                        float(arrival),
+                    )
+                continue
             if metric.get("kind") == "actor_communication":
                 actor_id = int(metric["actor_id"])
                 actor_queue_wait_seconds[actor_id] = float(metric["queue_wait_seconds"])
                 actor_queue_wait_timeouts[actor_id] = int(metric["queue_wait_timeouts"])
                 actor_transition_messages[actor_id] = int(metric.get("messages_sent", 0))
+                actor_transitions_sent[actor_id] = int(metric.get("transitions", 0))
                 actor_action_counts[actor_id] = np.asarray(metric.get("action_counts", ()), dtype=np.int64)
                 actor_line_clear_transitions[actor_id] = int(metric.get("line_clear_transitions", 0))
                 actor_terminal_transitions[actor_id] = int(metric.get("terminal_transitions", 0))
@@ -240,6 +259,10 @@ def train(
                 tb.latest(
                     "communication/actors_transition_put_message_count_cumulative",
                     sum(actor_transition_messages.values()),
+                )
+                tb.latest(
+                    f"communication/actor_{actor_id}/transitions_sent_cumulative",
+                    actor_transitions_sent[actor_id],
                 )
                 nonempty_counts = [counts for counts in actor_action_counts.values() if counts.size]
                 if nonempty_counts:
@@ -287,48 +310,52 @@ def train(
                 continue
             for key in ("mean_return", "mean_survival_pieces", "mean_lines", "mean_length", "truncated_episodes"):
                 writer.add_scalar(f"evaluation/{key}", result[key], step)
-            qualified = learner.schedule_evaluation_qualifies(
-                mean_lines=float(result["mean_lines"]),
-                mean_survival_pieces=float(result["mean_survival_pieces"]),
-            )
-            learner.observe_schedule_evaluation(
-                mean_lines=float(result["mean_lines"]),
-                mean_survival_pieces=float(result["mean_survival_pieces"]),
-                checkpoint_transition=step,
-            )
-            schedule_triggered.value = int(learner.schedule_triggered)
-            writer.add_scalar("evaluation/schedule_qualified", float(qualified), step)
-            writer.add_scalar(
-                "evaluation/schedule_triggered",
-                float(learner.schedule_triggered),
-                step,
-            )
 
-    def save_checkpoint(path: Path, *, schedule_evaluation: bool) -> None:
+    def save_checkpoint(path: Path, *, evaluate: bool) -> None:
         nonlocal scheduled_evaluations
         learner.checkpoint(path)
-        if schedule_evaluation:
+        if evaluate:
             try:
                 evaluation_queue.put_nowait(str(path))
                 scheduled_evaluations += 1
             except queue.Full:
-                writer.add_scalar("evaluation/schedule_failed", 1, learner.transitions)
+                writer.add_scalar("evaluation/queue_full", 1, learner.transitions)
+
+    def publish_latest_weights() -> None:
+        state = learner.state_dict_cpu()
+        message = (learner.gradient_updates, state)
+        for weight_queue in weight_queues:
+            if not _put_latest_weight(
+                weight_queue,
+                message,
+                poll_timeout=config.transition_put_poll_timeout,
+                stop_event=stop_event,
+            ):
+                raise RuntimeError("training stopped while publishing actor weights")
+
+    def gather_failure() -> RuntimeError:
+        try:
+            error = gather_error_queue.get(timeout=0.1)
+        except queue.Empty:
+            return RuntimeError("gather process exited before delivering the final round")
+        return RuntimeError(
+            f"gather process failed with {error['type']}: {error['message']}\n"
+            f"{error['traceback']}"
+        )
 
     try:
-        while learner.transitions < total:
+        expected_round = 0
+        completed_rounds = 0
+        final_received = False
+        while not final_received:
             wait_started = time.perf_counter()
             try:
-                if config.transition_get_poll_timeout > 0:
-                    batch = transition_queue.get(timeout=config.transition_get_poll_timeout)
-                else:
-                    batch = transition_queue.get_nowait()
+                gathered_round: GatheredRound = gathered_round_queue.get_nowait()
             except queue.Empty:
-                idle_seconds = time.perf_counter() - wait_started
-                learner_get_wait_seconds += idle_seconds
-                learner_get_empty_seconds += idle_seconds
+                poll_seconds = time.perf_counter() - wait_started
+                learner_get_wait_seconds += poll_seconds
+                learner_get_empty_seconds += poll_seconds
                 learner_get_empty_polls += 1
-                if config.transition_get_poll_timeout > 0:
-                    learner_get_poll_timeouts += 1
                 drain_metrics()
                 drain_evaluations()
                 tb.latest(
@@ -340,65 +367,75 @@ def train(
                     learner_get_empty_polls,
                 )
                 flush_tensorboard()
-                if not any(p.is_alive() for p in actors):
-                    raise RuntimeError("all actor processes exited before reaching the transition budget")
+                if stop_event.is_set() or not gather.is_alive():
+                    raise gather_failure()
                 if config.learner_idle_sleep > 0:
                     time.sleep(config.learner_idle_sleep)
                 continue
             learner_get_wait_seconds += time.perf_counter() - wait_started
-            learner.add(batch)
-            if learner.schedule_triggered:
-                schedule_triggered.value = 1
-            # 一个 IPC batch 可能包含数百条 transition。这里按 transition
-            # cadence 补齐所有到期 update，而不是“收到一条消息只更新一次”。
-            # 因此 transition_batch_size 只影响通信效率，不改变每条样本对应的
-            # update_every 训练频率。
+
+            if gathered_round.round_id != expected_round:
+                raise RuntimeError(
+                    f"learner received round {gathered_round.round_id}, "
+                    f"expected {expected_round}"
+                )
+            if len(gathered_round.batch.actions) != actors_count * config.transition_batch_size:
+                raise RuntimeError(
+                    f"gathered round {expected_round} has "
+                    f"{len(gathered_round.batch.actions)} transitions, expected "
+                    f"{actors_count * config.transition_batch_size}"
+                )
+            learner.add(gathered_round.batch)
+            shared_decay_progress.value = learner.decay_progress_at()
+            completed_rounds += 1
+            tb.latest("communication/synchronous_rounds_cumulative", completed_rounds)
+            for actor_id in range(actors_count):
+                tb.latest(
+                    f"communication/actor_{actor_id}/accepted_transitions_cumulative",
+                    completed_rounds * config.transition_batch_size,
+                )
+            update_started = time.perf_counter()
             while True:
                 if not learner.update():
                     break
                 if learner.gradient_updates % config.broadcast_every == 0:
-                    state = learner.state_dict_cpu()
-                    for q in weight_queues:
-                        try:
-                            while True:
-                                q.get_nowait()
-                        except queue.Empty:
-                            pass
-                        try:
-                            q.put_nowait(state)
-                        except queue.Full:
-                            pass
+                    publish_latest_weights()
+            tb.latest(
+                "communication/learner/round_update_seconds",
+                time.perf_counter() - update_started,
+            )
             drain_metrics()
             drain_evaluations()
             tb.latest(
                 "communication/learner/transition_get_wait_seconds_cumulative",
                 learner_get_wait_seconds,
             )
-            tb.latest(
-                "communication/learner/transition_get_poll_timeout_count_cumulative",
-                learner_get_poll_timeouts,
-            )
             flush_tensorboard()
             if learner.transitions - last_checkpoint >= config.checkpoint_every:
                 checkpoint_path = checkpoint_dir / f"dddqn_{learner.transitions}.pt"
                 should_evaluate = learner.transitions - last_evaluation >= config.eval_every
-                save_checkpoint(checkpoint_path, schedule_evaluation=should_evaluate)
+                save_checkpoint(checkpoint_path, evaluate=should_evaluate)
                 if should_evaluate:
                     last_evaluation = learner.transitions
                 last_checkpoint = learner.transitions
+            final_received = bool(gathered_round.is_final)
+            expected_round += 1
+        if learner.transitions < total:
+            raise RuntimeError(
+                f"final gathered round stopped at {learner.transitions}, below budget {total}"
+            )
         final_path = checkpoint_dir / f"dddqn_{learner.transitions}.pt"
         should_evaluate = learner.transitions != last_evaluation
-        save_checkpoint(final_path, schedule_evaluation=should_evaluate)
+        save_checkpoint(final_path, evaluate=should_evaluate)
         drain_metrics()
         drain_evaluations()
         flush_tensorboard(force=True)
     finally:
         stop_event.set()
-        for process in actors:
-            process.join(timeout=10)
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=2)
+        gather.join(timeout=10)
+        if gather.is_alive():
+            gather.terminate()
+            gather.join(timeout=2)
         # Let already scheduled checkpoints finish without holding up the learner loop.
         deadline = time.perf_counter() + config.eval_shutdown_timeout
         while completed_evaluations < scheduled_evaluations and time.perf_counter() < deadline:
@@ -420,10 +457,15 @@ def train(
         flush_tensorboard(force=True)
         writer.flush()
         writer.close()
-        transition_queue.close()
+        gathered_round_queue.close()
+        gather_error_queue.close()
         metric_queue.close()
+        metric_queue.cancel_join_thread()
         for q in weight_queues:
             q.close()
+            # The final asynchronous snapshot may intentionally remain unread
+            # when actors stop at the transition budget.
+            q.cancel_join_thread()
         evaluation_queue.close()
         evaluation_result_queue.close()
     return log_dir
