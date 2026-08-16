@@ -1,0 +1,19 @@
+# PyTorch MADDPG core.  This standalone project targets Python >= 3.10.
+torch>=2.0
+# Gym 0.26 (needed by archived MPE) is not NumPy-2 compatible.
+numpy>=1.24,<2.0
+tensorboard>=2.0
+
+# Maintained comparison backend. The [mpe] extra installs pygame.
+gymnasium==1.2.1
+pettingzoo[mpe]==1.25.0
+
+# Archived OpenAI MPE compatibility backend. Gym and Gymnasium are both
+# required when both environment backends are retained; they are not alternatives.
+gym==0.26.2
+numpy-stl==3.2.0
+six>=1.16
+# Archived MPE's OpenGL viewer uses the pyglet 1.x API.
+pyglet==1.5.27
+# 论文/官方 TF 代码使用的旧 MPE；固定到 shared-reward 修复后的归档提交。
+multiagent @ git+https://github.com/openai/multiagent-particle-envs.git@6ed7cac

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maddpg-torch-faithful"
+version = "0.1.0"
+description = "Faithful PyTorch port of OpenAI MADDPG for MPE"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE.txt"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["maddpg*", "experiments*"]
