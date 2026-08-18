@@ -3,10 +3,10 @@
 Examples:
 
   # Headless deterministic evaluation (the default)
-  python -m experiments.play_torch --checkpoint ./chkpt/legacy/official/simple_spread
+  python -m experiments.play_torch --checkpoint ./chkpt/maddpg/legacy/official/simple_spread
 
   # Open the MPE viewer and play at roughly 10 environment steps per second
-  python -m experiments.play_torch --checkpoint ./chkpt/legacy/official/simple_spread --render
+  python -m experiments.play_torch --checkpoint ./chkpt/maddpg/legacy/official/simple_spread --render
 """
 
 import argparse
@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from experiments.train_torch import (
+    ALGORITHM_NAME,
     CHECKPOINT_VERSION,
     SUPPORTED_CHECKPOINT_VERSIONS,
     _seed_everything,
@@ -25,6 +26,7 @@ from maddpg.common.tf_util_torch import get_device, load_state, resolve_state_pa
 
 
 _REQUIRED_METADATA = (
+    "algorithm",
     "env_backend",
     "scenario",
     "policy_mode",
@@ -38,6 +40,9 @@ _REQUIRED_METADATA = (
     "gamma",
     "batch_size",
     "action_specs",
+)
+_REQUIRED_V3_METADATA = tuple(
+    key for key in _REQUIRED_METADATA if key != "algorithm"
 )
 _REQUIRED_V2_METADATA = (
     "env_backend",
@@ -126,13 +131,23 @@ def _evaluation_args_from_checkpoint(checkpoint, options):
     if not isinstance(metadata, dict):
         raise ValueError("unsupported checkpoint: metadata must be a dictionary")
     required_metadata = (
-        _REQUIRED_V2_METADATA if version == 2 else _REQUIRED_METADATA
+        _REQUIRED_V2_METADATA
+        if version == 2
+        else _REQUIRED_V3_METADATA
+        if version == 3
+        else _REQUIRED_METADATA
     )
     missing = [key for key in required_metadata if key not in metadata]
     if missing:
         raise ValueError(
             "unsupported checkpoint: missing metadata fields {}".format(
                 missing
+            )
+        )
+    if version == CHECKPOINT_VERSION and metadata["algorithm"] != ALGORITHM_NAME:
+        raise ValueError(
+            "unsupported checkpoint algorithm {!r}; expected {!r}".format(
+                metadata["algorithm"], ALGORITHM_NAME
             )
         )
     num_units = (

@@ -14,11 +14,13 @@ from experiments.train_torch import (
     _checkpoint_payload,
     _evaluation_tensorboard_metrics,
     _save_checkpoint_and_evaluate,
+    _state_dir as maddpg_state_dir,
     evaluate_checkpoint,
     get_trainers,
     make_env,
 )
 from experiments.play_torch import parse_args as parse_play_args, play
+from QMIX.train import _state_dir as qmix_state_dir
 from maddpg.common.env_adapters_torch import infer_action_specs
 from maddpg.common.tensorboard_logger_torch import TensorBoardIntervalLogger
 from maddpg.common.tf_util_torch import load_state, resolve_state_path, save_state
@@ -71,6 +73,17 @@ def _checkpoint_fixture(args):
 
 
 class CheckpointEvaluationTest(unittest.TestCase):
+    def test_algorithm_checkpoint_directories_do_not_overlap(self):
+        args = _args()
+        root = Path("shared-checkpoint-root")
+
+        maddpg_dir = Path(maddpg_state_dir(root, args))
+        qmix_dir = qmix_state_dir(root, args.scenario)
+
+        self.assertNotEqual(maddpg_dir, qmix_dir)
+        self.assertEqual(maddpg_dir.parts[-4], "maddpg")
+        self.assertEqual(qmix_dir.parts[-4], "qmix")
+
     def test_simple_adversary_checkpoint_evaluation_reports_task_metrics(self):
         args = _args()
         args.scenario = "simple_adversary"
@@ -241,6 +254,30 @@ class CheckpointEvaluationTest(unittest.TestCase):
             self.assertEqual(evaluation["episode_lengths"], [25])
             self.assertIn("version 2 checkpoint", output.getvalue())
 
+    def test_play_accepts_version_3_checkpoint_without_algorithm_metadata(self):
+        args = _args()
+        args.env_backend = "legacy"
+        args.max_episode_len = 2
+        checkpoint, _, _ = _checkpoint_fixture(args)
+        checkpoint["checkpoint_version"] = 3
+        del checkpoint["metadata"]["algorithm"]
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_path = save_state(directory, checkpoint)
+            options = parse_play_args(
+                [
+                    "--checkpoint",
+                    checkpoint_path,
+                    "--episodes",
+                    "1",
+                    "--no-cuda",
+                ]
+            )
+            with redirect_stdout(io.StringIO()):
+                evaluation = play(options)
+
+            self.assertEqual(evaluation["evaluation_episodes"], 1)
+            self.assertEqual(evaluation["episode_lengths"], [2])
+
     def test_evaluation_is_deterministic_and_preserves_training_rng(self):
         args = _args()
         checkpoint, _, _ = _checkpoint_fixture(args)
@@ -304,6 +341,10 @@ class CheckpointEvaluationTest(unittest.TestCase):
             self.assertEqual(
                 Path(checkpoint_path).name,
                 "state_steps_123.pt",
+            )
+            self.assertEqual(
+                load_state(checkpoint_path)["metadata"]["algorithm"],
+                "maddpg",
             )
             report_path = Path(directory) / "evaluation.json"
             self.assertTrue(report_path.is_file())

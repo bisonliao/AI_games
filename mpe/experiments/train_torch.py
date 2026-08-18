@@ -6,7 +6,7 @@ explicit comparison modes and do not share checkpoints with the default mode.
 
 渲染可视化（弹窗看 MPE）：
   python experiments/train_torch.py --display --load-dir <模型根目录> --scenario simple
-  实际从 load-dir/<backend>/<policy-mode>/<scenario>/ 加载。可加 --eval-episodes N。
+  实际从 load-dir/maddpg/<backend>/<policy-mode>/<scenario>/ 加载。可加 --eval-episodes N。
 
 评测与胜负指标：
   - 协作场景（如 simple_spread）：总回报 episode_reward 越高越好。
@@ -58,7 +58,7 @@ def parse_args():
         help="copy is the stable DDPG default; independent reproduces the TF1 initialization quirk",
     )
     parser.add_argument("--max-episode-len", type=int, default=25, help="maximum episode length")
-    parser.add_argument("--num-episodes", type=int, default=2_00_000, help="number of episodes")
+    parser.add_argument("--num-episodes", type=int, default=200_000, help="number of episodes")
     parser.add_argument("--num-adversaries", type=int, default=0, help="number of adversaries")
     parser.add_argument("--good-policy", type=str, default="maddpg", help="policy for good agents")
     parser.add_argument("--adv-policy", type=str, default="maddpg", help="policy of adversaries")
@@ -76,7 +76,7 @@ def parse_args():
     # Checkpointing
     parser.add_argument("--exp-name", type=str, default=None, help="name of the experiment")
     parser.add_argument("--save-dir", type=str, default="chkpt/",
-                        help="checkpoint root; backend/policy/scenario subdirectories are added")
+                        help="checkpoint root; maddpg/backend/policy/scenario subdirectories are added")
     parser.add_argument("--save-rate", type=int, default=10000, help="save model once every time this many episodes are completed")
     parser.add_argument("--load-dir", type=str, default="",
                         help="checkpoint root to load; defaults to save-dir")
@@ -84,7 +84,7 @@ def parse_args():
     parser.add_argument("--restore", action="store_true", default=False)
     parser.add_argument("--display", action="store_true", default=False,
                         help="渲染可视化：弹窗显示 MPE 环境，需配合 --load-dir 加载已训练策略")
-    parser.add_argument("--eval-episodes", type=int, default=10,
+    parser.add_argument("--eval-episodes", type=int, default=20,
                         help="仅在与 --display 同时使用时生效：跑满该数量 episode 后退出并打印评测回报（0=不限制）")
     parser.add_argument(
         "--checkpoint-eval-episodes",
@@ -174,8 +174,9 @@ def get_trainers(
     return trainers
 
 
-CHECKPOINT_VERSION = 3
-SUPPORTED_CHECKPOINT_VERSIONS = (2, CHECKPOINT_VERSION)
+ALGORITHM_NAME = "maddpg"
+CHECKPOINT_VERSION = 4
+SUPPORTED_CHECKPOINT_VERSIONS = (2, 3, CHECKPOINT_VERSION)
 _CHECKPOINT_V2_METADATA_KEYS = (
     "env_backend",
     "scenario",
@@ -198,7 +199,19 @@ def _seed_everything(seed):
 
 def _state_dir(root, arglist):
     return os.path.join(
-        root.rstrip(os.sep),
+        os.fspath(root).rstrip(os.sep),
+        ALGORITHM_NAME,
+        arglist.env_backend,
+        arglist.policy_mode,
+        arglist.scenario,
+    )
+
+
+def _legacy_state_dir(root, arglist):
+    """Pre-algorithm-directory layout, accepted for restore compatibility."""
+
+    return os.path.join(
+        os.fspath(root).rstrip(os.sep),
         arglist.env_backend,
         arglist.policy_mode,
         arglist.scenario,
@@ -207,6 +220,7 @@ def _state_dir(root, arglist):
 
 def _checkpoint_metadata(arglist, action_spec_n):
     return {
+        "algorithm": ALGORITHM_NAME,
         "env_backend": arglist.env_backend,
         "scenario": arglist.scenario,
         "policy_mode": arglist.policy_mode,
@@ -278,6 +292,14 @@ def _load_trainers_from_checkpoint(
         metadata_to_compare = {
             key: expected_metadata[key]
             for key in _CHECKPOINT_V2_METADATA_KEYS
+        }
+    elif checkpoint_version == 3:
+        # Version 3 is fully self-describing but predates the explicit
+        # algorithm identity field and algorithm-specific save directory.
+        metadata_to_compare = {
+            key: value
+            for key, value in expected_metadata.items()
+            if key != "algorithm"
         }
     if actual_metadata != metadata_to_compare:
         raise ValueError(
@@ -635,10 +657,15 @@ def train(arglist):
     _seed_everything(arglist.seed)
     device = get_device(use_cuda=not arglist.no_cuda)
 
-    # Backend and policy mode are part of experiment identity and cannot share checkpoints.
+    # Algorithm/backend/policy/scenario all participate in checkpoint identity.
     save_dir = _state_dir(arglist.save_dir, arglist)
     load_root = arglist.load_dir if arglist.load_dir else arglist.save_dir
     load_dir = _state_dir(load_root, arglist)
+    legacy_load_dir = _legacy_state_dir(load_root, arglist)
+    using_legacy_load_dir = False
+    if not os.path.exists(load_dir) and os.path.exists(legacy_load_dir):
+        load_dir = legacy_load_dir
+        using_legacy_load_dir = True
 
     # Both adapters expose the same dict-based parallel API to this loop.
     env = make_env(arglist.scenario, arglist, arglist.benchmark)
@@ -671,6 +698,11 @@ def train(arglist):
     train_step = 0
     completed_episodes = 0
     if arglist.display or arglist.restore or arglist.benchmark:
+        if using_legacy_load_dir:
+            print(
+                "[Compatibility] loading pre-algorithm-directory checkpoint "
+                "from {}".format(load_dir)
+            )
         print("Loading previous state from {}...".format(load_dir))
         ckpt = load_state(load_dir, map_location=device)
         train_step, completed_episodes = _load_trainers_from_checkpoint(

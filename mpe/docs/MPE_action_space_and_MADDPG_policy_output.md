@@ -37,7 +37,7 @@ u_y = action[3] - action[4]
 checkpoint 路径为：
 
 ```text
-<root>/<env-backend>/<policy-mode>/<scenario>/state_steps_<steps>.pt
+<root>/maddpg/<env-backend>/<policy-mode>/<scenario>/state_steps_<steps>.pt
 ```
 
-文件保存 online/target 网络、两个 Adam 状态、训练 step、完成 episode 数和动作规格元数据。恢复时严格校验后端、场景、策略模式和规格。紧邻当前版本、已实际产出的 v2 checkpoint 仍可加载；更早的格式不兼容，也不会部分静默加载。
+文件保存算法名、online/target 网络、两个 Adam 状态、训练 step、完成 episode 数和动作规格元数据。恢复时严格校验算法、后端、场景、策略模式和规格。已有的 v2/v3 checkpoint 及其不带 `maddpg/` 的旧目录布局仍可兼容加载；更早的格式不兼容，也不会部分静默加载。

@@ -205,6 +205,17 @@ class TorchTrainerParityTest(unittest.TestCase):
         )
         self.assertEqual((train_step, episodes), (1234, 56))
 
+        version_3_payload = copy.deepcopy(payload)
+        version_3_payload["checkpoint_version"] = 3
+        del version_3_payload["metadata"]["algorithm"]
+        train_step, episodes = _load_trainers_from_checkpoint(
+            version_3_payload,
+            [restored],
+            _checkpoint_metadata(args, spec),
+            load_optimizers=True,
+        )
+        self.assertEqual((train_step, episodes), (1234, 56))
+
     def test_old_or_mismatched_checkpoints_are_rejected(self):
         args = _args()
         spec = [ActionSpec("official", (5,))]
