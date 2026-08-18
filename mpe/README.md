@@ -142,10 +142,11 @@ chkpt/maddpg/legacy/official/simple_spread/
 | `task/covered_landmarks` | 终局被覆盖的 landmark 数量的区间平均。 |
 | `task/coverage_ratio` | 终局覆盖比例的区间平均。 |
 | `task/episode_success` | 当前日志区间内严格终局成功的比例。 |
+| `task/landmark_center_success` | `d < 0.15` 的终局成功率：三个不同 agent 分别将一个 landmark 的圆心纳入自身圆形区域。 |
 | `task/success_rate` | 从训练开始累计的严格终局成功率。 |
 | `task/success_rate_roll100` | 最近 100 个 episode 的严格终局成功率，最适合观察业务能力变化。 |
 | `eval/episode_reward_mean`、`eval/episode_reward_std` | 每次保存 checkpoint 后，在固定连续 seed 上执行 deterministic 策略的回报均值和标准差。判断泛化时优先于带探索的训练 reward。 |
-| `eval/task_coverage_ratio`、`eval/task_episode_success` | checkpoint 固定 seed 评测的终局覆盖率和业务成功率。 |
+| `eval/task_coverage_ratio`、`eval/task_episode_success`、`eval/task_landmark_center_success` | checkpoint 固定 seed 评测的终局覆盖率、严格完整覆盖成功率和 `d < 0.15` 圆心覆盖成功率。 |
 | `loss/q_loss`、`loss/p_loss`、`loss/pg_loss` | critic、actor 总损失和策略梯度部分；主要用于诊断，不应单独作为任务收敛依据。 |
 | `grad/q_grad_norm`、`grad/p_grad_norm` | critic 和 actor 梯度规模；持续异常增大通常表示训练不稳定。 |
 | `q/mean_q`、`q/mean_target_q` | critic 当前 Q 与 Bellman target 的均值，用于识别 Q 值漂移。 |
@@ -263,10 +264,11 @@ QMIX/checkpoints/qmix/legacy/official/simple_spread/
 | `reward/scaled_team_episode_reward` | learner 写入 replay、用于 TD target 的缩放团队回报，默认缩放为 `1 / n_agents`。 |
 | `task/covered_landmarks`、`task/coverage_ratio` | 终局覆盖数量和比例的日志区间平均。 |
 | `task/episode_success` | 当前日志区间内严格终局成功的比例。 |
+| `task/landmark_center_success` | `d < 0.15` 的终局成功率：三个不同 agent 分别将一个 landmark 的圆心纳入自身圆形区域。 |
 | `task/success_rate` | 从训练开始累计的严格终局成功率。 |
 | `task/success_rate_roll100` | 最近 100 个 episode 的严格终局成功率；业务能力的首要训练指标。 |
 | `eval/team_episode_reward_mean`、`eval/team_episode_reward_std` | checkpoint 固定连续 seed、greedy 策略的团队回报均值和标准差。 |
-| `eval/task_coverage_ratio`、`eval/task_episode_success` | checkpoint 固定 seed 评测的严格终局覆盖率和成功率。 |
+| `eval/task_coverage_ratio`、`eval/task_episode_success`、`eval/task_landmark_center_success` | checkpoint 固定 seed 评测的严格终局覆盖率、完整覆盖成功率和 `d < 0.15` 圆心覆盖成功率。 |
 | `loss/td_loss` | Huber 或 MSE TD loss；默认 Huber。应结合 Q、梯度和 reward 判断。 |
 | `loss/td_error_abs` | 有效 transition 的平均绝对 TD error。 |
 | `q/chosen_total`、`q/target_total` | mixer 对已选动作的联合 Q 与 Bellman target 均值；两者长期分离表示拟合异常。 |
@@ -301,6 +303,12 @@ Legacy `simple_spread` 中：
 `benchmark_data()` 一致；从圆形几何看，它也恰好表示“landmark 整圆被 agent
 完整包含”，并非任意经验阈值。严格 `<` 与 `<=` 只影响精确落在边界的状态，
 不是当前 60% 与视觉结果差异的原因。
+
+此外，训练日志、checkpoint 自动评测以及两个 `play` 入口现在都额外报告
+`landmark_center_success`：它使用同样的一对一最大匹配，但条件为 `d < 0.15`，
+表示三个不同 agent 分别把一个 landmark 的圆心纳入自己的圆形区域。两个
+`play` 的标准输出会同时列出 `d < 0.10` 的严格完整覆盖成功率和 `d < 0.15`
+的圆心覆盖成功率；JSON 报告还包含各自的成功次数与成功率。
 
 当前实现还使用最大二分图匹配，保证一个 agent 不能同时替两个 landmark 计数。
 这比原始 benchmark 的“每个 landmark 找最近 agent”更符合“三个 agent 分别覆盖

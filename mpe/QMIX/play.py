@@ -37,6 +37,7 @@ from .train import ALGORITHM_NAME, SUPPORTED_CHECKPOINT_VERSIONS
 
 
 _CHECKPOINT_PATTERN = re.compile(r"state_steps_(\d+)\.pt")
+_LANDMARK_CENTER_SUCCESS_METRIC = "landmark_center_success"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -391,6 +392,17 @@ def play(options: argparse.Namespace) -> dict[str, object]:
             float(item["task_metrics"].get("episode_success", 0.0)) >= 0.5
             for item in episode_results
         )
+    landmark_center_success_count = None
+    if _LANDMARK_CENTER_SUCCESS_METRIC in task_metrics:
+        landmark_center_success_count = sum(
+            float(
+                item["task_metrics"].get(
+                    _LANDMARK_CENTER_SUCCESS_METRIC, 0.0
+                )
+            )
+            >= 0.5
+            for item in episode_results
+        )
     report: dict[str, object] = {
         "checkpoint": os.fspath(checkpoint_path),
         "checkpoint_version": checkpoint.get("checkpoint_version"),
@@ -412,6 +424,13 @@ def play(options: argparse.Namespace) -> dict[str, object]:
     if success_count is not None:
         report["task_success_count"] = int(success_count)
         report["task_success_rate"] = float(success_count / options.episodes)
+    if landmark_center_success_count is not None:
+        report["task_landmark_center_success_count"] = int(
+            landmark_center_success_count
+        )
+        report["task_landmark_center_success_rate"] = float(
+            landmark_center_success_count / options.episodes
+        )
     print(
         "[Summary] episodes={}, team_reward={:.6f} +/- {:.6f}, "
         "reward={:.6f} +/- {:.6f}, mean_length={:.2f}".format(
@@ -433,10 +452,20 @@ def play(options: argparse.Namespace) -> dict[str, object]:
         )
     if success_count is not None:
         print(
-            "[Summary] business success: {}/{} ({:.6f})".format(
+            "[Summary] strict full-coverage success (d < 0.10): "
+            "{}/{} ({:.6f})".format(
                 success_count,
                 options.episodes,
                 success_count / options.episodes,
+            )
+        )
+    if landmark_center_success_count is not None:
+        print(
+            "[Summary] landmark-center success (d < 0.15): "
+            "{}/{} ({:.6f})".format(
+                landmark_center_success_count,
+                options.episodes,
+                landmark_center_success_count / options.episodes,
             )
         )
 

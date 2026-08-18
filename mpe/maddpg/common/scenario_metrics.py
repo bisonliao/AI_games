@@ -16,6 +16,7 @@ ScenarioMetricPlugin = Callable[[object], Dict[str, float]]
 # PettingZoo simple_spread's benchmark_data() considers a landmark occupied
 # when its nearest agent is strictly closer than 0.1.
 SIMPLE_SPREAD_COVERAGE_RADIUS = 0.1
+SIMPLE_SPREAD_LANDMARK_CENTER_RADIUS = 0.15
 SIMPLE_ADVERSARY_TIE_DISTANCE = 0.05
 
 
@@ -54,9 +55,11 @@ def _maximum_bipartite_matches(within_coverage: np.ndarray) -> int:
 def simple_spread_metrics(env: object) -> Dict[str, float]:
     """Compute terminal one-agent-per-landmark coverage for simple_spread.
 
-    A landmark is covered at distance < 0.1, matching PettingZoo's own
-    benchmark definition.  Maximum bipartite matching prevents one agent from
-    being counted as covering two nearby landmarks.
+    Strict full coverage uses distance < 0.1, matching PettingZoo's own
+    benchmark definition.  Landmark-center coverage additionally uses
+    distance < 0.15, the simple_spread agent radius.  Maximum bipartite
+    matching prevents one agent from being counted as covering two nearby
+    landmarks.
     """
 
     raw_env = getattr(env, "unwrapped", env)
@@ -71,6 +74,7 @@ def simple_spread_metrics(env: object) -> Dict[str, float]:
             "covered_landmarks": 0.0,
             "coverage_ratio": 0.0,
             "episode_success": 0.0,
+            "landmark_center_success": 0.0,
         }
 
     agent_positions = np.asarray([agent.state.p_pos for agent in agents])
@@ -84,12 +88,18 @@ def simple_spread_metrics(env: object) -> Dict[str, float]:
     covered_landmarks = _maximum_bipartite_matches(
         distances < SIMPLE_SPREAD_COVERAGE_RADIUS
     )
+    landmark_centers_covered = _maximum_bipartite_matches(
+        distances < SIMPLE_SPREAD_LANDMARK_CENTER_RADIUS
+    )
     total_landmarks = len(landmarks)
 
     return {
         "covered_landmarks": float(covered_landmarks),
         "coverage_ratio": float(covered_landmarks / total_landmarks),
         "episode_success": float(covered_landmarks == total_landmarks),
+        "landmark_center_success": float(
+            landmark_centers_covered == total_landmarks
+        ),
     }
 
 

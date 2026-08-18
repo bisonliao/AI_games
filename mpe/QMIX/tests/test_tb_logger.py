@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from QMIX.tb_logger import TensorBoardLogger
+from QMIX.train import _evaluation_tensorboard_metrics
 
 
 class _RecordingWriter:
@@ -22,6 +23,26 @@ class _RecordingWriter:
 
 
 class TaskMetricLoggerTest(unittest.TestCase):
+    def test_checkpoint_eval_reports_landmark_center_success(self):
+        metrics = _evaluation_tensorboard_metrics(
+            {
+                "episode_reward_mean": -3.0,
+                "episode_reward_std": 0.5,
+                "team_episode_reward_mean": -1.0,
+                "team_episode_reward_std": 0.2,
+                "episode_length_mean": 25.0,
+                "task_metrics": {
+                    "episode_success": 0.6,
+                    "landmark_center_success": 1.0,
+                },
+            }
+        )
+
+        self.assertEqual(metrics["eval/task_episode_success"], 0.6)
+        self.assertEqual(
+            metrics["eval/task_landmark_center_success"], 1.0
+        )
+
     def test_reports_maddpg_compatible_task_success_tags(self):
         writer = _RecordingWriter()
         logger = TensorBoardLogger(

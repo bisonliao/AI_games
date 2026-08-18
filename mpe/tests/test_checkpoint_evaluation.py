@@ -73,6 +73,25 @@ def _checkpoint_fixture(args):
 
 
 class CheckpointEvaluationTest(unittest.TestCase):
+    def test_maddpg_checkpoint_eval_reports_landmark_center_success(self):
+        metrics = _evaluation_tensorboard_metrics(
+            {
+                "episode_reward_mean": -3.0,
+                "episode_reward_std": 0.5,
+                "episode_length_mean": 25.0,
+                "agent_episode_reward_mean": [-1.0, -1.0, -1.0],
+                "task_metrics": {
+                    "episode_success": 0.6,
+                    "landmark_center_success": 1.0,
+                },
+            }
+        )
+
+        self.assertEqual(metrics["eval/task_episode_success"], 0.6)
+        self.assertEqual(
+            metrics["eval/task_landmark_center_success"], 1.0
+        )
+
     def test_algorithm_checkpoint_directories_do_not_overlap(self):
         args = _args()
         root = Path("shared-checkpoint-root")
@@ -191,6 +210,34 @@ class CheckpointEvaluationTest(unittest.TestCase):
             self.assertFalse(evaluation["render"])
             self.assertEqual(evaluation["metadata"]["env_backend"], "legacy")
             self.assertEqual(evaluation["episode_lengths"], [2])
+
+    def test_play_simple_spread_reports_landmark_center_success_rate(self):
+        args = _args()
+        args.scenario = "simple_spread"
+        args.env_backend = "legacy"
+        args.max_episode_len = 1
+        checkpoint, _, _ = _checkpoint_fixture(args)
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_path = save_state(directory, checkpoint)
+            options = parse_play_args(
+                [
+                    "--checkpoint",
+                    checkpoint_path,
+                    "--episodes",
+                    "1",
+                    "--no-cuda",
+                ]
+            )
+            with redirect_stdout(io.StringIO()) as output:
+                evaluation = play(options)
+
+            self.assertIn("task_success_count", evaluation)
+            self.assertIn("task_success_rate", evaluation)
+            self.assertIn("task_landmark_center_success_count", evaluation)
+            self.assertIn("task_landmark_center_success_rate", evaluation)
+            self.assertIn(
+                "landmark-center success (d < 0.15)", output.getvalue()
+            )
 
     def test_play_simple_adversary_labels_roles_and_reports_metrics(self):
         args = _args()

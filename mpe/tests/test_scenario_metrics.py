@@ -5,6 +5,7 @@ import numpy as np
 
 from maddpg.common.scenario_metrics import (
     SIMPLE_ADVERSARY_TIE_DISTANCE,
+    SIMPLE_SPREAD_LANDMARK_CENTER_RADIUS,
     get_scenario_metric_plugin,
     simple_adversary_metrics,
     simple_spread_metrics,
@@ -53,6 +54,7 @@ class SimpleSpreadMetricsTest(unittest.TestCase):
                 "covered_landmarks": 3.0,
                 "coverage_ratio": 1.0,
                 "episode_success": 1.0,
+                "landmark_center_success": 1.0,
             },
         )
 
@@ -68,8 +70,25 @@ class SimpleSpreadMetricsTest(unittest.TestCase):
                 "covered_landmarks": 2.0,
                 "coverage_ratio": 2.0 / 3.0,
                 "episode_success": 0.0,
+                "landmark_center_success": 0.0,
             },
         )
+
+    def test_landmark_center_success_uses_agent_radius(self):
+        offset = SIMPLE_SPREAD_LANDMARK_CENTER_RADIUS - 0.01
+        env = _env(
+            agent_positions=[(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)],
+            landmark_positions=[
+                (offset, 0.0),
+                (1.0 + offset, 0.0),
+                (2.0 + offset, 0.0),
+            ],
+        )
+
+        metrics = simple_spread_metrics(env)
+
+        self.assertEqual(metrics["episode_success"], 0.0)
+        self.assertEqual(metrics["landmark_center_success"], 1.0)
 
 
 class SimpleAdversaryMetricsTest(unittest.TestCase):

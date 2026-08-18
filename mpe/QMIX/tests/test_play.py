@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 import io
 from pathlib import Path
 import tempfile
@@ -93,7 +93,8 @@ class PlayEvaluationTest(unittest.TestCase):
                     "--no-cuda",
                 ]
             )
-            report = play(options)
+            with redirect_stdout(io.StringIO()) as output:
+                report = play(options)
 
             self.assertEqual(report["saved_env_steps"], 123)
             self.assertEqual(report["saved_completed_episodes"], 7)
@@ -108,6 +109,13 @@ class PlayEvaluationTest(unittest.TestCase):
             )
             self.assertEqual(report["task_success_count"], 0)
             self.assertEqual(report["task_success_rate"], 0.0)
+            self.assertIn("task_landmark_center_success_count", report)
+            self.assertIn("task_landmark_center_success_rate", report)
+            self.assertGreaterEqual(
+                report["task_landmark_center_success_rate"],
+                report["task_success_rate"],
+            )
+            self.assertIn("landmark-center success (d < 0.15)", output.getvalue())
             self.assertEqual(report["metadata"]["learner_config"]["hidden_dim"], 17)
             self.assertTrue(report_path.is_file())
             saved_report = json.loads(report_path.read_text(encoding="utf-8"))

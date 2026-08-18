@@ -463,6 +463,24 @@ def _save_evaluation(
             stream.write("\n")
 
 
+def _evaluation_tensorboard_metrics(evaluation: dict) -> dict[str, float]:
+    return {
+        "eval/episode_reward_mean": evaluation["episode_reward_mean"],
+        "eval/episode_reward_std": evaluation["episode_reward_std"],
+        "eval/team_episode_reward_mean": evaluation[
+            "team_episode_reward_mean"
+        ],
+        "eval/team_episode_reward_std": evaluation[
+            "team_episode_reward_std"
+        ],
+        "eval/episode_length_mean": evaluation["episode_length_mean"],
+        **{
+            f"eval/task_{name}": value
+            for name, value in evaluation["task_metrics"].items()
+        },
+    }
+
+
 def _evaluate_checkpoint(
     learner: QMIXLearner,
     args: argparse.Namespace,
@@ -483,24 +501,7 @@ def _evaluate_checkpoint(
         f"episode_reward={evaluation['episode_reward_mean']:.6f} "
         f"team_reward={evaluation['team_episode_reward_mean']:.6f}"
     )
-    logger.immediate(
-        {
-            "eval/episode_reward_mean": evaluation["episode_reward_mean"],
-            "eval/episode_reward_std": evaluation["episode_reward_std"],
-            "eval/team_episode_reward_mean": evaluation[
-                "team_episode_reward_mean"
-            ],
-            "eval/team_episode_reward_std": evaluation[
-                "team_episode_reward_std"
-            ],
-            "eval/episode_length_mean": evaluation["episode_length_mean"],
-            **{
-                f"eval/task_{name}": value
-                for name, value in evaluation["task_metrics"].items()
-            },
-        },
-        env_steps,
-    )
+    logger.immediate(_evaluation_tensorboard_metrics(evaluation), env_steps)
 
 
 def train(args: argparse.Namespace) -> None:

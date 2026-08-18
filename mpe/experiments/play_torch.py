@@ -52,6 +52,9 @@ _REQUIRED_V2_METADATA = (
     "action_specs",
 )
 
+_STRICT_SUCCESS_METRIC = "episode_success"
+_LANDMARK_CENTER_SUCCESS_METRIC = "landmark_center_success"
+
 
 def _infer_num_units(checkpoint):
     try:
@@ -204,6 +207,18 @@ def _print_episode(result, total_episodes):
     )
 
 
+def _add_success_summary(evaluation, metric_name, field_prefix):
+    success_rate = evaluation["task_metrics"].get(metric_name)
+    if success_rate is None:
+        return None
+    success_count = int(
+        round(float(success_rate) * evaluation["evaluation_episodes"])
+    )
+    evaluation[field_prefix + "_count"] = success_count
+    evaluation[field_prefix + "_rate"] = float(success_rate)
+    return success_count, float(success_rate)
+
+
 def play(options):
     if options.episodes <= 0:
         raise ValueError("--episodes must be greater than 0")
@@ -251,6 +266,14 @@ def play(options):
     evaluation["checkpoint"] = os.fspath(checkpoint_path)
     evaluation["render"] = bool(options.render)
     evaluation["metadata"] = metadata
+    strict_success = _add_success_summary(
+        evaluation, _STRICT_SUCCESS_METRIC, "task_success"
+    )
+    landmark_center_success = _add_success_summary(
+        evaluation,
+        _LANDMARK_CENTER_SUCCESS_METRIC,
+        "task_landmark_center_success",
+    )
 
     print(
         "[Summary] episodes: {}, mean reward: {:.6f}, std: {:.6f}, "
@@ -282,6 +305,24 @@ def play(options):
                         evaluation["task_metrics"].items()
                     )
                 )
+            )
+        )
+    if strict_success is not None:
+        print(
+            "[Summary] strict full-coverage success (d < 0.10): "
+            "{}/{} ({:.6f})".format(
+                strict_success[0],
+                evaluation["evaluation_episodes"],
+                strict_success[1],
+            )
+        )
+    if landmark_center_success is not None:
+        print(
+            "[Summary] landmark-center success (d < 0.15): "
+            "{}/{} ({:.6f})".format(
+                landmark_center_success[0],
+                evaluation["evaluation_episodes"],
+                landmark_center_success[1],
             )
         )
 
