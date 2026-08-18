@@ -5,7 +5,6 @@ __pycache__/
 .pytest_cache/
 build/
 dist/
-runs/
 chkpt/
 learning_curves/
 benchmark_files/
