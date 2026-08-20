@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Dict
 
 import torch as th
-import torch.nn.functional as F
 from gymnasium import spaces
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from torch import nn
@@ -21,7 +20,7 @@ class MultiViewCombinedExtractor(BaseFeaturesExtractor):
         frame_stack: int = 3,
         visual_feature_dim: int = 64,
         proprio_feature_dim: int = 64,
-        augmentation_pad: int = 4,
+        visual_head_version: int = 1,
     ) -> None:
         image_space = observation_space.spaces["image"]
         proprio_space = observation_space.spaces["proprio"]
@@ -41,7 +40,9 @@ class MultiViewCombinedExtractor(BaseFeaturesExtractor):
         self.n_views = int(n_views)
         self.frame_stack = int(frame_stack)
         self.visual_feature_dim = int(visual_feature_dim)
-        self.augmentation_pad = int(augmentation_pad)
+        self.visual_head_version = int(visual_head_version)
+        if self.visual_head_version not in {1, 2}:
+            raise ValueError("visual_head_version must be 1 or 2")
         self.encoder = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=3, stride=2),
             nn.ReLU(),
@@ -54,11 +55,25 @@ class MultiViewCombinedExtractor(BaseFeaturesExtractor):
         with th.no_grad():
             sample = th.zeros(1, 3, height, width)
             encoded_size = int(self.encoder(sample).shape[1])
-        self.visual_head = nn.Sequential(
-            nn.Linear(encoded_size, self.visual_feature_dim),
-            nn.LayerNorm(self.visual_feature_dim),
-            nn.ReLU(),
-        )
+        if self.visual_head_version == 1:
+            # Kept only so checkpoints created before the visual-collapse fix
+            # can still be loaded with their original architecture.
+            self.visual_head = nn.Sequential(
+                nn.Linear(encoded_size, self.visual_feature_dim),
+                nn.LayerNorm(self.visual_feature_dim),
+                nn.ReLU(),
+            )
+        else:
+            # A learned LayerNorm bias drove every visual feature below zero
+            # in previous runs; the following ReLU then made the branch
+            # permanently gradient-dead.  A non-affine normalization cannot
+            # learn that global negative shift, and LeakyReLU retains a
+            # gradient even for negative activations.
+            self.visual_head = nn.Sequential(
+                nn.Linear(encoded_size, self.visual_feature_dim),
+                nn.LayerNorm(self.visual_feature_dim, elementwise_affine=False),
+                nn.LeakyReLU(negative_slope=0.01),
+            )
         self.proprio_head = nn.Sequential(
             nn.Linear(proprio_space.shape[0], proprio_feature_dim),
             nn.LayerNorm(proprio_feature_dim),
@@ -71,7 +86,24 @@ class MultiViewCombinedExtractor(BaseFeaturesExtractor):
         self._features_dim = features_dim
 
     def forward(self, observations: Dict[str, th.Tensor]) -> th.Tensor:
-        image = observations["image"].float()
+        visual = self.encode_visual(observations["image"])
+        batch_size = visual.shape[0]
+        visual = visual.reshape(
+            batch_size,
+            self.frame_stack * self.n_views * self.visual_feature_dim,
+        )
+        proprio = self.proprio_head(observations["proprio"].float())
+        return th.cat([visual, proprio], dim=1)
+
+    def encode_visual(self, image: th.Tensor) -> th.Tensor:
+        """Encode RGB crops as ``(batch, frame*view, feature)``.
+
+        This public, side-effect-free path is also used by the low-frequency
+        visual-health probe, avoiding a second implementation of image
+        preprocessing and view reshaping.
+        """
+
+        image = image.float()
         if image.max().detach().item() > 1.5:
             image = image / 255.0
         batch_size = image.shape[0]
@@ -88,33 +120,11 @@ class MultiViewCombinedExtractor(BaseFeaturesExtractor):
             image.shape[-2],
             image.shape[-1],
         )
-        if self.training and self.augmentation_pad > 0:
-            image = self._random_shift(image, self.augmentation_pad)
-        visual = self.visual_head(self.encoder(image))
-        visual = visual.reshape(
+        return self.visual_head(self.encoder(image)).reshape(
             batch_size,
-            self.frame_stack * self.n_views * self.visual_feature_dim,
+            self.frame_stack * self.n_views,
+            self.visual_feature_dim,
         )
-        proprio = self.proprio_head(observations["proprio"].float())
-        return th.cat([visual, proprio], dim=1)
-
-    @staticmethod
-    def _random_shift(image: th.Tensor, pad: int) -> th.Tensor:
-        """Apply a shared random pixel translation to each RGB crop.
-
-        This is the small-image augmentation used by DrQ-style pixel RL. The
-        same shift is applied to each RGB view/frame crop independently; it is
-        disabled automatically when the policy is in evaluation mode.
-        """
-
-        batch, _, height, width = image.shape
-        padded = F.pad(image, (pad, pad, pad, pad), mode="replicate")
-        top = th.randint(0, 2 * pad + 1, (batch,), device=image.device)
-        left = th.randint(0, 2 * pad + 1, (batch,), device=image.device)
-        rows = th.arange(height, device=image.device)[None, :, None] + top[:, None, None]
-        cols = th.arange(width, device=image.device)[None, None, :] + left[:, None, None]
-        batch_index = th.arange(batch, device=image.device)[:, None, None]
-        return padded[batch_index, :, rows, cols].permute(0, 3, 1, 2)
 
 
 __all__ = ["MultiViewCombinedExtractor"]

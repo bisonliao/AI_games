@@ -8,7 +8,12 @@ from typing import Callable, Optional
 import gymnasium as gym
 from stable_baselines3.common.monitor import Monitor
 
-from .env import DEFAULT_FRAME_STACK, DEFAULT_IMAGE_SIZE, PixelTaskEnv
+from .env import (
+    DEFAULT_CAMERA_SCALE,
+    DEFAULT_FRAME_STACK,
+    DEFAULT_IMAGE_SIZE,
+    PixelTaskEnv,
+)
 
 
 MONITOR_INFO_KEYS = (
@@ -32,7 +37,7 @@ def make_env_factory(
     frame_stack: int = DEFAULT_FRAME_STACK,
     max_episode_steps: int = 150,
     action_repeat: int = 8,
-    camera_scale: float = 0.8,
+    camera_scale: float = DEFAULT_CAMERA_SCALE,
     monitor_dir: Optional[Path] = None,
     render_mode: Optional[str] = None,
 ) -> Callable[[], gym.Env]:

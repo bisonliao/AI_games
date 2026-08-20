@@ -22,20 +22,29 @@ from SAC_VecObs.env import SACVectorTaskEnv
 CAMERA_VIEW_NAMES = ("xy", "xz", "yz")
 N_VIEWS = len(CAMERA_VIEW_NAMES)
 RGB_CHANNELS = 3
-# Conservative defaults for an 8 GiB GPU / 39 GB RAM workstation. They can
-# be overridden from the training and evaluation CLIs when more memory is
-# available.
+# These defaults favor visual localization accuracy. They can be overridden
+# from the training and evaluation CLIs for resource-constrained runs.
 DEFAULT_IMAGE_SIZE = 96
-DEFAULT_FRAME_STACK = 2
-PROPRIO_SIZE = 20
+DEFAULT_FRAME_STACK = 1
+DEFAULT_CAMERA_SCALE = 1.0
+PROPRIO_SIZE = 26
+
+# Normalize the Cartesian end-effector position using the same controller
+# workspace limits as PandaTabletopEnv._apply_action().  Values normally lie
+# in [-1, 1], with a small amount of headroom retained for physics transients.
+EE_WORKSPACE_LOW = np.array([0.28, -0.48, -0.08], dtype=np.float32)
+EE_WORKSPACE_HIGH = np.array([0.82, 0.48, 0.72], dtype=np.float32)
+EE_WORKSPACE_CENTER = (EE_WORKSPACE_LOW + EE_WORKSPACE_HIGH) * 0.5
+EE_WORKSPACE_HALF_RANGE = (EE_WORKSPACE_HIGH - EE_WORKSPACE_LOW) * 0.5
+EE_VELOCITY_SCALE = np.float32(1.0)  # metres per second
 
 
 class PixelTaskEnv(gym.Env):
     """Pixel-observation reach or pick-place environment.
 
     A single observation contains three synchronized RGB projections. With
-    the default three-frame stack, ``image`` has shape ``(27, H, W)``:
-    3 frames x 3 views x RGB.
+    the default single-frame stack, ``image`` has shape ``(9, H, W)``:
+    1 frame x 3 views x RGB. ``frame_stack`` can be increased explicitly.
     """
 
     metadata = {"render_modes": ["human"], "render_fps": 30}
@@ -47,7 +56,7 @@ class PixelTaskEnv(gym.Env):
         frame_stack: int = DEFAULT_FRAME_STACK,
         max_episode_steps: int = 150,
         action_repeat: int = 8,
-        camera_scale: float = 0.8,
+        camera_scale: float = DEFAULT_CAMERA_SCALE,
         seed: Optional[int] = None,
         render_mode: Optional[str] = None,
     ) -> None:
@@ -138,9 +147,13 @@ class PixelTaskEnv(gym.Env):
 
         client = self.task_env.base_env._client
         size = self.image_size
-        # This crop covers the randomized tabletop and the Panda workspace.
+        # At the target plane, camera_scale is the visible width/height in
+        # metres. The default 1.0 m crop covers the full controller workspace:
+        # x=[0.02, 1.02], y=[-0.50, 0.50], z=[-0.20, 0.80].
         center = np.array([0.52, 0.0, 0.30], dtype=np.float64)
-        distance = 1.5
+        distance = 5.0
+        near = 0.05
+        far = 7.0
         views = (
             (center + np.array([0.0, 0.0, distance]), center, np.array([0.0, 1.0, 0.0])),
             (center + np.array([0.0, distance, 0.0]), center, np.array([0.0, 0.0, 1.0])),
@@ -154,14 +167,22 @@ class PixelTaskEnv(gym.Env):
                 cameraUpVector=up.tolist(),
                 physicsClientId=client,
             )
-            half = self.camera_scale / 2.0
+            # PyBullet's computeProjectionMatrix expects frustum bounds on
+            # the near plane; it is perspective, despite the generic name.
+            # Passing workspace-scale bounds directly (the previous code)
+            # produced an approximately 177-degree FOV and shrank the cube to
+            # zero pixels. Scale the bounds by near/distance so the target
+            # plane spans camera_scale metres. A distant camera makes the
+            # resulting narrow-FOV projection effectively orthographic while
+            # retaining TinyRenderer compatibility.
+            half = self.camera_scale * 0.5 * near / distance
             projection_matrix = p.computeProjectionMatrix(
                 left=-half,
                 right=half,
                 bottom=-half,
                 top=half,
-                nearVal=0.01,
-                farVal=3.0,
+                nearVal=near,
+                farVal=far,
             )
             _, _, rgba, _, _ = p.getCameraImage(
                 width=size,
@@ -186,6 +207,24 @@ class PixelTaskEnv(gym.Env):
         raw = self.task_env.base_env._get_observation()
         q = np.asarray(raw[0:7], dtype=np.float32) / np.float32(np.pi)
         dq = np.clip(np.asarray(raw[7:14], dtype=np.float32) / 10.0, -5.0, 5.0)
+        ee_state = p.getLinkState(
+            self.task_env.base_env.robot_id,
+            self.task_env.base_env.END_EFFECTOR_LINK,
+            computeLinkVelocity=True,
+            computeForwardKinematics=True,
+            physicsClientId=self.task_env.base_env._client,
+        )
+        ee_position = np.asarray(ee_state[4], dtype=np.float32)
+        ee_position_norm = np.clip(
+            (ee_position - EE_WORKSPACE_CENTER) / EE_WORKSPACE_HALF_RANGE,
+            -1.5,
+            1.5,
+        )
+        ee_linear_velocity = np.clip(
+            np.asarray(ee_state[6], dtype=np.float32) / EE_VELOCITY_SCALE,
+            -5.0,
+            5.0,
+        )
         width = self._gripper_width()
         width_norm = np.float32(np.clip(width / 0.08, 0.0, 1.5))
         width_velocity = np.float32(
@@ -200,6 +239,8 @@ class PixelTaskEnv(gym.Env):
             [
                 q,
                 dq,
+                ee_position_norm,
+                ee_linear_velocity,
                 np.array([width_norm, width_velocity], dtype=np.float32),
                 action,
             ]
@@ -219,6 +260,7 @@ __all__ = [
     "CAMERA_VIEW_NAMES",
     "DEFAULT_FRAME_STACK",
     "DEFAULT_IMAGE_SIZE",
+    "DEFAULT_CAMERA_SCALE",
     "N_VIEWS",
     "PROPRIO_SIZE",
     "PixelTaskEnv",

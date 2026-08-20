@@ -9,7 +9,7 @@ from pathlib import Path
 from stable_baselines3 import SAC
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from .env import DEFAULT_FRAME_STACK, DEFAULT_IMAGE_SIZE
+from .env import DEFAULT_CAMERA_SCALE, DEFAULT_FRAME_STACK, DEFAULT_IMAGE_SIZE
 from .policy import MultiViewCombinedExtractor
 from .utils import make_env_factory
 
@@ -18,12 +18,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", required=True, choices=["reach", "pick_place"])
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--episodes", type=int, default=10)
+    parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--seed", type=int, default=10000)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
     parser.add_argument("--frame-stack", type=int, default=DEFAULT_FRAME_STACK)
-    parser.add_argument("--camera-scale", type=float, default=0.8)
+    parser.add_argument("--camera-scale", type=float, default=DEFAULT_CAMERA_SCALE)
     parser.add_argument("--max-episode-steps", type=int, default=150)
     parser.add_argument("--action-repeat", type=int, default=8)
     parser.add_argument("--stochastic", action="store_true")
