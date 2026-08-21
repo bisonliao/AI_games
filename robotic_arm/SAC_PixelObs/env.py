@@ -16,12 +16,17 @@ import numpy as np
 import pybullet as p
 from gymnasium import spaces
 
-from SAC_VecObs.env import SACVectorTaskEnv
+from SAC_VecObs.env import PickPlaceStage, SACVectorTaskEnv, STAGE_NAMES
 
 
 CAMERA_VIEW_NAMES = ("xy", "xz", "yz")
 N_VIEWS = len(CAMERA_VIEW_NAMES)
 RGB_CHANNELS = 3
+GOAL_GREEN_RGB = np.array([38, 191, 51], dtype=np.uint8)
+GOAL_DILATION_RADIUS = 1
+GOAL_MARKER_RADIUS = 2
+MIN_GOAL_GREEN_PIXELS = 12
+PIXEL_STAGE_STEP_LIMITS = {stage: 100 for stage in PickPlaceStage}
 # These defaults favor visual localization accuracy. They can be overridden
 # from the training and evaluation CLIs for resource-constrained runs.
 DEFAULT_IMAGE_SIZE = 96
@@ -37,6 +42,93 @@ EE_WORKSPACE_HIGH = np.array([0.82, 0.48, 0.72], dtype=np.float32)
 EE_WORKSPACE_CENTER = (EE_WORKSPACE_LOW + EE_WORKSPACE_HIGH) * 0.5
 EE_WORKSPACE_HALF_RANGE = (EE_WORKSPACE_HIGH - EE_WORKSPACE_LOW) * 0.5
 EE_VELOCITY_SCALE = np.float32(1.0)  # metres per second
+
+
+class _PixelTaskStateEnv(SACVectorTaskEnv):
+    """Shared task semantics with PixelObs-specific stage budgets.
+
+    ``SAC_VecObs`` remains the validated vector experiment and must not be
+    changed by visual-observation experiments. This override intentionally
+    mirrors its pick-place reward implementation, changing only the timeout
+    lookup to the PixelObs-local 100-step budget.
+    """
+
+    def _pick_place_reward(
+        self,
+        previous: Dict[str, Any],
+        current: Dict[str, Any],
+        action: np.ndarray,
+    ) -> Tuple[float, bool, bool]:
+        self._stage_steps += 1
+        failure_reason = self._update_stage(current)
+        if (
+            not failure_reason
+            and self._stage_steps >= PIXEL_STAGE_STEP_LIMITS[self.stage]
+        ):
+            failure_reason = f"{STAGE_NAMES[int(self.stage)]}_timeout"
+        self._failure_reason = failure_reason
+
+        drop_failure = failure_reason in {"object_dropped", "object_left_goal"}
+        other_failure = bool(failure_reason and not drop_failure)
+        reward_terms = {
+            "time": -0.01,
+            "action": -0.001 * float(np.sum(action * action)),
+            "progress": 0.0,
+            "event": 0.0,
+            "drop": -5.0 if drop_failure else 0.0,
+            "failure": -5.0 if other_failure else 0.0,
+        }
+        if self.stage == PickPlaceStage.APPROACH:
+            reward_terms["progress"] = 2.0 * (
+                previous["ee_object_distance"] - current["ee_object_distance"]
+            )
+        elif self.stage == PickPlaceStage.GRASP:
+            reward_terms["progress"] = 4.0 * float(
+                current["object_position"][2] - previous["object_position"][2]
+            )
+        elif self.stage == PickPlaceStage.TRANSPORT:
+            reward_terms["progress"] = 2.0 * (
+                previous["object_goal_xy_distance"]
+                - current["object_goal_xy_distance"]
+            )
+        elif self.stage == PickPlaceStage.PLACE:
+            previous_height_error = abs(
+                float(previous["object_position"][2])
+                - self.base_env.object_half_extent
+            )
+            current_height_error = abs(
+                float(current["object_position"][2])
+                - self.base_env.object_half_extent
+            )
+            reward_terms["progress"] = 2.0 * (
+                previous_height_error - current_height_error
+            )
+
+        if self.ever_grasped and not self.grasp_bonus_given:
+            reward_terms["event"] += 1.0
+            self.grasp_bonus_given = True
+        if self.ever_lifted and not self.lift_bonus_given:
+            reward_terms["event"] += 2.0
+            self.lift_bonus_given = True
+        if (
+            self.stage in {PickPlaceStage.PLACE, PickPlaceStage.RELEASE}
+            and not self.place_bonus_given
+        ):
+            reward_terms["event"] += 1.0
+            self.place_bonus_given = True
+        if self.stage == PickPlaceStage.RELEASE and not self.release_bonus_given:
+            reward_terms["event"] += 1.0
+            self.release_bonus_given = True
+
+        if self.stage == PickPlaceStage.RELEASE and self._settled_at_goal(current):
+            self.stable_steps += 1
+        else:
+            self.stable_steps = 0
+        success = self.stable_steps >= 4
+        if success:
+            reward_terms["event"] += 10.0
+        self._last_reward_terms = reward_terms
+        return float(sum(reward_terms.values())), success, bool(failure_reason)
 
 
 class PixelTaskEnv(gym.Env):
@@ -74,7 +166,7 @@ class PixelTaskEnv(gym.Env):
         self.frame_stack = int(frame_stack)
         self.camera_scale = float(camera_scale)
         self.render_mode = render_mode
-        self.task_env = SACVectorTaskEnv(
+        self.task_env = _PixelTaskStateEnv(
             task=task,
             render_mode=render_mode,
             max_episode_steps=max_episode_steps,
@@ -193,11 +285,103 @@ class PixelTaskEnv(gym.Env):
                 physicsClientId=client,
             )
             rgb = np.asarray(rgba, dtype=np.uint8).reshape(size, size, 4)[..., :3]
+            if self.task == "pick_place":
+                rgb = self._enhance_goal_marker(
+                    rgb,
+                    view_matrix,
+                    projection_matrix,
+                )
             # Canonicalize the +X view's horizontal direction.
             if index == 2:
                 rgb = np.fliplr(rgb)
             frames.append(np.transpose(rgb, (2, 0, 1)))
         return np.concatenate(frames, axis=0)
+
+    def _enhance_goal_marker(
+        self,
+        rgb: np.ndarray,
+        view_matrix,
+        projection_matrix,
+    ) -> np.ndarray:
+        """Make the placement target legible without changing the scene.
+
+        The real PyBullet marker is a thin tabletop plane, so an orthogonal
+        side view may contain only a one-pixel green line.  Preserve those
+        rendered pixels, thicken their mask by one pixel, and only fall back
+        to a small projected marker when the resulting signal is still too
+        weak.  This changes the pixel observation only: collision geometry,
+        rewards and task-state detection remain untouched.
+        """
+
+        channels = rgb.astype(np.int16)
+        red, green, blue = np.moveaxis(channels, -1, 0)
+        original_mask = (
+            (green > red + 30)
+            & (green > blue + 30)
+            & (green > 80)
+        )
+        expanded_mask = self._dilate_mask(original_mask, GOAL_DILATION_RADIUS)
+        result = rgb.copy()
+        # Do not recolor the genuine rendered target pixels. Only give its
+        # immediate neighbours the same canonical green used by RobotEnv.
+        result[expanded_mask & ~original_mask] = GOAL_GREEN_RGB
+
+        if int(expanded_mask.sum()) < MIN_GOAL_GREEN_PIXELS:
+            row, column = self._project_world_point(
+                self.task_env.base_env.goal_position,
+                view_matrix,
+                projection_matrix,
+                rgb.shape[0],
+                rgb.shape[1],
+            )
+            yy, xx = np.ogrid[: rgb.shape[0], : rgb.shape[1]]
+            fallback_mask = (
+                (yy - row) ** 2 + (xx - column) ** 2
+                <= GOAL_MARKER_RADIUS ** 2
+            )
+            result[fallback_mask] = GOAL_GREEN_RGB
+        return result
+
+    @staticmethod
+    def _dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
+        if radius <= 0:
+            return mask.copy()
+        height, width = mask.shape
+        padded = np.pad(mask, radius, mode="constant", constant_values=False)
+        dilated = np.zeros_like(mask)
+        for row_offset in range(2 * radius + 1):
+            for column_offset in range(2 * radius + 1):
+                dilated |= padded[
+                    row_offset : row_offset + height,
+                    column_offset : column_offset + width,
+                ]
+        return dilated
+
+    @staticmethod
+    def _project_world_point(
+        point: np.ndarray,
+        view_matrix,
+        projection_matrix,
+        height: int,
+        width: int,
+    ) -> Tuple[int, int]:
+        """Project a world point into PyBullet's unflipped camera image."""
+
+        view = np.asarray(view_matrix, dtype=np.float64).reshape(4, 4, order="F")
+        projection = np.asarray(projection_matrix, dtype=np.float64).reshape(
+            4, 4, order="F"
+        )
+        homogeneous = np.append(np.asarray(point, dtype=np.float64), 1.0)
+        clip = projection @ view @ homogeneous
+        if abs(float(clip[3])) < 1e-12:
+            raise RuntimeError("goal projection has a zero homogeneous coordinate")
+        ndc = clip[:3] / clip[3]
+        column = int(round((float(ndc[0]) + 1.0) * 0.5 * (width - 1)))
+        row = int(round((1.0 - float(ndc[1])) * 0.5 * (height - 1)))
+        return (
+            int(np.clip(row, 0, height - 1)),
+            int(np.clip(column, 0, width - 1)),
+        )
 
     def _make_observation(self) -> Dict[str, np.ndarray]:
         image = np.concatenate(tuple(self._frames), axis=0).astype(np.uint8)
@@ -261,7 +445,11 @@ __all__ = [
     "DEFAULT_FRAME_STACK",
     "DEFAULT_IMAGE_SIZE",
     "DEFAULT_CAMERA_SCALE",
+    "GOAL_DILATION_RADIUS",
+    "GOAL_MARKER_RADIUS",
+    "MIN_GOAL_GREEN_PIXELS",
     "N_VIEWS",
+    "PIXEL_STAGE_STEP_LIMITS",
     "PROPRIO_SIZE",
     "PixelTaskEnv",
 ]

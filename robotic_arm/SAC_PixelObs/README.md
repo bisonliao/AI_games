@@ -21,6 +21,13 @@ yz：沿 X 轴侧视，图像横纵轴对应 Y/Z
 PyBullet 的 `computeProjectionMatrix` 本身不是正交矩阵。96×96 下会保留红块和
 绿色目标的有效像素；测试会防止相机参数再次把目标压缩到零像素。
 
+Pick-place 的绿色目标在物理场景中是一张很薄的桌面平面，原始 xz/yz 侧视图可能
+只有一条约 1 像素宽的绿线。`SAC_PixelObs` 会在渲染后保留原始绿色像素，并只在
+图像空间向外膨胀 1 像素；若某一视图增强后仍少于 12 个绿色像素，则在目标中心的
+相机投影位置补一个半径 2 像素的小型绿色 marker。该处理仅用于 pick-place 的 RGB
+observation，不创建或修改 PyBullet 物体，也不改变碰撞、奖励、目标位置或阶段判断；
+reach 不执行这项增强，绿色目标仍保持隐藏。
+
 `proprio` 是 26 维归一化向量：
 
 ```text
@@ -33,6 +40,11 @@ PyBullet 的 `computeProjectionMatrix` 本身不是正交矩阵。96×96 下会�
 ```
 
 以下字段不会进入 actor observation：物体坐标、目标坐标、阶段 one-hot、`ever_grasped`、`ever_lifted` 和阶段计数器。环境内部仍可使用精确仿真状态计算 reward 和 termination。
+
+Pick-place 五个阶段仍沿用共享任务环境的判定语义，但由 `SAC_PixelObs` 内部的专用
+适配器把每阶段预算设为 `100` 个 RL step；`SAC_VecObs` 的原有预算不受影响。默认
+episode 总上限仍为 `150`。阶段超时机制没有删除：它避免 policy 长期停留在一个阶段
+刷 reward；实际终止时间由当前阶段预算与全局 episode horizon 中先到达者决定。
 
 这次 observation 已由旧版的 `64×64 + 20 维 proprio` 改为
 `96×96 + 26 维 proprio`，网络输入 shape 已变化，因此旧版 checkpoint 不能直接在

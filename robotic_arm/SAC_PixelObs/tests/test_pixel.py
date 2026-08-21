@@ -13,7 +13,12 @@ from SAC_PixelObs.callbacks import (
     VisualHealthCallback,
     write_tensorboard_scalars,
 )
-from SAC_PixelObs.env import PixelTaskEnv
+from SAC_PixelObs.env import (
+    MIN_GOAL_GREEN_PIXELS,
+    PIXEL_STAGE_STEP_LIMITS,
+    PixelTaskEnv,
+)
+from SAC_VecObs.env import PickPlaceStage, STAGE_STEP_LIMITS
 from SAC_PixelObs.policy import MultiViewCombinedExtractor
 from SAC_PixelObs.train import parse_args
 
@@ -50,10 +55,85 @@ def test_cube_and_goal_remain_visible_at_default_96_resolution():
                 green_counts.append(
                     int(((green > red + 30) & (green > blue + 30) & (green > 80)).sum())
                 )
-            # Each marker may be thin or occluded in a side projection, but
-            # the three-camera observation must contain a usable projection.
+            # The red object must remain visible in the original scene, and
+            # PixelObs goal enhancement must make all three projections useful.
             assert max(red_counts) >= 4
-            assert max(green_counts) >= 8
+            assert min(green_counts) >= MIN_GOAL_GREEN_PIXELS
+    finally:
+        env.close()
+
+
+def test_goal_enhancement_preserves_image_contract_and_is_pick_place_only():
+    pick_place = PixelTaskEnv(
+        task="pick_place", image_size=96, frame_stack=1, action_repeat=1
+    )
+    reach = PixelTaskEnv(task="reach", image_size=96, frame_stack=1, action_repeat=1)
+    try:
+        pick_observation, _ = pick_place.reset(seed=7)
+        reach_observation, _ = reach.reset(seed=7)
+        for observation in (pick_observation, reach_observation):
+            assert observation["image"].shape == (9, 96, 96)
+            assert observation["image"].dtype == np.uint8
+
+        reach_views = reach_observation["image"].reshape(3, 3, 96, 96)
+        for view in reach_views:
+            red, green, blue = view.astype(np.int16)
+            green_mask = (
+                (green > red + 30) & (green > blue + 30) & (green > 80)
+            )
+            assert int(green_mask.sum()) == 0
+    finally:
+        pick_place.close()
+        reach.close()
+
+
+def test_goal_enhancement_falls_back_to_projected_marker():
+    env = PixelTaskEnv(task="pick_place", image_size=32, action_repeat=1)
+    try:
+        blank = np.zeros((32, 32, 3), dtype=np.uint8)
+        identity = np.eye(4, dtype=np.float64).reshape(-1, order="F")
+        enhanced = env._enhance_goal_marker(blank, identity, identity)
+        red, green, blue = enhanced.astype(np.int16).transpose(2, 0, 1)
+        green_count = int(
+            ((green > red + 30) & (green > blue + 30) & (green > 80)).sum()
+        )
+        assert green_count >= MIN_GOAL_GREEN_PIXELS
+        assert enhanced.shape == blank.shape
+        assert enhanced.dtype == blank.dtype
+    finally:
+        env.close()
+
+
+def test_pixel_stage_budgets_are_local_and_uniformly_one_hundred_steps():
+    assert set(PIXEL_STAGE_STEP_LIMITS) == set(PickPlaceStage)
+    assert set(PIXEL_STAGE_STEP_LIMITS.values()) == {100}
+    # The vector-observation experiment keeps its independently validated
+    # per-stage limits; importing PixelObs must not mutate that global state.
+    assert STAGE_STEP_LIMITS[PickPlaceStage.APPROACH] == 50
+    assert STAGE_STEP_LIMITS[PickPlaceStage.GRASP] == 30
+    assert STAGE_STEP_LIMITS[PickPlaceStage.TRANSPORT] == 75
+    assert STAGE_STEP_LIMITS[PickPlaceStage.PLACE] == 100
+    assert STAGE_STEP_LIMITS[PickPlaceStage.RELEASE] == 20
+
+
+def test_pixel_pick_place_approach_times_out_at_one_hundred_steps():
+    env = PixelTaskEnv(
+        task="pick_place",
+        image_size=32,
+        max_episode_steps=150,
+        action_repeat=1,
+    )
+    try:
+        env.task_env.reset(seed=11)
+        action = np.zeros(4, dtype=np.float32)
+        for _ in range(99):
+            _, _, terminated, truncated, info = env.task_env.step(action)
+            assert not terminated
+            assert not truncated
+        _, _, terminated, truncated, info = env.task_env.step(action)
+        assert terminated
+        assert not truncated
+        assert info["failure_reason"] == "approach_timeout"
     finally:
         env.close()
 
