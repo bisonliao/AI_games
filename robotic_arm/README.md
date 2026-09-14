@@ -14,6 +14,7 @@
 | [`RobotEnv/`](RobotEnv/) | 基础 PyBullet 场景、Panda IK/夹爪控制、桌面物体和目标区域，以及脚本控制器。它不负责 SAC 训练。 |
 | [`SAC_VecObs/`](SAC_VecObs/) | 基于精确状态向量的 SAC 实验。包含 observation、奖励、pick-place 阶段状态机、并行环境、训练、评估和 TensorBoard 逻辑。 |
 | [`SAC_PixelObs/`](SAC_PixelObs/) | 基于三个正交 RGB 相机视图和机械臂本体状态的 SAC 实验。物体/目标精确坐标和阶段状态不提供给 policy。 |
+| [`SAC_BC_PixelObs/`](SAC_BC_PixelObs/) | 在SAC_PixelObs的基础上，克隆teacher的行为（BC），teacher是SAC_VecObs训练得到的checkpoint。 |
 
 各实验目录下的 `README.md` 记录了对应实现的参数、观测维度、训练命令和指标说明；训练产生的 checkpoint、monitor 和 TensorBoard 日志位于对应目录的 `runs/` 下。
 
