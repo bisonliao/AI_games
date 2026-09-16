@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed-start", type=int, default=10_000)
     parser.add_argument("--seed-set", choices=("unseen", "train"), default="unseen")
     parser.add_argument("--gui", action="store_true")
+    parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--stochastic", action="store_true")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--image-size", type=int, default=96)
@@ -40,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.episodes <= 0:
         parser.error("--episodes must be positive")
+    if args.fps <= 0.0:
+        parser.error("--fps must be positive")
     return args
 
 
@@ -74,6 +78,7 @@ def build_sac_environment(args: argparse.Namespace, config: EnvConfig):
                 seed=args.seed_start,
                 config=config,
                 randomize=False,
+                render_mode="human" if args.gui else None,
             )
         ]
     )
@@ -91,6 +96,7 @@ def evaluate_bc(
     lift_count = 0
     approach_timeout_count = 0
     returns = []
+ 
 
     for episode_id in range(args.episodes):
         env = config.make_env(
@@ -102,6 +108,7 @@ def evaluate_bc(
         episode_return = 0.0
 
         while True:
+            frame_start = time.perf_counter()
             with torch.inference_mode():
                 tensors, _ = actor.obs_to_tensor(observation)
                 action = actor(
@@ -110,6 +117,10 @@ def evaluate_bc(
                 ).cpu().numpy()[0]
             observation, reward, terminated, truncated, info = env.step(action)
             episode_return += float(reward)
+            if args.gui:
+                remaining = (1.0 / args.fps) - (time.perf_counter() - frame_start)
+                if remaining > 0.0:
+                    time.sleep(remaining)
             if terminated or truncated:
                 success_count += int(info.get("success", False))
                 grasp_count += int(info.get("ever_grasped", False))
@@ -168,6 +179,7 @@ def evaluate_sac(
     for _ in range(args.episodes):
         episode_return = 0.0
         while True:
+            frame_start = time.perf_counter()
             action, _ = model.predict(
                 observation,
                 deterministic=not args.stochastic,
@@ -202,6 +214,10 @@ def evaluate_sac(
                     )
                     writer.add_scalar("eval/episode_return", episode_return, episode_id)
                 break
+            if args.gui:
+                remaining = (1.0 / args.fps) - (time.perf_counter() - frame_start)
+                if remaining > 0.0:
+                    time.sleep(remaining)
 
     result = {
         "mode": "sac",

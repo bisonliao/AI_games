@@ -193,7 +193,15 @@ class RandomizedPixelTaskEnv(PixelTaskEnv):
         return np.concatenate(frames, axis=0)
 
 
-def make_randomized_env_factory(*, task: str, rank: int, seed: int, config, randomize: bool = True):
+def make_randomized_env_factory(
+    *,
+    task: str,
+    rank: int,
+    seed: int,
+    config,
+    randomize: bool = True,
+    render_mode: str | None = None,
+):
     """Return a picklable factory for learner evaluation environments."""
     def _init():
         return RandomizedPixelTaskEnv(
@@ -205,6 +213,7 @@ def make_randomized_env_factory(*, task: str, rank: int, seed: int, config, rand
             action_repeat=config.action_repeat,
             seed=seed + rank,
             randomize=randomize,
+            render_mode=render_mode,
         )
     return _init
 

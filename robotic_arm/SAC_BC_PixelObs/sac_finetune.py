@@ -328,7 +328,11 @@ def _actor_process(
         policy_version, state = control_queue.get()
         actor = make_actor(config, device="cpu")
         actor.load_state_dict(_state_dict_from_numpy(state), strict=True)
-        env = config.make_env(seed=seed + actor_id)
+        # Fine-tuning intentionally uses the same nominal environment as the
+        # original PixelObs task.  No object, goal, joint, or camera jitter is
+        # applied to actor rollouts; task/* metrics therefore describe this
+        # fixed reset distribution.
+        env = config.make_env(seed=seed + actor_id, randomize=False)
         observation, _ = env.reset(seed=seed + actor_id)
         rows: list[tuple] = []
         summaries: list[dict] = []
@@ -423,11 +427,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bc-model", type=Path, required=True)
     parser.add_argument("--expert-data", type=Path, required=True)
-    parser.add_argument("--total-timesteps", type=int, default=30_000_000)
+    parser.add_argument("--total-timesteps", type=int, default=10_000_000)
     parser.add_argument("--n-actors", type=int, default=8)
     parser.add_argument("--utd-ratio", type=float, default=0.10)
     parser.add_argument("--learning-starts", type=int, default=1_000)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--buffer-size", type=int, default=10_000)
     parser.add_argument("--prior-ratio", type=float, default=0.25)
     parser.add_argument("--bc-warmup-transitions", type=int, default=50_000)
@@ -441,7 +445,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-freq", type=int, default=3_000_000)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--keep-checkpoints", type=int, default=3)
-    parser.add_argument("--log-freq", type=int, default=5_000)
+    parser.add_argument("--log-freq", type=int, default=10_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--output", type=Path, default=None)
@@ -581,6 +585,11 @@ def _save_checkpoint(model, run_dir, transition_count, n_updates, args, policy_v
         "batch_size": args.batch_size,
         "rollout_chunk_size": args.rollout_chunk_size,
         "tensorboard_dir": str(tensorboard_dir),
+        "environment_randomize": False,
+        "object_position_jitter": 0.0,
+        "goal_position_jitter": 0.0,
+        "initial_joint_jitter": 0.0,
+        "camera_jitter": 0.0,
         "args": vars(args),
     }
     (run_dir / "checkpoint_metadata.json").write_text(
@@ -618,7 +627,9 @@ def main() -> None:
     # construct policy/critic modules and the replay buffer.
     learner_env = DummyVecEnv(
         [make_randomized_env_factory(
-            task="pick_place", rank=0, seed=args.seed, config=config, randomize=True
+            # This environment is not stepped; it only supplies SB3 spaces.
+            # Keep it consistent with the no-jitter actor environments anyway.
+            task="pick_place", rank=0, seed=args.seed, config=config, randomize=False
         )]
     )
     augmentation = ConsistentMultiViewAugmentation(args.augmentation_shift)

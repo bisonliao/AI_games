@@ -23,10 +23,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-repeat", type=int, default=8)
     parser.add_argument("--camera-scale", type=float, default=1.0)
     parser.add_argument("--train-seed-start", type=int, default=0)
-    parser.add_argument("--camera-jitter", type=float, default=0.03)
+    parser.add_argument("--camera-jitter", type=float, default=0.00)
     parser.add_argument("--object-position-jitter", type=float, default=0.04)
     parser.add_argument("--goal-position-jitter", type=float, default=0.04)
-    parser.add_argument("--initial-joint-jitter", type=float, default=0.05)
+    parser.add_argument("--initial-joint-jitter", type=float, default=0.00) #必须为0，否则会导致反关节而不能成功
     args = parser.parse_args()
     if args.episodes <= 0:
         parser.error("--episodes must be positive")

@@ -21,11 +21,11 @@ from SAC_PixelObs.policy import MultiViewCombinedExtractor
 PACKAGE = Path(__file__).resolve().parent
 REPO = PACKAGE.parent
 DEFAULT_EXPERT = REPO / (
-    "SAC_VecObs/runs/pick_place_20260818_211439/checkpoints/"
-    "pick_place_sac_1000000_steps.zip"
+    "SAC_VecObs/runs/pick_place_20260915_101759/checkpoints/"
+    "pick_place_sac_2000000_steps.zip"
 )
 FORMAT_VERSION = 2
-TB_LOG_ROOT = PACKAGE / "tb_logs"
+TB_LOG_ROOT = REPO / "tb_logs"
 
 
 @dataclass(frozen=True)
@@ -109,7 +109,9 @@ def new_tensorboard_run(stage: str) -> Path:
         raise ValueError(f"Unsupported TensorBoard stage: {stage}")
 
     run_name = f"{stage}_{datetime.now():%Y%m%d_%H%M%S}_pid{os.getpid()}"
-    log_root = output_path(TB_LOG_ROOT)
+    # TensorBoard is the one package artifact intentionally stored at the
+    # repository root so all experiments share one dashboard directory.
+    log_root = TB_LOG_ROOT.resolve()
     log_root.mkdir(parents=True, exist_ok=True)
 
     # A process may start the same stage twice within one second. Keep those
