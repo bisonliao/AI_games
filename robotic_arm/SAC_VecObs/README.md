@@ -185,15 +185,17 @@ SB3 是当前实现依赖，但不是架构前提。若以后需要真正的异�
 APPROACH → GRASP → TRANSPORT → PLACE → RELEASE → SUCCESS
 ```
 
-阶段含义如下：
+阶段含义和状态机转换如下。表中的“保持/进入条件”描述当前阶段负责的任务状态；“正常转换”描述满足什么条件后向后推进；“失败退出”描述违反任务顺序或停滞时如何终止 episode。阶段只能向后推进，不能回到前一阶段。
 
-| 阶段 | 判断 | 主要奖励 |
-|---|---|---|
-| `approach` | 尚未形成双指抓取 | 夹爪接近物体 |
-| `grasp` | 双指接触且夹爪闭合 | 首次抓取奖励、向上抬起进度 |
-| `transport` | 物体已离开桌面 | 物体 XY 接近目标 |
-| `place` | 被抓物体已到目标上方 | 稳定向桌面降低 |
-| `release` | 目标内松开夹爪 | 等待物体稳定 |
+| 阶段 | 保持/进入条件 | 正常转换 | 失败退出 | 主要奖励 |
+|---|---|---|---|---|
+| `approach` | episode 从这里开始；夹爪尚未形成连续确认的双指接触 | 左右手指都接触物体、夹爪已收拢，并连续满足 `2` 个环境 step → `grasp` | 阶段预算 `50` step 用尽 → `approach_timeout` | 末端接近物体的有符号距离进度 |
+| `grasp` | 已确认双指接触，物体仍在桌面附近 | 物体达到 `lifted` 高度且仍保持双指接触 → `transport` | 持续失去接触 `4` 个 step → `grasp_lost`；阶段预算 `30` step → `grasp_timeout` | 首次抓取 `+1`；首次抬起 `+2`；物体高度上升的有符号进度 |
+| `transport` | 物体已抬起，并由夹爪保持接触 | 物体 XY 到目标距离 `< 0.075 m` 且仍处于 `lifted` → `place` | 未抬起或失去接触持续 `4` 个 step → `object_dropped`；阶段预算 `75` step → `transport_timeout` | 物体接近目标的有符号 XY 进度 |
+| `place` | 物体处于目标附近，夹爪默认仍保持闭合；允许在较宽的 `< 0.18 m` 退出带内调整 | 夹爪打开后，必须同时满足：物体中心高度距离桌面静止高度不超过 `0.010 m`、目标 XY 距离 `< 0.075 m`、物体不再 `lifted` → `release` | 物体离开 `< 0.18 m` 退出带持续 `4` 个 step → `object_left_goal`；在安全高度前打开夹爪持续 `2` 个 step → `premature_release`；阶段预算 `100` step → `place_timeout` | 物体向桌面降低的有符号高度进度；只有正常进入 `release` 后才发放一次 place/release 里程碑奖励 |
+| `release` | 已通过安全高度门控并松开夹爪；物体仍需在 `< 0.10 m` 释放退出带内 | 物体位于目标内、回到桌面、夹爪打开、线速度和角速度足够低，并连续稳定 `4` 个 step → `success` | 重新闭合夹爪或物体离开 `< 0.10 m` 退出带持续 `4` 个 step → `release_regressed`；阶段预算 `20` step → `release_timeout` | 等待稳定；最终成功奖励 `+10` |
+
+其中，释放安全高度以物体中心相对于 `object_half_extent` 的误差计算。当前物体半高约为 `0.025 m`，所以允许释放的中心高度约为 `0.025 ... 0.035 m`。`lifted` 使用更宽松的抬起判定，不能替代这个释放门控；提前打开夹爪不会进入 `release`，也不会领取 place/release 奖励。
 
 成功必须同时满足：
 
@@ -205,7 +207,7 @@ APPROACH → GRASP → TRANSPORT → PLACE → RELEASE → SUCCESS
 
 掉落在目标外会收到失败惩罚并终止。阶段机只允许向前推进：确认进入 `grasp` 后不会退回 `approach`，后续阶段也不会回退。接触判定使用少量连续 step 防抖；确认抓取后持续失去接触、物体离开目标区域、重新抓取或当前阶段超时，都会得到失败惩罚并终止 episode。抓取、抬起、到达目标和释放奖励只发放一次，避免反复切换阶段刷 reward。
 
-阶段是 history-dependent 的，因此 observation 显式包含阶段 one-hot、`ever_grasped`、`ever_lifted` 和稳定计数，保持任务状态对 policy 可见。
+阶段是 history-dependent 的，因此 observation 显式包含阶段 one-hot、`ever_grasped`、`ever_lifted` 和稳定计数，保持任务状态对 policy 可见。释放诊断额外写入 terminal `info`：`premature_release`、`release_height_ready` 和 `release_height_error`；它们不进入 observation。
 
 阶段 progress 使用有符号差分：抬升获得正的高度变化，下降产生负的高度变化；不再把负向变化截断为零。这样即使在同一阶段上下振荡，也不能持续获得净 progress reward。
 
@@ -220,7 +222,7 @@ Reward shaping 的目标是帮助 agent 发现完整动作序列，而不是让 
 1. **阶段单向推进**：状态机只允许 `approach → grasp → transport → place → release`。确认进入某阶段后不能退回前一阶段重新领取 progress；持续回退会被解释为抓取丢失、掉落或释放失败，并终止 episode。
 2. **使用有符号进度差分**：接近、抬升、搬运和降低奖励都基于前后状态的误差变化。向目标前进为正，退步为负；尤其抬升奖励不再使用 `max(0, Δz)`。在同一阶段往返运动时，正负 progress 会相互抵消，时间和动作成本使循环的净回报为负。
 3. **里程碑奖励只发放一次**：抓取、首次抬起、到达目标、释放和最终成功由 history flag 保护，不能通过抖动或重复触发事件反复领取 bonus。
-4. **违反任务顺序会失败终止**：确认抓取后持续丢失接触、运输中掉落、放置后明显离开目标、释放后重新闭合夹爪，以及阶段超时，都会产生 `-5` 的 `reward/failure` 或 `reward/drop` 并设置 `terminated=True`。失败后不能继续利用剩余 horizon 刷分。
+4. **违反任务顺序会失败终止**：确认抓取后持续丢失接触、运输中掉落、放置后明显离开目标、未降到安全高度就释放、释放后重新闭合夹爪，以及阶段超时，都会产生 `-5` 的 `reward/failure` 或 `reward/drop` 并设置 `terminated=True`。失败后不能继续利用剩余 horizon 刷分。
 5. **防抖与迟滞避免误罚**：物理接触和目标边界可能在相邻 simulation step 间抖动，因此进入阶段需要连续确认，异常也需要连续多个 RL step 才判失败；目标区域采用不同的进入/退出阈值。严格的任务顺序与对 PyBullet 瞬时噪声的容忍并不冲突。
 6. **阶段预算只作为停滞安全阀**：预算用于防止 policy 长期停在某阶段而不尝试推进，并减少 replay buffer 中的低价值 transition；它不是修复循环刷分的主要机制。真正保证循环无利可图的是阶段不可回退、有符号差分和一次性事件奖励。全局 `max_episode_steps` 仍是 Gymnasium truncation 上限。
 7. **奖励内部状态对 policy 可见**：阶段 one-hot、历史 flag、阶段预算进度、接触确认进度和异常容忍进度都包含在 observation 中，避免 reward/termination 依赖 policy 看不到的隐藏计数器。
@@ -258,6 +260,19 @@ Reward shaping 的目标是帮助 agent 发现完整动作序列，而不是让 
 阶段 one-hot、历史标记和阶段计时/防抖进度不是额外“答案泄漏”，而是为了保证环境的奖励状态对 policy 可见。例如，同样是物体放在桌面上，`ever_lifted=0` 表示尚未抓取，`ever_lifted=1` 则可能表示已经搬运并释放；如果隐藏该信息，依赖历史的成功判定就不再满足 Markov 假设。
 
 训练端使用 `VecNormalize` 维护 observation 均值和方差。评估模型时必须同时加载对应的 `vecnormalize.pkl`。
+
+Vector SAC 的 TensorBoard 日志统一写入项目根目录：
+
+```text
+tb_logs/sac_vec_<task>_<YYYYMMDD_HHMMSS>_pid<PID>_1/
+```
+
+目录名包含 `sac_vec`、任务名、时间戳和进程 PID；如果 SB3 自动创建运行编号，
+末尾会追加 `_1`。使用以下命令查看：
+
+```bash
+tensorboard --logdir tb_logs
+```
 
 ## 安装
 
@@ -354,7 +369,7 @@ eval/success_rate
 
 `task/truncation_rate` 表示 episode 因达到 `max_episode_steps` 而结束的比例。环境适配层会独立检查时间上限，factory 外还使用 Gymnasium `TimeLimit` 二次保护，避免底层和上层任务成功条件不一致时产生永不结束的 episode。判断是否需要增大 horizon 时，应结合最终阶段观察该指标：大量 episode 在 `place/release` 阶段截断才说明时间可能不够；如果始终停在 `approach/grasp`，增加 horizon 通常不能解决探索或奖励问题。
 
-Monitor 的 terminal info 还会保存 `failure_reason`，常见值包括 `grasp_lost`、`object_dropped`、`object_left_goal`、`release_regressed` 和各阶段的 `*_timeout`，便于区分探索失败、物理掉落与阶段停滞。
+Monitor 的 terminal info 还会保存 `failure_reason`，常见值包括 `grasp_lost`、`object_dropped`、`object_left_goal`、`premature_release`、`release_regressed` 和各阶段的 `*_timeout`，便于区分探索失败、物理掉落、释放过早与阶段停滞。训练回调会将释放过早比例记录为 `task/premature_release_rate`，并记录 `task/release_height_ready_rate`。
 
 ## 评估和 GUI
 
@@ -369,6 +384,33 @@ python -m SAC_VecObs.evaluate \
 ```
 
 `evaluate` 会尝试在 checkpoint 附近自动查找 `vecnormalize.pkl`，但显式传入最可靠。
+
+查看带 jitter 的 checkpoint 行为时，使用 `--jitter-eval`。该模式在 reset 时对
+object/goal XY 和 Panda 初始关节角施加扰动，默认值为 `0.04 m / 0.04 m / 0.05 rad`。
+配合 `--gui` 可以直观看到机械臂在每个 jitter 状态中的动作；程序会打印每个完成
+episode 的实际物体位置、目标位置和初始关节偏移：
+
+```bash
+python -m SAC_VecObs.evaluate \
+  --task pick_place \
+  --checkpoint SAC_VecObs/runs/<run_name>/checkpoints/pick_place_sac_1000000_steps.zip \
+  --vecnormalize SAC_VecObs/runs/<run_name>/checkpoints/pick_place_sac_vecnormalize_1000000_steps.pkl \
+  --jitter-eval --gui --episodes 20 --fps 10
+```
+
+关闭 `--jitter-eval` 时，评估仍使用原始 `SACVectorTaskEnv`，不会施加任何物理 jitter。
+
+pick-place teacher 的默认训练预算为 `5,000,000` transitions。训练入口在每个
+checkpoint 保存后，固定使用 unseen seed `10000...10019` 做 20 回合评估，并把
+`eval/unseen_*` 指标写入同一 TensorBoard；训练结束后再使用
+`10000...10099` 做 100 回合最终评估。默认 `--checkpoint-freq` 和
+`--eval-freq` 均为 `1,000,000`，训练环境不会使用这组 unseen seed。
+
+训练期间还会用独立的 jitter 评估环境记录 `jitter_eval/*`：默认使用 seed
+`30000...30019`，对 object/goal XY 和 Panda 初始关节角施加评估期扰动
+（分别为 `0.04 m`、`0.04 m`、`0.05 rad`）。训练结束后使用
+`30000...30099` 做完整 jitter 评估。jitter 评估不改变训练环境、奖励或
+阶段机，且与普通 unseen 评估共享训练中的 VecNormalize 统计。
 
 ## Curriculum
 
