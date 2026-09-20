@@ -24,7 +24,7 @@
 
 1. **向量化观测**：`SAC_VecObs` 下的 `reach` 和 `pick_place` 都能快速、稳定收敛，成功率可达到 100%。
 2. **三个正交 RGB 观测**：`SAC_PixelObs` 下的 `reach` 可以达到 70% 以上成功率；但 `pick_place` 长时间训练仍不能收敛，甚至无法稳定完成第一个 `APPROACH` 阶段。
-3. **三个正交 RGB 观测+BC预训练**：pick_place可以达到70%以上的成功率。
+3. **三个正交 RGB 观测+BC预训练**：pick_place可以达到90%以上的成功率, 需要训练至少8M时间步。
 
 
 
