@@ -68,6 +68,14 @@ class PixelTaskMetricsCallback(BaseCallback):
             self.logger.record_mean(
                 "task/stage_timeout_rate", float(reason.endswith("_timeout"))
             )
+            self.logger.record_mean(
+                "task/premature_release_rate",
+                float(reason == "premature_release"),
+            )
+            self.logger.record_mean(
+                "task/release_height_ready_rate",
+                float(episode.get("release_height_ready", False)),
+            )
         return True
 
 

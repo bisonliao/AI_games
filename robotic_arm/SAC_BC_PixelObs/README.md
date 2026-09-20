@@ -106,3 +106,27 @@ tb_logs/
 ```bash
 tensorboard --logdir tb_logs
 ```
+
+## DrQ 图像增强
+
+为缓解像素 SAC 过拟合，`sac_finetune.py` 已引入 DrQ：默认使用 4 像素随机 shift，并以 `K=2、M=2` 分别平均 target Q 和 critic loss；增强只作用于 replay batch，不用于 rollout 或评估。
+
+三相机中心高度为 `z=0.30 m`，物体中心约为 `z=0.025 m`。实测 96×96 的 `xz/yz` 视图中，红色物体位于第 71–77 行，距底边至少 18 像素，因此 ±4 像素 shift 不会把物体移出画面。需要继续观察的是：三个投影视图的坐标语义不同，共享同一 shift 会轻微破坏多视图三维对应关系；可用 `--augmentation-shift 0/2/4` 做消融。
+
+# 遗留问题
+
+【背景】
+你仔细阅读SAC_BC_PixelObs/下的代码，它基于像素视觉作为观测输入，训练agent控制机械臂完成pick-place任务。思路是：
+step1:expert_showcase.py：用SAC_VecObs/下基于向量化内部状态作为观测输入训练好的模型为teacher，进行演示，生成400条带视觉观测的episode
+step2:bc_pretrain.py：使用BC这一行为克隆算法，基于400条episode做预训练
+step3:sac_finetune.py：使用预训练好的模型作为起始模型，与环境交互生成新的replay buffer，结合400条teacher演示的经验，进行训练
+很重要的一个设计是：把机械臂的整个作业episode分为approach grasp transport lift place release多个阶段、每个阶段的奖励都是不一样的，且这些阶段只能单向推进。详细见SAC_VecObs/README.md文档。
+
+【问题】
+我经过上述三步，sac_finetune训练400万时间步后，模型可以达到65%的成功率、grasp/lift的这种阶段性成功率可以达到100%。我仔细观察评测视频，发现失败的都是最后一步release后，红色物体没有很好的放到绿色目标位置，然后该episode的阶段已经到了RELEASE阶段，阶段单向推进，不是处于approach阶段，agent不会重新捡起物体，即使episode长度允许还有很多动作机会。
+
+
+我已经调整了进入RELEASE阶段的条件，让它更加严苛：必须让物体位置比较低才可以进入RELEASE阶段，确保物体不会在最后放置的时候滑出绿色区域导致失败。但是我发现效果有限，是不是要把进入PLACE阶段的条件做得更严苛，让物体和目标位置的中心的(x,y)坐标对齐更多？我对此依然没有信心，因为还有速度的问题。
+
+我先加大训练的预算，看看效果。
+

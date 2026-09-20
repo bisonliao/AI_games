@@ -20,9 +20,11 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from stable_baselines3 import SAC
 from stable_baselines3.common.buffers import DictReplayBuffer, DictReplayBufferSamples
 from stable_baselines3.common.logger import configure
+from stable_baselines3.common.utils import polyak_update
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from .common import (
@@ -78,6 +80,8 @@ class MixedSB3Replay(DictReplayBuffer):
         if not 0.0 <= prior_ratio <= 1.0:
             raise ValueError("prior_ratio must be in [0, 1]")
         self.prior_ratio = float(prior_ratio)
+        # Kept for BC prior-action sampling; replay.sample itself returns raw
+        # observations so DrQ can draw independent K/M transforms per update.
         self.augmentation = augmentation
         self.rng = np.random.default_rng(seed)
         self.prior: list[tuple] = []
@@ -154,8 +158,7 @@ class MixedSB3Replay(DictReplayBuffer):
             raise ValueError("Insufficient distinct prior and online rows")
 
         if prior_count == 0:
-            batch = super().sample(batch_size, env)
-            return self._augment_batch(batch)
+            return super().sample(batch_size, env)
 
         if online_count == 0:
             prior_obs, prior_next, prior_actions, prior_rewards, prior_dones = (
@@ -168,7 +171,7 @@ class MixedSB3Replay(DictReplayBuffer):
                 dones=self.to_torch(prior_dones),
                 rewards=self.to_torch(prior_rewards),
             )
-            return self._augment_batch(batch)
+            return batch
 
         online = super().sample(online_count, env)
         prior_obs, prior_next, prior_actions, prior_rewards, prior_dones = (
@@ -189,25 +192,7 @@ class MixedSB3Replay(DictReplayBuffer):
             dones=torch.cat([online.dones, self.to_torch(prior_dones)]),
             rewards=torch.cat([online.rewards, self.to_torch(prior_rewards)]),
         )
-        return self._augment_batch(batch)
-
-    def _augment_batch(self, batch: DictReplayBufferSamples) -> DictReplayBufferSamples:
-        """Apply one consistent multi-view augmentation at encoder input."""
-        if self.augmentation is None:
-            return batch
-        return DictReplayBufferSamples(
-            observations=self._augment_observation(batch.observations),
-            actions=batch.actions,
-            next_observations=self._augment_observation(batch.next_observations),
-            dones=batch.dones,
-            rewards=batch.rewards,
-            discounts=batch.discounts,
-        )
-
-    def _augment_observation(self, observation: dict) -> dict:
-        result = dict(observation)
-        result["image"] = self.augmentation(result["image"])
-        return result
+        return batch
 
     def sample_prior_observations(self, count: int, device) -> tuple[dict, np.ndarray]:
         """Sample prior state/action pairs for BC actor regularization."""
@@ -219,8 +204,6 @@ class MixedSB3Replay(DictReplayBuffer):
             key: torch.as_tensor(np.stack([row[0][key] for row in rows]), device=device)
             for key in rows[0][0]
         }
-        if self.augmentation is not None:
-            observations["image"] = self.augmentation(observations["image"])
         actions = np.stack([row[1] for row in rows]).astype(np.float32)
         return observations, actions
 
@@ -237,6 +220,9 @@ class ProtectedSAC(SAC):
         bc_regularization_transitions: int,
         bc_action_coef: float,
         bc_action_coef_final: float,
+        drq_k: int = 2,
+        drq_m: int = 2,
+        augmentation=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -246,44 +232,125 @@ class ProtectedSAC(SAC):
         self.bc_regularization_transitions = int(bc_regularization_transitions)
         self.bc_action_coef = float(bc_action_coef)
         self.bc_action_coef_final = float(bc_action_coef_final)
+        self.drq_k = int(drq_k)
+        self.drq_m = int(drq_m)
+        self.drq_augmentation = augmentation
+        if self.drq_k < 1 or self.drq_m < 1:
+            raise ValueError("drq_k and drq_m must be positive")
         self.last_bc_action_loss = 0.0
         self.last_bc_coef = 0.0
         self.last_actor_frozen = 0.0
+        self.last_target_q_std = 0.0
+        self.last_current_q_std = 0.0
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
-        """Run normal SAC updates, then constrain the actor toward BC."""
-        super().train(gradient_steps=gradient_steps, batch_size=batch_size)
+        """Run SAC updates with independent DrQ target/current transforms."""
+        self.policy.set_training_mode(True)
+        optimizers = [self.actor.optimizer, self.critic.optimizer]
+        if self.ent_coef_optimizer is not None:
+            optimizers.append(self.ent_coef_optimizer)
+        self._update_learning_rate(optimizers)
+        ent_coef_losses, ent_coefs, actor_losses, critic_losses = [], [], [], []
         transition_count = int(self.num_timesteps)
         frozen = transition_count < self.bc_warmup_transitions
-        if frozen:
-            self.policy.actor.load_state_dict(self.bc_state, strict=True)
-            self.last_bc_action_loss = 0.0
-            self.last_bc_coef = self.bc_action_coef
-            self.last_actor_frozen = 1.0
-            return
+        self.last_actor_frozen = float(frozen)
 
-        progress = min(
-            1.0,
-            max(0.0, (transition_count - self.bc_warmup_transitions)
-                / max(self.bc_regularization_transitions, 1)),
-        )
-        coefficient = (
-            self.bc_action_coef
-            + progress * (self.bc_action_coef_final - self.bc_action_coef)
-        )
-        observations, actions = self.bc_replay.sample_prior_observations(
-            min(batch_size, len(self.bc_replay.prior)), self.device
-        )
-        target = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
-        predicted = self.policy.actor(observations, deterministic=True)
-        bc_loss = torch.nn.functional.mse_loss(predicted, target)
-        self.policy.actor.optimizer.zero_grad()
-        (coefficient * bc_loss).backward()
-        torch.nn.utils.clip_grad_norm_(self.policy.actor.parameters(), 10.0)
-        self.policy.actor.optimizer.step()
-        self.last_bc_action_loss = float(bc_loss.detach().cpu())
-        self.last_bc_coef = coefficient
-        self.last_actor_frozen = 0.0
+        for gradient_step in range(gradient_steps):
+            replay_data = self.replay_buffer.sample(
+                batch_size, env=self._vec_normalize_env
+            )
+            discounts = replay_data.discounts if replay_data.discounts is not None else self.gamma
+            raw_obs = replay_data.observations
+            raw_next_obs = replay_data.next_observations
+            augmentation = self.drq_augmentation
+
+            # Entropy temperature update uses one independently augmented state.
+            actor_obs = self._augment_observation(raw_obs, augmentation)
+            _, log_prob = self.actor.action_log_prob(actor_obs)
+            log_prob = log_prob.reshape(-1, 1)
+            ent_coef_loss = None
+            if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
+                ent_coef = torch.exp(self.log_ent_coef.detach())
+                ent_coef_loss = -(
+                    self.log_ent_coef * (log_prob + self.target_entropy).detach()
+                ).mean()
+                self.ent_coef_optimizer.zero_grad()
+                ent_coef_loss.backward()
+                self.ent_coef_optimizer.step()
+                ent_coef_losses.append(float(ent_coef_loss.detach().cpu()))
+            else:
+                ent_coef = self.ent_coef_tensor
+            ent_coefs.append(float(ent_coef.detach().cpu()))
+
+            # K target augmentations: average the soft double-Q targets.
+            target_values = []
+            with torch.no_grad():
+                for _ in range(self.drq_k):
+                    next_obs = self._augment_observation(raw_next_obs, augmentation)
+                    next_actions, next_log_prob = self.actor.action_log_prob(next_obs)
+                    next_q = torch.cat(self.critic_target(next_obs, next_actions), dim=1)
+                    next_q = next_q.min(dim=1, keepdim=True).values
+                    target_values.append(next_q - ent_coef * next_log_prob.reshape(-1, 1))
+                averaged_target = torch.stack(target_values, dim=0).mean(dim=0)
+                target_q_values = replay_data.rewards + (1 - replay_data.dones) * discounts * averaged_target
+            self.last_target_q_std = float(torch.stack(target_values, dim=0).std(dim=0, unbiased=False).mean().cpu()) if self.drq_k > 1 else 0.0
+
+            # M current-Q augmentations: accumulate mean critic gradients without
+            # retaining all M graphs simultaneously.
+            self.critic.optimizer.zero_grad()
+            current_values = []
+            for _ in range(self.drq_m):
+                obs = self._augment_observation(raw_obs, augmentation)
+                q_values = self.critic(obs, replay_data.actions)
+                current_values.append(torch.cat(q_values, dim=1).detach())
+                loss = 0.5 * sum(F.mse_loss(q, target_q_values) for q in q_values)
+                critic_losses.append(float(loss.detach().cpu()))
+                (loss / self.drq_m).backward()
+            self.critic.optimizer.step()
+            self.last_current_q_std = float(torch.stack(current_values, dim=0).std(dim=0, unbiased=False).mean().cpu()) if self.drq_m > 1 else 0.0
+
+            if not frozen:
+                actor_obs = self._augment_observation(raw_obs, augmentation)
+                actions_pi, actor_log_prob = self.actor.action_log_prob(actor_obs)
+                q_pi = torch.cat(self.critic(actor_obs, actions_pi), dim=1)
+                sac_actor_loss = (ent_coef * actor_log_prob.reshape(-1, 1) - q_pi.min(dim=1, keepdim=True).values).mean()
+                progress = min(1.0, max(0.0, (transition_count - self.bc_warmup_transitions) / max(self.bc_regularization_transitions, 1)))
+                coefficient = self.bc_action_coef + progress * (self.bc_action_coef_final - self.bc_action_coef)
+                prior_obs, prior_actions = self.bc_replay.sample_prior_observations(min(batch_size, len(self.bc_replay.prior)), self.device)
+                prior_obs = self._augment_observation(prior_obs, augmentation)
+                prior_target = torch.as_tensor(prior_actions, dtype=torch.float32, device=self.device)
+                bc_loss = F.mse_loss(self.actor(prior_obs, deterministic=True), prior_target)
+                actor_loss = sac_actor_loss + coefficient * bc_loss
+                self.actor.optimizer.zero_grad()
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 10.0)
+                self.actor.optimizer.step()
+                actor_losses.append(float(sac_actor_loss.detach().cpu()))
+                self.last_bc_action_loss = float(bc_loss.detach().cpu())
+                self.last_bc_coef = coefficient
+            else:
+                self.policy.actor.load_state_dict(self.bc_state, strict=True)
+                self.last_bc_action_loss = 0.0
+                self.last_bc_coef = self.bc_action_coef
+
+            if gradient_step % self.target_update_interval == 0:
+                polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
+
+        self._n_updates += gradient_steps
+        self.logger.record("train/n_updates", self._n_updates)
+        self.logger.record("train/ent_coef", np.mean(ent_coefs))
+        self.logger.record("train/actor_loss", np.mean(actor_losses) if actor_losses else 0.0)
+        self.logger.record("train/critic_loss", np.mean(critic_losses))
+        if ent_coef_losses:
+            self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
+
+    @staticmethod
+    def _augment_observation(observation: dict, augmentation):
+        if augmentation is None:
+            return observation
+        result = dict(observation)
+        result["image"] = augmentation(result["image"])
+        return result
 
     def _excluded_save_params(self) -> list[str]:
         """Do not serialize replay/prior objects through ``bc_replay``.
@@ -369,6 +436,12 @@ def _actor_process(
                         "ever_lifted": bool(info.get("ever_lifted", False)),
                         "stage_index": int(info.get("stage_index", -1)),
                         "failure_reason": str(info.get("failure_reason", "")),
+                        "premature_release": bool(
+                            info.get("premature_release", False)
+                        ),
+                        "release_height_ready": bool(
+                            info.get("release_height_ready", False)
+                        ),
                     }
                 )
                 observation, _ = env.reset()
@@ -427,7 +500,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bc-model", type=Path, required=True)
     parser.add_argument("--expert-data", type=Path, required=True)
-    parser.add_argument("--total-timesteps", type=int, default=10_000_000)
+    parser.add_argument("--total-timesteps", type=int, default=10_100_000)
     parser.add_argument("--n-actors", type=int, default=8)
     parser.add_argument("--utd-ratio", type=float, default=0.10)
     parser.add_argument("--learning-starts", type=int, default=1_000)
@@ -439,10 +512,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bc-action-coef", type=float, default=1.0)
     parser.add_argument("--bc-action-coef-final", type=float, default=0.1)
     parser.add_argument("--augmentation-shift", type=int, default=4)
+    parser.add_argument("--drq-k", type=int, default=2)
+    parser.add_argument("--drq-m", type=int, default=2)
     parser.add_argument("--rollout-chunk-size", type=int, default=32)
     parser.add_argument("--actor-queue-size", type=int, default=16)
     parser.add_argument("--policy-sync-interval", type=int, default=1_000)
-    parser.add_argument("--checkpoint-freq", type=int, default=3_000_000)
+    parser.add_argument("--checkpoint-freq", type=int, default=1_000_000)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--keep-checkpoints", type=int, default=3)
     parser.add_argument("--log-freq", type=int, default=10_000)
@@ -472,6 +547,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("BC coefficients must be non-negative")
     if args.augmentation_shift < 0:
         parser.error("--augmentation-shift must be non-negative")
+    if args.drq_k < 1 or args.drq_m < 1:
+        parser.error("--drq-k and --drq-m must be positive")
     if args.keep_checkpoints < 1:
         parser.error("--keep-checkpoints must be positive")
     return args
@@ -534,6 +611,14 @@ def _record_summaries(logger, summaries: list[dict]) -> None:
         logger.record_mean(
             "task/drop_rate", float(reason in {"object_dropped", "object_left_goal"})
         )
+        logger.record_mean(
+            "task/premature_release_rate",
+            float(summary.get("premature_release", reason == "premature_release")),
+        )
+        logger.record_mean(
+            "task/release_height_ready_rate",
+            float(summary.get("release_height_ready", False)),
+        )
         logger.record_mean("task/final_stage", float(summary["stage_index"]))
 
 
@@ -585,6 +670,9 @@ def _save_checkpoint(model, run_dir, transition_count, n_updates, args, policy_v
         "batch_size": args.batch_size,
         "rollout_chunk_size": args.rollout_chunk_size,
         "tensorboard_dir": str(tensorboard_dir),
+        "drq_k": args.drq_k,
+        "drq_m": args.drq_m,
+        "drq_shift_pixels": args.augmentation_shift,
         "environment_randomize": False,
         "object_position_jitter": 0.0,
         "goal_position_jitter": 0.0,
@@ -654,6 +742,9 @@ def main() -> None:
         bc_regularization_transitions=args.bc_regularization_transitions,
         bc_action_coef=args.bc_action_coef,
         bc_action_coef_final=args.bc_action_coef_final,
+        drq_k=args.drq_k,
+        drq_m=args.drq_m,
+        augmentation=augmentation,
     )
     if args.resume is not None:
         loaded = SAC.load(args.resume, env=learner_env, device=args.device)
@@ -747,6 +838,11 @@ def main() -> None:
                 logger.record("train/n_updates", n_updates)
                 logger.record("train/utd_target", args.utd_ratio)
                 logger.record("train/utd_actual", n_updates / max(learner_transition_count, 1))
+                logger.record("train/drq_k", args.drq_k)
+                logger.record("train/drq_m", args.drq_m)
+                logger.record("train/drq_shift_pixels", args.augmentation_shift)
+                logger.record("train/drq_target_q_std", model.last_target_q_std)
+                logger.record("train/drq_current_q_std", model.last_current_q_std)
                 logger.record("train/bc_action_loss", model.last_bc_action_loss)
                 logger.record("train/bc_action_coef", model.last_bc_coef)
                 logger.record("train/bc_actor_frozen", model.last_actor_frozen)
@@ -787,6 +883,11 @@ def main() -> None:
         logger.record("train/bc_action_coef", model.last_bc_coef)
         logger.record("train/bc_actor_frozen", model.last_actor_frozen)
         logger.record("train/actor_parameter_delta_from_bc", _actor_parameter_delta(model))
+        logger.record("train/drq_k", args.drq_k)
+        logger.record("train/drq_m", args.drq_m)
+        logger.record("train/drq_shift_pixels", args.augmentation_shift)
+        logger.record("train/drq_target_q_std", model.last_target_q_std)
+        logger.record("train/drq_current_q_std", model.last_current_q_std)
         logger.dump(learner_transition_count)
         logger.close()
         learner_env.close()

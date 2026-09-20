@@ -25,6 +25,9 @@ MONITOR_INFO_KEYS = (
     "stage_index",
     "time_limit_reached",
     "failure_reason",
+    "premature_release",
+    "release_height_ready",
+    "release_height_error",
 )
 
 

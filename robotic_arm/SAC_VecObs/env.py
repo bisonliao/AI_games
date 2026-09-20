@@ -48,6 +48,11 @@ VIOLATION_GRACE_STEPS = 4
 # the cube's short settling motion without permitting a phase-loop exploit.
 PLACE_EXIT_DISTANCE = 0.18
 RELEASE_EXIT_DISTANCE = 0.10
+# A release is only safe when the object is almost back on the tabletop.
+# Keeping this tolerance explicit makes the PLACE -> RELEASE transition
+# independent from the looser ``lifted`` threshold used earlier in the task.
+RELEASE_HEIGHT_TOLERANCE = 0.015
+RELEASE_CONFIRM_STEPS = 2
 
 
 class SACVectorTaskEnv(gym.Env):
@@ -125,6 +130,7 @@ class SACVectorTaskEnv(gym.Env):
         self._stage_steps = 0
         self._contact_steps = 0
         self._violation_steps = 0
+        self._premature_release_steps = 0
         self._failure_reason = ""
         self._last_reward_terms: Dict[str, float] = {}
 
@@ -157,6 +163,7 @@ class SACVectorTaskEnv(gym.Env):
         self._stage_steps = 0
         self._contact_steps = 0
         self._violation_steps = 0
+        self._premature_release_steps = 0
         self._failure_reason = ""
         self._last_reward_terms = {}
         observation = self._get_observation()
@@ -256,6 +263,18 @@ class SACVectorTaskEnv(gym.Env):
         self._stage_steps = 0
         self._contact_steps = 0
         self._violation_steps = 0
+        self._premature_release_steps = 0
+
+    def _release_height_error(self, metrics: Dict[str, Any]) -> float:
+        """Return the object's distance from its tabletop resting height."""
+
+        object_height = float(metrics["object_position"][2])
+        return abs(object_height - float(self.base_env.object_half_extent))
+
+    def _release_height_ready(self, metrics: Dict[str, Any]) -> bool:
+        """Whether opening the gripper now satisfies the safe-release gate."""
+
+        return self._release_height_error(metrics) <= RELEASE_HEIGHT_TOLERANCE
 
     def _update_stage(self, metrics: Dict[str, Any]) -> str:
         """Advance the one-way phase machine and return a failure reason.
@@ -274,6 +293,7 @@ class SACVectorTaskEnv(gym.Env):
         lifted = bool(metrics["lifted"])
         near_goal = bool(metrics["object_goal_xy_distance"] < 0.075)
         released = bool(metrics["gripper_width"] > 0.065)
+        release_height_ready = self._release_height_ready(metrics)
 
         if self.stage == PickPlaceStage.APPROACH:
             if contact_grasp:
@@ -318,8 +338,16 @@ class SACVectorTaskEnv(gym.Env):
                     return "object_left_goal"
             else:
                 self._violation_steps = 0
-            if near_goal and released and not lifted:
-                self._enter_stage(PickPlaceStage.RELEASE)
+            if released:
+                if not release_height_ready:
+                    self._premature_release_steps += 1
+                    if self._premature_release_steps >= RELEASE_CONFIRM_STEPS:
+                        return "premature_release"
+                elif near_goal and not lifted:
+                    self._premature_release_steps = 0
+                    self._enter_stage(PickPlaceStage.RELEASE)
+            else:
+                self._premature_release_steps = 0
             return ""
 
         # RELEASE is also monotonic.  Re-grasping or letting the object roll
@@ -419,7 +447,7 @@ class SACVectorTaskEnv(gym.Env):
         if self.ever_lifted and not self.lift_bonus_given:
             reward_terms["event"] += 2.0
             self.lift_bonus_given = True
-        if self.stage in {PickPlaceStage.PLACE, PickPlaceStage.RELEASE} and not self.place_bonus_given:
+        if self.stage == PickPlaceStage.RELEASE and not self.place_bonus_given:
             reward_terms["event"] += 1.0
             self.place_bonus_given = True
         if self.stage == PickPlaceStage.RELEASE and not self.release_bonus_given:
@@ -474,6 +502,8 @@ class SACVectorTaskEnv(gym.Env):
         return observation
 
     def _make_info(self, success: bool, failure: bool) -> Dict[str, Any]:
+        metrics = self._metrics()
+        release_height_error = self._release_height_error(metrics)
         return {
             "task": self.task,
             "success": bool(success),
@@ -483,18 +513,25 @@ class SACVectorTaskEnv(gym.Env):
             "failure": bool(failure),
             "stage": STAGE_NAMES[int(self.stage)],
             "stage_index": int(self.stage),
-            "is_grasped": bool(self._metrics()["finger_contact"]),
+            "is_grasped": bool(metrics["finger_contact"]),
             "ever_grasped": bool(self.ever_grasped),
             "ever_lifted": bool(self.ever_lifted),
             "stable_steps": int(self.stable_steps),
             "stage_steps": int(self._stage_steps),
             "failure_reason": self._failure_reason,
+            "premature_release": bool(self._failure_reason == "premature_release"),
+            "release_height_ready": bool(
+                self._release_height_ready(metrics)
+            ),
+            "release_height_error": float(release_height_error),
             "reward_terms": dict(self._last_reward_terms),
         }
 
 
 __all__ = [
     "GRASP_CONFIRM_STEPS",
+    "RELEASE_CONFIRM_STEPS",
+    "RELEASE_HEIGHT_TOLERANCE",
     "PickPlaceStage",
     "SACVectorTaskEnv",
     "STAGE_NAMES",

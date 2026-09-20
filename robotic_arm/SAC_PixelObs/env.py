@@ -16,7 +16,13 @@ import numpy as np
 import pybullet as p
 from gymnasium import spaces
 
-from SAC_VecObs.env import PickPlaceStage, SACVectorTaskEnv, STAGE_NAMES
+from SAC_VecObs.env import (
+    PickPlaceStage,
+    RELEASE_CONFIRM_STEPS,
+    RELEASE_HEIGHT_TOLERANCE,
+    SACVectorTaskEnv,
+    STAGE_NAMES,
+)
 
 
 CAMERA_VIEW_NAMES = ("xy", "xz", "yz")
@@ -110,10 +116,7 @@ class _PixelTaskStateEnv(SACVectorTaskEnv):
         if self.ever_lifted and not self.lift_bonus_given:
             reward_terms["event"] += 2.0
             self.lift_bonus_given = True
-        if (
-            self.stage in {PickPlaceStage.PLACE, PickPlaceStage.RELEASE}
-            and not self.place_bonus_given
-        ):
+        if self.stage == PickPlaceStage.RELEASE and not self.place_bonus_given:
             reward_terms["event"] += 1.0
             self.place_bonus_given = True
         if self.stage == PickPlaceStage.RELEASE and not self.release_bonus_given:
@@ -451,5 +454,7 @@ __all__ = [
     "N_VIEWS",
     "PIXEL_STAGE_STEP_LIMITS",
     "PROPRIO_SIZE",
+    "RELEASE_CONFIRM_STEPS",
+    "RELEASE_HEIGHT_TOLERANCE",
     "PixelTaskEnv",
 ]
