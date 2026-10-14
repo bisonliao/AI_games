@@ -24,9 +24,19 @@ class DuelingQNetwork(nn.Module):
         hidden = self.trunk(obs)
         value = self.value(hidden)
         advantage = self.advantage(hidden)
+        # Dueling DQN 的均值聚合：Q(s,a) = V(s) + A(s,a) - mean_a A(s,a)。
+        # 直接用 Q=V+A 也能拟合 Q，但 V 加 c、所有 A 减 c 后 Q 不变，
+        # 两个分支对公共基准的分工不确定。减均值让有效优势 A-mean(A)
+        # 在动作间均值为 0，V 则等于这些动作的 Q 均值（并非 max Q）。
+        # 原始 A 仍可整体平移，但不再影响 Q；动作间的相对大小保持不变。
+        # 参考原论文公式 (9)：https://proceedings.mlr.press/v48/wangf16.pdf
         if action_mask is None:
+            # dim=1 是动作维：对每个样本分别求均值，不跨 batch 平均。
             mean_advantage = advantage.mean(dim=1, keepdim=True)
         else:
+            # 本项目只对当前合法动作取均值，避免非法动作输出影响 Q 基准。
+            # 终局可能没有合法动作；分母至少为 1 以防除零，此时均值为 0，
+            # learner 会另外清零终局的自举项，不在此状态选择动作。
             valid = action_mask.to(dtype=advantage.dtype)
             mean_advantage = (advantage * valid).sum(
                 dim=1,

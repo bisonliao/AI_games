@@ -49,6 +49,38 @@ def metric_key(metrics: dict[str, float]) -> tuple[float, float, float]:
     return (metrics.get('eval/self_draw_rate', 0.0), metrics.get('eval/return', 0.0), -metrics.get('eval/length', 0.0))
 
 
+def transition_next_observation(next_obs, terminated, truncated, infos):
+    """恢复每条 transition 的真实 next_obs，隔离 worker 的自动 reset。
+
+    ``SubprocessVectorEnv`` 为了继续采样，会在终局 step 内部 reset；因此
+    返回给训练循环的 ``next_obs`` 对已结束环境属于下一局。worker 同时把
+    reset 前的真实终局观测放在 ``info['final_observation']`` 中，这里必须
+    显式替换回 replay。非终局 transition 则直接使用当前 next_obs。
+    """
+    replay_next_obs = {
+        key: np.asarray(value).copy()
+        for key, value in next_obs.items()
+    }
+    done = np.asarray(terminated, dtype=bool) | np.asarray(truncated, dtype=bool)
+    for index, is_done in enumerate(done):
+        if not is_done:
+            continue
+        final_observation = infos[index].get('final_observation')
+        if final_observation is None:
+            raise RuntimeError(
+                'terminated/truncated transition is missing final_observation '
+                f'for environment index {index}'
+            )
+        for key in replay_next_obs:
+            if key not in final_observation:
+                raise RuntimeError(
+                    f'final_observation is missing field {key!r} '
+                    f'for environment index {index}'
+                )
+            replay_next_obs[key][index] = final_observation[key]
+    return replay_next_obs
+
+
 def train(config: TrainConfig, resume: str | None = None, run_id: str | None = None):
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -99,15 +131,20 @@ def train(config: TrainConfig, resume: str | None = None, run_id: str | None = N
             epsilon = agent.epsilon(env_steps)
             actions = agent.select_actions(obs['vector'], obs['action_mask'], epsilon, rng)
             next_obs, rewards, terminated, truncated, infos = envs.step(actions)
+            # worker 在终局 step 内部会自动 reset；训练循环继续使用 next_obs
+            # 作为下一次采样的当前观测，但 replay 必须换回终局前的真实观测。
+            replay_next_obs = transition_next_observation(
+                next_obs, terminated, truncated, infos
+            )
             replay.add_batch(
                 obs['vector'],
                 actions,
                 rewards,
-                next_obs['vector'],
+                replay_next_obs['vector'],
                 terminated,
                 truncated,
                 obs['action_mask'],
-                next_obs['action_mask'],
+                replay_next_obs['action_mask'],
             )
             episode_metrics.update(rewards, terminated, truncated, infos)
             obs = next_obs
