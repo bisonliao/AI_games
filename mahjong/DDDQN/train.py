@@ -64,8 +64,9 @@ def train(config: TrainConfig, resume: str | None = None, run_id: str | None = N
     )
     envs = SubprocessVectorEnv(config.num_envs, env_config, config.seed)
     log_root = _root_path(config.log_dir)
-    checkpoint_root = _root_path(config.checkpoint_dir)
     logger = MetricsLogger(str(log_root), run_id=run_id)
+    # 使用 logger 最终确定的 run_id，自动生成和手动指定的运行都独立保存。
+    checkpoint_root = _root_path(config.checkpoint_dir) / logger.run_id
     episode_metrics = EpisodeMetrics(config.num_envs)
     rng = np.random.default_rng(config.seed)
     env_steps = 0
@@ -82,7 +83,10 @@ def train(config: TrainConfig, resume: str | None = None, run_id: str | None = N
         if resume:
             checkpoint = torch.load(resume, map_location=device, weights_only=False)
             env_steps = agent.load_checkpoint(checkpoint)
-            best_metric = checkpoint.get('best_metric')
+            # 在原目录续训时沿用历史最佳；另开 run 时从本次评测重新排名，
+            # 避免新目录因未超过旧 run 的最佳成绩而一直没有 best.pt。
+            if Path(resume).resolve().parent == checkpoint_root.resolve():
+                best_metric = checkpoint.get('best_metric')
             if checkpoint.get('numpy_rng_state') is not None:
                 rng.bit_generator.state = checkpoint['numpy_rng_state']
             train_cursor = max(
@@ -216,7 +220,7 @@ def parse_args(argv=None):
     parser.add_argument('--resume')
     parser.add_argument(
         '--run-id',
-        help='Accepted for CLI compatibility; logs currently use timestamp_pid IDs',
+        help='Subdirectory for logs and checkpoints; defaults to a timestamp_pid ID',
     )
     return parser.parse_args(argv)
 

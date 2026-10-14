@@ -9,7 +9,8 @@ from .envs import make_vec_env
 
 def train(cfg: DQNConfig, run_id='default'):
     log_path = Path(cfg.log_dir) / f'sb3_{run_id}'
-    checkpoint_path = Path(cfg.checkpoint_dir)
+    # 与 TensorBoard 运行目录使用同一标识，避免不同 run 覆盖模型。
+    checkpoint_path = Path(cfg.checkpoint_dir) / f'sb3_{run_id}'
     checkpoint_path.mkdir(parents=True, exist_ok=True)
     env = make_vec_env(cfg.num_envs, cfg.seed)
     eval_env = make_vec_env(cfg.eval_num_envs, cfg.seed + 100_000)

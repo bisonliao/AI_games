@@ -20,8 +20,11 @@ The vector is the only neural-network feature input; the mask is used for
 random exploration, greedy selection, and Double-DQN next-action selection.
 The action space remains `Discrete(141)`, with automatic self-draw termination.
 
-Checkpoints are SB3 zip files under `checkpoints/`; old `DDDQN/*.pt` files are
-not compatible. TensorBoard output is written below `tb_logs/sb3_<run_id>/`.
+Checkpoints are SB3 zip files under `checkpoints/sb3_<run_id>/`; old `DDDQN/*.pt`
+files are not compatible. Periodic checkpoints, `best/best_model.zip`, and
+`sb3_last.zip` are all stored in this run directory. TensorBoard output is
+written below `tb_logs/sb3_<run_id>/`. Set a different `--run-id` for each
+experiment (the CLI default is `run`) to keep their models separate.
 Console and TensorBoard dumps are emitted every `log_interval_steps` environment
 steps (default `10000`); training updates still run at `train_freq`.
 The default `exploration_fraction=0.4` linearly decays epsilon from `1.0` to
