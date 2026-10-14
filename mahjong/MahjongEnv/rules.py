@@ -34,9 +34,18 @@ def _meldable(c, groups):
 
 
 def is_win(tiles, meld_count=0):
+    """判断一组手牌是否胡牌，并把输入规范化后交给缓存函数。
+
+    排序保证同一手牌的不同排列（例如摸牌顺序不同）使用同一个缓存键。
+    """
     return _is_win_cached(tuple(sorted(tiles)), int(meld_count))
 
 
+# ``lru_cache`` 会把函数参数作为键，把已经计算出的返回值保存起来。
+# 这里的键是 ``(tiles, meld_count)``：tiles 必须是可哈希的 tuple，
+# meld_count 是整数。相同手牌结构再次判胡时直接返回缓存结果，不必重复递归。
+# ``maxsize=200_000`` 表示最多保留 20 万个最近使用的结果；超过上限时，
+# 最久未使用的条目会被淘汰。缓存只存在于当前 Python 进程，重启进程后清空。
 @lru_cache(maxsize=200_000)
 def _is_win_cached(tiles, meld_count=0):
     """若干成句加一对将，支持 0 到 4 组；红中可替代任意牌。
@@ -44,12 +53,19 @@ def _is_win_cached(tiles, meld_count=0):
     ``tiles`` 只包含手牌，已碰/杠的牌通过 ``meld_count`` 传入。
     因此成句数由剩余手牌张数推导，而不是固定写死为四组。
     """
+    # 将手牌转成每种牌的计数；红中单独取出，后续作为万能牌使用，
+    # 因此普通牌递归拆解时不把红中当作真实牌面。
     c = counts(tiles)
     wild = int(c[RED])
     c[RED] = 0
-    # Concealed/open meld tiles are stored separately and are excluded from hand.
+
+    # 手牌必须能拆成“若干组三张牌 + 一对将”。
+    # 摸了牌后，少于两张，或者扣除一对后不能被 3 整除，都不可能胡。
     if len(tiles) < 2 or (len(tiles) - 2) % 3:
         return False
+
+    # 根据手牌张数推导还需要拆出的成句数量。
+    # meld_count 是已经碰/杠的副露数量；总成句数超过 4 组时牌型非法。
     need_groups = (len(tiles) - 2) // 3
     if (
         not 0 <= need_groups <= 4
@@ -57,28 +73,43 @@ def _is_win_cached(tiles, meld_count=0):
         or need_groups + meld_count > 4
     ):
         return False
+    # 逐一尝试 27 种普通牌作为“将牌”。红中不能作为 pair 的循环下标，
+    # 但可以在下面分支中补足将牌缺少的一张或两张。
     for pair in range(27):
+        # 优先使用两张天然相同的牌作将。
         if c[pair] >= 2:
             use = 2
+        # 只有一张天然牌时，用一张红中补成对子。
         elif c[pair] == 1 and wild:
             use = 1
+        # 没有这张天然牌时，用两张红中组成万能对子。
         elif wild >= 2:
             use = 0
+        # 既没有天然对子，也没有足够红中，当前候选牌不能作将。
         else:
             use = -1
         if use < 0:
+            # 恢复/修改计数都没有发生，直接尝试下一种将牌。
             continue
+
+        # 暂时从计数中移除作为将牌使用的天然牌。
         c[pair] -= max(0, use)
+        # 计算为将牌消耗的红中数量：需要两张，减去已经使用的天然牌。
         w = wild - (2 - use)
         if w >= 0:
-            # Try all distributions of wildcards among the remaining melds.
+            # 没有剩余红中时，使用普通的成句递归；否则使用支持万能牌的递归。
             if w == 0:
                 complete = _meldable(c, need_groups)
             else:
                 complete = _complete_with_wild(c, w, need_groups)
             if complete:
+                # 当前将牌选择能够完成所有剩余成句，整手牌胡牌。
                 return True
+
+        # 当前将牌选择失败，恢复刚才移除的天然牌，继续尝试其他将牌。
         c[pair] += max(0, use)
+
+    # 所有可能的将牌选择都失败，说明这手牌不能按标准牌型胡牌。
     return False
 
 def _complete_with_wild(c, wild, groups):

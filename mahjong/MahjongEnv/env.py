@@ -80,32 +80,26 @@ class MahjongEnv(gym.Env):
         if starter == 0:
             self._draw(0)
         else:
-            self.state.players[starter].hand.append(self.state.wall.pop())
-            self.state.players[starter].hand.sort()
+            # 起手牌友在发完 13 张后先拿第 14 张牌；进入统一的
+            # _advance_others() 循环时，这位玩家只需要弃牌，不应再次摸牌。
+            self._draw(starter)
         self.state.current_player = starter
         self.state.phase = 'play'
-        if is_win(self.state.players[starter].hand, len(self.state.players[starter].melds)):
+        if starter == 0 and is_win(self.state.players[starter].hand, len(self.state.players[starter].melds)):
             self.state.heaven_win = True
-            self.state.terminal_reason = 'win' if starter == 0 else 'loss'
+            self.state.terminal_reason = 'win'
             self.state.phase = 'terminal'
             return self._obs(), self._info()
         if starter != 0:
-            starter_hand = self.state.players[starter].hand
-            tile = int(self.rng.choice(starter_hand))
-            starter_hand.remove(tile)
-            self.state.players[starter].discards.append(tile)
-            self.state.last_discard = tile
-            self.state.claim_from = starter
             order = []
-            current = (starter + 1) % 4
+            current = starter
             while current != 0:
                 order.append(current)
                 current = (current + 1) % 4
-            self.state.pending_players = order
-            if self._claim_available():
-                self.state.phase = 'claim'
-            else:
-                self._advance_others(order, animate=False)
+            # order 从起手牌友开始，直到 agent 上家为止；统一交给
+            # _advance_others() 完成摸牌、判胡、启发式弃牌和响应检查。
+            # 其中 order[0] 已经在上面拿到第 14 张牌，循环会跳过其摸牌。
+            self._advance_others(order, animate=False, initial_turn=True)
         return self._obs(), self._info()
 
     def _legal_mask(self):
@@ -228,17 +222,22 @@ class MahjongEnv(gym.Env):
         if not 0 <= action < N_ACTIONS:
             raise ValueError(f'action must be in [0, {N_ACTIONS}), got {action}')
         if not self._legal_mask()[action]:
-            info = {**self._info(), 'invalid_action': True}
-            # A terminal state has no legal actions.  Treat an accidental
-            # step on it as terminal instead of returning a non-advancing
-            # transition forever (which would train Q toward -0.2).
-            if self.state.terminal_reason is not None:
-                outcome = self.state.terminal_reason
-                reward = {'win': self.config.win_reward,
-                          'loss': self.config.loss_reward,
-                          'draw': self.config.draw_reward}.get(outcome, 0.0)
-                return self._obs(), float(reward), True, False, info
-            return self._obs(), -0.2, False, False, info
+            # 胡牌、流局等终局是正常的环境结果，但终局状态没有后续动作；
+            # reset() 的调用方必须根据 terminal_reason 结束当前局并重新 reset。
+            # 训练/评测向量封装也会在终局后自动 reset，因此不应该把任何动作
+            # 发送到这里。非终局时，动作掩码同样由环境生成，调用方应先按掩码
+            # 筛选动作。走到这里说明调用方违反了接口协议，或环境的合法动作
+            # 判断与执行逻辑存在 bug。
+            #
+            # 不返回惩罚作为兜底：惩罚会把程序错误伪装成训练信号，导致错误
+            # 状态继续进入 replay buffer，使真正的非法动作来源更难定位。
+            legal_actions = np.flatnonzero(self._legal_mask()).tolist()
+            raise ValueError(
+                f'illegal action {action} for phase={self.state.phase!r}, '
+                f'terminal_reason={self.state.terminal_reason!r}; '
+                f'legal_actions={legal_actions}'
+            )
+        # 由动作推出动作类型：弃牌、碰、杠、胡、 pass
         typ = next(
             (
                 name
@@ -247,7 +246,8 @@ class MahjongEnv(gym.Env):
                 or (name in ACTION_NAMES and offset <= action < offset + 28)
             ),
             'invalid',
-        )
+        ) 
+        # 动作作用于28张牌的哪张
         tile = action - ACTION_OFFSETS.get(typ, 0) if typ in ACTION_NAMES else -1
         p = self.state.players[0]
         event = None
@@ -274,13 +274,26 @@ class MahjongEnv(gym.Env):
                 shaping_delta = new_potential - self.last_discard_potential
             self.last_discard_potential = new_potential
             self._advance_others()
+        # 碰/杠会先进入“副露完成、尚未弃牌”的中间状态；此时手牌张数
+        # 不符合标准弃牌后状态，直接比较 potential 可能造成虚假的 ukeire
+        # 变化。因此碰杠本身通常没有 shaping 奖励，牌效变化在后续完成弃牌
+        # 时统一计入 potential 差值；延迟信号仍会通过 DQN 折扣回报传回动作。
         elif typ=='concealed_kong':
+            # 暗杠只处理四张相同的牌，并从牌墙补摸一张。补摸后如果胡牌，
+            # _check_self_draw() 会直接结束本局；否则本次 step 返回“杠后、
+            # 尚未出牌”的 agent 局面。这里不能调用 _advance_others()，因为
+            # 杠后的弃牌仍应由 agent 在下一次 step 中单独选择。
             p.hand = [x for x in p.hand if x != tile]
             p.melds.append(Meld('concealed_kong', (tile,) * 4))
             event = 'kong'
             self._draw(0)
             self._check_self_draw()
         elif typ=='peng':
+            # 碰牌使用弃牌加上手里的两张牌组成副露；碰后不补摸牌，
+            # agent 当前手牌中仍保留一张需要打出的牌。must_discard=True
+            # 会让下一次观测的合法动作只包含 discard，避免 agent 连续
+            # 再碰/杠而跳过碰后的出牌。其他牌友不会在这里推进，必须等
+            # agent 下一次 step 完成弃牌后才进入 _advance_others()。
             p.hand.remove(tile)
             p.hand.remove(tile)
             p.melds.append(Meld('peng', (tile,) * 3, self.state.claim_from))
@@ -290,6 +303,10 @@ class MahjongEnv(gym.Env):
             self.state.current_player = 0
             self.state.must_discard = True
         elif typ=='ming_kong':
+            # 明杠同样先完成副露，再从牌墙补摸一张。补摸牌可能直接自摸胡；
+            # 若未胡，本次 step 返回补摸后的杠后局面，agent 仍需在下次
+            # step 继续决策（通常选择弃牌；当前动作掩码也会保留其他可用
+            # 的杠动作）。只有完成弃牌后，牌友才会继续行动。
             for _ in range(3): p.hand.remove(tile)
             p.melds.append(Meld('ming_kong', (tile,) * 4, self.state.claim_from))
             event = 'kong'
@@ -298,6 +315,9 @@ class MahjongEnv(gym.Env):
             self.state.current_player = 0
             self._check_self_draw()
         elif typ=='added_kong':
+            # 加杠把已有碰牌扩展为四张，并补摸一张杠牌。和暗杠、明杠一样，
+            # 未自摸时先把杠后局面交回 agent；不能在这里替 agent 弃牌或推进
+            # 牌友，否则会跳过杠后的出牌决策。
             p.hand.remove(tile)
             for meld in p.melds:
                 if meld.kind == 'peng' and meld.tiles[0] == tile:
@@ -314,13 +334,12 @@ class MahjongEnv(gym.Env):
             outcome = self.state.terminal_reason
         self.state.last_action = action
         self.state.step += 1
-        if not terminated and not self.state.wall:
+        # 一局牌最多消耗有限的牌墙；正常流程中每次摸牌都会减少 wall，
+        # 因此牌墙耗尽本身就是充分的终局条件，不需要再用 max_steps
+        # 人为截断牌局或把它标记为 truncated。
+        if not terminated and not self.state.wall: #牌墙空了
             terminated = True
-            outcome = 'draw'
-            self.state.terminal_reason = 'draw'
-        if self.state.step >= self.config.max_steps and not terminated:
-            terminated = True
-            outcome = 'draw'
+            outcome = 'draw' #流局/平局
             self.state.terminal_reason = 'draw'
         reward = shaped_reward(
             before,
@@ -347,15 +366,21 @@ class MahjongEnv(gym.Env):
             self.state.terminal_reason = 'win'
             self.state.phase = 'terminal'
 
-    def _advance_others(self, players=None, animate=True):
+    def _advance_others(self, players=None, animate=True, initial_turn=False):
         if players is None:
             players = [1, 2, 3]
         self.state.pending_players = list(players)
+        first_player = self.state.pending_players[0] if initial_turn and self.state.pending_players else None
         while self.state.pending_players:
             i = self.state.pending_players.pop(0)
-            self._draw(i)
+            # 起手牌友已经在 reset() 中拿到第 14 张牌；其余玩家每次
+            # 轮到自己时才从牌墙摸一张。
+            if i != first_player:
+                self._draw(i)
             hand = self.state.players[i].hand
             if is_win(hand, len(self.state.players[i].melds)):
+                if initial_turn:
+                    self.state.heaven_win = True
                 self.state.terminal_reason = 'loss'
                 return
             tile = choose_discard(
